@@ -127,6 +127,7 @@ def unknown_permissions(values: Optional[Iterable[str]]) -> list[str]:
 
 def catalog() -> dict:
     return {
+        "account_admin_supported": True,
         "permissions": [
             {"key": k, "label": label, "description": desc, "group": group, "sensitive": sens}
             for k, (label, desc, group, sens) in PERMISSIONS.items()
