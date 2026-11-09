@@ -7,7 +7,7 @@ from datetime import datetime
 
 from app.services.markets import market_summary, reseller_market
 from app.db.database import get_db
-from app.db.models import User
+from app.db.models import User, ResellerStaff
 from app.services.auth import verify_token, get_current_user, pwd_context
 import logging
 import re
@@ -104,6 +104,23 @@ def _user_to_profile(user: User) -> dict:
     }
 
 
+async def _login_identity(db, user, token):
+    if isinstance(token, dict) and token.get("staff_id") is not None:
+        identity = await db.get(ResellerStaff, int(token["staff_id"]))
+        if (identity is None or identity.parent_reseller_id != user.id or not identity.is_active
+                or identity.deleted_at is not None or int(identity.token_version or 0) != int(token.get("stv", -1))):
+            raise HTTPException(status_code=401, detail="Invalid login")
+        return identity
+    return user
+
+
+async def _identity_profile(db, user, token):
+    profile = _user_to_profile(user)
+    identity = await _login_identity(db, user, token)
+    profile["email"] = identity.email
+    return profile
+
+
 def _ap_control_flag_for(user: User) -> bool:
     """True when this user should see the Access points UI."""
     from app.services.ap_access import ap_control_allowed
@@ -121,7 +138,7 @@ async def get_profile(
 ):
     """Return the authenticated user's profile."""
     user = await get_current_user(token, db)
-    return _user_to_profile(user)
+    return await _identity_profile(db, user, token)
 
 
 # ---------------------------------------------------------------------------
@@ -137,11 +154,13 @@ async def update_profile(
     """Update one or more profile fields for the authenticated user."""
     user = await get_current_user(token, db)
 
-    if request.email is not None and request.email != user.email:
+    identity = await _login_identity(db, user, token)
+    if request.email is not None and request.email != identity.email:
         from app.api.staff_routes import email_in_use
         if await email_in_use(db, request.email):
             raise HTTPException(status_code=409, detail="A user with this email already exists")
-        user.email = request.email
+        identity.email = request.email
+        identity.token_version = int(identity.token_version or 0) + 1
 
     if request.organization_name is not None:
         user.organization_name = request.organization_name
@@ -164,7 +183,9 @@ async def update_profile(
     await db.commit()
     await db.refresh(user)
 
-    return _user_to_profile(user)
+    result = _user_to_profile(user)
+    result["email"] = identity.email
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +201,8 @@ async def change_password(
     """Change the authenticated user's password. Requires current password."""
     user = await get_current_user(token, db)
 
-    if not pwd_context.verify(request.current_password, user.password_hash):
+    identity = await _login_identity(db, user, token)
+    if not pwd_context.verify(request.current_password, identity.password_hash):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Current password is incorrect",
@@ -192,17 +214,19 @@ async def change_password(
             detail="New password must differ from the current password",
         )
 
-    user.password_hash = pwd_context.hash(request.new_password)
-    user.token_version = int(user.token_version or 0) + 1
+    identity.password_hash = pwd_context.hash(request.new_password)
+    identity.token_version = int(identity.token_version or 0) + 1
     await db.commit()
 
     from app.api.auth_routes import login_token_claims
     from app.services.auth import create_access_token
     from app.services.staff_access import invalidate_owner, token_expiry
     invalidate_owner(user.id)
+    from app.services.staff_access import staff_token_claims
+    claims = staff_token_claims(identity, user) if isinstance(identity, ResellerStaff) else login_token_claims(user)
     return {
         "detail": "Password updated successfully",
-        "access_token": create_access_token(login_token_claims(user), token_expiry()),
+        "access_token": create_access_token(claims, token_expiry()),
     }
 
 

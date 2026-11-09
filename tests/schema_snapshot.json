@@ -702,6 +702,9 @@
   "created_at",
   "expires_at",
   "id",
+  "identity_email",
+  "staff_id",
+  "staff_token_version",
   "token_hash",
   "used_at",
   "user_id"
@@ -911,6 +914,7 @@
   "deleted_at",
   "email",
   "id",
+  "is_account_admin",
   "is_active",
   "last_login_at",
   "name",

@@ -81,6 +81,7 @@ class StaffContext:
     owner_id: int
     name: str
     permissions: frozenset
+    is_account_admin: bool = False
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,7 @@ class _StaffState:
     deleted: bool
     token_version: int
     permissions: frozenset
+    is_account_admin: bool = False
 
 
 _current_staff: contextvars.ContextVar[Optional[StaffContext]] = contextvars.ContextVar(
@@ -140,7 +142,7 @@ def staff_permission_denied_response(exc: "StaffPermissionDenied") -> JSONRespon
 def require_permission(permission: str) -> None:
     """For handlers that need a finer check than the route map (e.g. one field)."""
     staff = current_staff()
-    if staff is not None and permission not in staff.permissions:
+    if staff is not None and not staff.is_account_admin and permission not in staff.permissions:
         raise StaffPermissionDenied(permission)
 
 
@@ -216,6 +218,7 @@ async def _staff_state(staff_id: int) -> Optional[_StaffState]:
                 ResellerStaff.deleted_at,
                 ResellerStaff.token_version,
                 ResellerStaff.permissions,
+                ResellerStaff.is_account_admin,
             ).join(User, User.id == ResellerStaff.parent_reseller_id).where(
                 ResellerStaff.id == staff_id, User.role == UserRole.RESELLER
             )
@@ -229,7 +232,8 @@ async def _staff_state(staff_id: int) -> Optional[_StaffState]:
             is_active=bool(row.is_active),
             deleted=row.deleted_at is not None,
             token_version=int(row.token_version or 0),
-            permissions=frozenset(perms.clean_permissions(row.permissions or [])),
+            permissions=frozenset(perms.PERMISSIONS if row.is_account_admin else perms.clean_permissions(row.permissions or [])),
+            is_account_admin=bool(row.is_account_admin),
         )
     _prune(_staff_cache, STATE_TTL_SECONDS, now_mono)
     _staff_cache[staff_id] = (state, now_mono)
@@ -506,9 +510,12 @@ async def _enforce_staff(request: Request, call_next, claims: dict, method: str,
     if perms.is_public(path):
         return await call_next(request)
 
-    actor = f"{state.name} (staff)"
+    actor = f"{state.name} (account admin)" if state.is_account_admin else f"{state.name} (staff)"
     rule, params = perms.match_rule(method, path)
-    if rule is None or not rule.allows(state.permissions):
+    # Co-admins have the same reseller authority as the owner. Platform-admin
+    # routes still require the existing explicit reseller-facing route rule.
+    account_admin_allowed = state.is_account_admin and not path.startswith("/api/admin/")
+    if not account_admin_allowed and (rule is None or not rule.allows(state.permissions)):
         needed = rule.permission_label if rule is not None else None
         logger.info("[staff %s owner=%s] denied %s %s (needs %s)",
                     staff_id, owner_id, method, path, needed or "owner")
@@ -523,6 +530,7 @@ async def _enforce_staff(request: Request, call_next, claims: dict, method: str,
 
     token = _current_staff.set(StaffContext(
         staff_id=staff_id, owner_id=owner_id, name=state.name, permissions=state.permissions,
+        is_account_admin=state.is_account_admin,
     ))
     try:
         response = await call_next(request)

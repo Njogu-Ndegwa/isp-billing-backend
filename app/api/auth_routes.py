@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func
 from pydantic import BaseModel
 from typing import Any, Optional
 from datetime import datetime, timedelta
@@ -10,7 +10,7 @@ import secrets
 
 from app.services.markets import market_summary
 from app.db.database import get_db
-from app.db.models import User, UserRole, PasswordResetToken
+from app.db.models import User, UserRole, PasswordResetToken, ResellerStaff
 from app.services.auth import create_user, authenticate_user, create_access_token, get_current_user, pwd_context
 from app.core.deps import oauth2_scheme as optional_oauth2_scheme  # auto_error=False: signup is public
 from app.services.subscription import get_invoice_alert_for_user
@@ -278,7 +278,10 @@ def _reset_request_allowed(email: str, now: datetime) -> bool:
 
 
 def _hash_reset_token(raw_token: str) -> str:
-    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    # Domain separation makes staff recovery links unusable by an older release
+    # that only understands user_id (important if a deployment is rolled back).
+    material = "account-login:" + raw_token if raw_token.startswith("staff.") else raw_token
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 class ForgotPasswordRequest(BaseModel):
@@ -298,22 +301,35 @@ async def forgot_password(
         return FORGOT_PASSWORD_GENERIC_RESPONSE
 
     try:
-        result = await db.execute(select(User).filter(User.email == email))
+        result = await db.execute(select(User).filter(func.lower(User.email) == email))
         user = result.scalar_one_or_none()
-        if not user:
-            return FORGOT_PASSWORD_GENERIC_RESPONSE
+        staff = None
+        if user is None:
+            staff = (await db.execute(select(ResellerStaff).join(
+                User, User.id == ResellerStaff.parent_reseller_id
+            ).where(func.lower(ResellerStaff.email) == email,
+                    ResellerStaff.deleted_at.is_(None), ResellerStaff.is_active.is_(True),
+                    User.role == UserRole.RESELLER))).scalar_one_or_none()
+            if staff is None:
+                return FORGOT_PASSWORD_GENERIC_RESPONSE
+            user = await db.get(User, staff.parent_reseller_id)
+        recipient = staff.email if staff else user.email
 
-        raw_token = secrets.token_urlsafe(32)
+        raw_token = ("staff." if staff else "") + secrets.token_urlsafe(32)
         await db.execute(
             update(PasswordResetToken)
             .where(
                 PasswordResetToken.user_id == user.id,
+                PasswordResetToken.staff_id == (staff.id if staff else None),
                 PasswordResetToken.used_at.is_(None),
             )
             .values(used_at=now)
         )
         db.add(PasswordResetToken(
             user_id=user.id,
+            staff_id=staff.id if staff else None,
+            staff_token_version=int(staff.token_version or 0) if staff else None,
+            identity_email=recipient,
             token_hash=_hash_reset_token(raw_token),
             created_at=now,
             expires_at=now + timedelta(minutes=settings.PASSWORD_RESET_TOKEN_TTL_MINUTES),
@@ -325,7 +341,7 @@ async def forgot_password(
         reset_url = (
             f"{settings.FRONTEND_BASE_URL.rstrip('/')}/reset-password?token={raw_token}"
         )
-        background.add_task(email_service.send_password_reset_email, user.email, reset_url)
+        background.add_task(email_service.send_password_reset_email, recipient, reset_url)
         return FORGOT_PASSWORD_GENERIC_RESPONSE
     except Exception as e:
         logger.error(f"Forgot-password error for {email}: {e}")
@@ -344,16 +360,30 @@ async def reset_password(
     db: AsyncSession = Depends(get_db)
 ):
     """Complete a password reset with a token from the emailed link."""
+    if len(request.new_password.encode("utf-8")) > 72:
+        raise HTTPException(status_code=400, detail="Password must be at most 72 bytes")
     if len(request.new_password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
     if not request.token:
         raise HTTPException(status_code=400, detail="Invalid or expired reset link")
 
+    # Validate cheaply before hashing, then release the connection while bcrypt
+    # runs. Re-read under a lock afterwards so concurrent uses cannot both win.
+    token_hash = _hash_reset_token(request.token)
+    candidate = (await db.execute(select(PasswordResetToken.id).where(
+        PasswordResetToken.token_hash == token_hash,
+        PasswordResetToken.used_at.is_(None),
+        PasswordResetToken.expires_at >= datetime.utcnow(),
+    ))).scalar_one_or_none()
+    await db.commit()
+    if candidate is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset link")
+    password_hash = await asyncio.to_thread(pwd_context.hash, request.new_password)
     now = datetime.utcnow()
     result = await db.execute(
         select(PasswordResetToken).filter(
-            PasswordResetToken.token_hash == _hash_reset_token(request.token)
-        )
+            PasswordResetToken.token_hash == token_hash
+        ).with_for_update().execution_options(populate_existing=True)
     )
     token_row = result.scalar_one_or_none()
     if not token_row or token_row.used_at is not None or token_row.expires_at < now:
@@ -369,8 +399,19 @@ async def reset_password(
             detail="Invalid or expired reset link. Please request a new one.",
         )
 
-    user.password_hash = await asyncio.to_thread(pwd_context.hash, request.new_password)
-    user.token_version = int(user.token_version or 0) + 1
+    identity = user
+    if token_row.staff_id is not None:
+        identity = (await db.execute(select(ResellerStaff).where(
+            ResellerStaff.id == token_row.staff_id
+        ).with_for_update())).scalar_one_or_none()
+        if (identity is None or not identity.is_active or identity.deleted_at is not None
+                or identity.parent_reseller_id != user.id or user.role != UserRole.RESELLER
+                or int(identity.token_version or 0) != token_row.staff_token_version):
+            raise HTTPException(status_code=400, detail="Invalid or expired reset link")
+    if token_row.identity_email is not None and token_row.identity_email != identity.email:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset link")
+    identity.password_hash = password_hash
+    identity.token_version = int(identity.token_version or 0) + 1
     token_row.used_at = now
     await db.commit()
     from app.services.staff_access import invalidate_owner
