@@ -6,6 +6,7 @@ from typing import Any, Optional
 from datetime import datetime, timedelta
 import asyncio
 import hashlib
+import hmac
 import secrets
 
 from app.services.markets import market_summary
@@ -280,8 +281,9 @@ def _reset_request_allowed(email: str, now: datetime) -> bool:
 def _hash_reset_token(raw_token: str) -> str:
     # Domain separation makes staff recovery links unusable by an older release
     # that only understands user_id (important if a deployment is rolled back).
-    material = "account-login:" + raw_token if raw_token.startswith("staff.") else raw_token
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+    if raw_token.startswith("staff."):
+        return hmac.new(settings.SECRET_KEY.encode("utf-8"), raw_token.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
 
 
 class ForgotPasswordRequest(BaseModel):

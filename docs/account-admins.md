@@ -27,7 +27,7 @@ another admin's reset link or login.
 
 Startup adds the admin flag and recovery columns idempotently, before serving
 authentication. Existing rows keep their permissions. Staff reset tokens use a
-separate hash domain, so older releases cannot find or consume them as primary
+keyed hash, so older releases cannot find or consume them as primary
 login reset tokens if this release is rolled back.
 
 Tests: `tests/test_account_admins.py`, `tests/test_staff.py`,
