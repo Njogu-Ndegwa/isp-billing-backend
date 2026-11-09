@@ -209,3 +209,32 @@ async def test_postgres_concurrent_reset_only_one_wins(client, actors, sent, eng
     body = {"token": sent[0][1], "new_password": "concurrent-new-password"}
     results = await asyncio.gather(*[client.post("/api/auth/reset-password", json=body) for _ in range(2)])
     assert sorted(r.status_code for r in results) == [200, 400]
+
+
+@pytest.mark.asyncio
+async def test_owner_can_create_an_account_admin(client, actors):
+    owner, _, owner_jwt, _ = actors
+    response = await client.post("/api/staff", headers=auth(owner_jwt), json={
+        "name": "New admin", "email": "new-admin@example.com", "password": "new-admin-password",
+        "is_account_admin": True})
+    assert response.status_code == 200, response.text
+    assert response.json()["is_account_admin"] is True
+    login = await client.post("/api/auth/login", json={"email": "new-admin@example.com", "password": "new-admin-password"})
+    assert login.status_code == 200
+    assert login.json()["user"]["id"] == owner.id
+    assert (await client.get("/api/staff", headers=auth(login.json()["access_token"])) ).status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inactive", ["disabled", "removed"])
+async def test_inactive_identity_gets_no_recovery_email(client, actors, db, sent, inactive):
+    from datetime import datetime
+    member = actors[1]
+    if inactive == "disabled":
+        member.is_active = False
+    else:
+        member.deleted_at = datetime.utcnow()
+    await db.commit()
+    response = await client.post("/api/auth/forgot-password", json={"email": member.email})
+    assert response.status_code == 200
+    assert sent == []

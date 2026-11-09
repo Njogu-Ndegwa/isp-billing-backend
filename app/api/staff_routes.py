@@ -9,9 +9,9 @@ POST   /api/staff/{id}/reset-password    set a new password           (owner onl
 DELETE /api/staff/{id}                   remove (soft)                (owner only)
 GET    /api/staff/activity               who did what                 (owner only)
 
-"Owner only" is enforced twice: the staff middleware never lets a staff token
-reach these routes (``staff.manage`` is not grantable), and every handler here
-refuses a token that carries ``staff_id``.
+The primary owner and explicitly designated account admins manage these routes.
+Ordinary staff cannot grant themselves staff management or the account-admin
+role; both the middleware and handler verify the actor against current DB state.
 
 Anything that must end a staff member's sessions -- permission change,
 deactivation, removal, password reset -- bumps ``token_version`` and drops the

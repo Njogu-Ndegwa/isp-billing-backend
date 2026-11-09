@@ -416,5 +416,5 @@ async def reset_password(
     await db.commit()
     from app.services.staff_access import invalidate_owner
     invalidate_owner(user.id)
-    logger.info(f"Password reset completed for user {user.id}")
+    logger.info("Password reset completed for user %s, staff %s", user.id, token_row.staff_id)
     return {"message": "Password reset successfully. You can now sign in."}
