@@ -984,6 +984,23 @@ async def run_password_reset_migrations():
         await conn.run_sync(
             lambda c: PasswordResetToken.__table__.create(c, checkfirst=True)
         )
+        additions = {
+            "staff_id": "INTEGER REFERENCES reseller_staff(id) ON DELETE CASCADE",
+            "staff_token_version": "INTEGER NULL",
+            "identity_email": "VARCHAR(255) NULL",
+        }
+        if conn.dialect.name == "sqlite":
+            columns = {r[1] for r in (await conn.execute(sa_text("PRAGMA table_info(password_reset_tokens)"))).all()}
+            for name, ddl in additions.items():
+                if name not in columns:
+                    await conn.execute(sa_text(f"ALTER TABLE password_reset_tokens ADD COLUMN {name} {ddl}"))
+        else:
+            await conn.execute(sa_text("""
+                ALTER TABLE password_reset_tokens
+                ADD COLUMN IF NOT EXISTS staff_id INTEGER REFERENCES reseller_staff(id) ON DELETE CASCADE,
+                ADD COLUMN IF NOT EXISTS staff_token_version INTEGER NULL,
+                ADD COLUMN IF NOT EXISTS identity_email VARCHAR(255) NULL
+            """))
     logger.info("Migration: password_reset_tokens table ready")
 
 
@@ -2724,6 +2741,13 @@ async def run_staff_migrations():
             sync_conn, tables=[ResellerStaff.__table__, StaffActivityLog.__table__], checkfirst=True
         ))
 
+        if conn.dialect.name == "sqlite":
+            columns = {r[1] for r in (await conn.execute(sa_text("PRAGMA table_info(reseller_staff)"))).all()}
+            if "is_account_admin" not in columns:
+                await conn.execute(sa_text("ALTER TABLE reseller_staff ADD COLUMN is_account_admin BOOLEAN NOT NULL DEFAULT false"))
+        else:
+            await conn.execute(sa_text("ALTER TABLE reseller_staff ADD COLUMN IF NOT EXISTS is_account_admin BOOLEAN NOT NULL DEFAULT false"))
+
 
 async def run_free_setup_column_migration():
     """Add users.free_setup_until (nullable, so the previous release still runs).
@@ -3580,11 +3604,9 @@ async def startup_event():
     await run_staff_migrations()
     await run_free_setup_column_migration()
 
-    try:
-        await run_password_reset_migrations()
-        logger.info("Password reset migrations completed successfully")
-    except Exception as e:
-        logger.error(f"Password reset migration failed (non-fatal): {e}")
+    # Recovery is part of authentication; never serve an incomplete auth schema.
+    await run_password_reset_migrations()
+    logger.info("Password reset migrations completed successfully")
 
     try:
         await run_reconnection_migrations()

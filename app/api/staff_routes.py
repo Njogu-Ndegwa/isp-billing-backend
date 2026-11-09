@@ -9,9 +9,9 @@ POST   /api/staff/{id}/reset-password    set a new password           (owner onl
 DELETE /api/staff/{id}                   remove (soft)                (owner only)
 GET    /api/staff/activity               who did what                 (owner only)
 
-"Owner only" is enforced twice: the staff middleware never lets a staff token
-reach these routes (``staff.manage`` is not grantable), and every handler here
-refuses a token that carries ``staff_id``.
+The primary owner and explicitly designated account admins manage these routes.
+Ordinary staff cannot grant themselves staff management or the account-admin
+role; both the middleware and handler verify the actor against current DB state.
 
 Anything that must end a staff member's sessions -- permission change,
 deactivation, removal, password reset -- bumps ``token_version`` and drops the
@@ -54,6 +54,7 @@ def staff_public(staff: ResellerStaff, business_name: Optional[str] = None) -> d
     """The ``staff`` object returned at login and by /api/staff/me."""
     return {
         "id": staff.id,
+        "is_account_admin": bool(staff.is_account_admin),
         "name": staff.name,
         "email": staff.email,
         "phone": staff.phone,
@@ -65,6 +66,7 @@ def staff_public(staff: ResellerStaff, business_name: Optional[str] = None) -> d
 
 def _staff_row(staff: ResellerStaff) -> dict:
     return {
+        "is_account_admin": bool(staff.is_account_admin),
         "id": staff.id,
         "name": staff.name,
         "email": staff.email,
@@ -99,7 +101,10 @@ async def login_staff(db: AsyncSession, email: str, password: str) -> Optional[d
     claims = staff_access.staff_token_claims(staff, owner)
     identity = login_user_payload(owner)
     identity["email"] = staff.email
-    identity["staff"] = staff_public(staff, business_label(owner))
+    # Existing clients treat staff=null as full account access. Preserve that
+    # contract while retaining the separate actor in JWTs, recovery and audits.
+    identity["staff"] = None if staff.is_account_admin else staff_public(staff, business_label(owner))
+    identity["account_admin"] = staff_public(staff, business_label(owner)) if staff.is_account_admin else None
     response = {
         "access_token": create_access_token(claims, staff_access.token_expiry()),
         "token_type": "bearer",
@@ -130,7 +135,11 @@ async def email_in_use(db: AsyncSession, email: str, *, exclude_staff_id: Option
 
 async def _require_owner(token: dict, db: AsyncSession) -> User:
     if token.get("staff_id") is not None:
-        raise staff_access.StaffPermissionDenied(perms.STAFF_MANAGE)
+        actor = await db.get(ResellerStaff, int(token["staff_id"]))
+        if (actor is None or not actor.is_account_admin or not actor.is_active
+                or actor.deleted_at is not None or actor.parent_reseller_id != int(token["user_id"])
+                or int(actor.token_version or 0) != int(token.get("stv", -1))):
+            raise staff_access.StaffPermissionDenied(perms.STAFF_MANAGE)
     user = await get_current_user(token, db)
     if user.role != UserRole.RESELLER:
         raise HTTPException(status_code=403, detail="Only reseller accounts can have staff")
@@ -160,10 +169,11 @@ def _check_permissions_input(values: Optional[List[str]]) -> list[str]:
 
 
 async def _log_owner_action(owner: User, method: str, path: str, summary: str) -> None:
+    actor = staff_access.current_staff()
     await staff_access.record_activity(
         owner_id=owner.id,
-        staff_id=None,
-        actor_label="Account owner",
+        staff_id=actor.staff_id if actor else None,
+        actor_label=f"{actor.name} (account admin)" if actor else "Account owner",
         action=f"{method} staff",
         permission=perms.STAFF_MANAGE,
         method=method,
@@ -195,6 +205,11 @@ async def staff_me(
     owner = await db.get(User, int(token["user_id"]))
     if staff is None or owner is None:
         raise HTTPException(status_code=401, detail="Staff account not found")
+    if staff.is_account_admin:
+        return {"is_staff": False, "staff": None,
+                "account_admin": staff_public(staff, business_label(owner)),
+                "permissions": list(perms.PERMISSIONS) + [perms.STAFF_MANAGE],
+                "feature_flags": _staff_feature_flags(owner.role)}
     public = staff_public(staff, business_label(owner))
     # Staff act in the owner's (reseller) scope for feature gating.
     return {"is_staff": True, "staff": public, "permissions": public["permissions"],
@@ -264,6 +279,7 @@ def _clean_phone(v):
 
 
 class StaffCreateRequest(BaseModel):
+    is_account_admin: bool = False
     name: str
     email: str
     phone: Optional[str] = None
@@ -276,6 +292,7 @@ class StaffCreateRequest(BaseModel):
 
 
 class StaffUpdateRequest(BaseModel):
+    is_account_admin: Optional[bool] = None
     name: Optional[str] = None
     email: Optional[str] = None
     phone: Optional[str] = None
@@ -331,6 +348,7 @@ async def create_staff(
         phone=body.phone,
         password_hash=await asyncio.to_thread(pwd_context.hash, body.password),
         permissions=permissions,
+        is_account_admin=body.is_account_admin,
         is_active=True,
         token_version=0,
         permissions_updated_at=now,
@@ -344,7 +362,7 @@ async def create_staff(
     logger.info("[staff] owner=%s added staff=%s perms=%s", owner.id, staff.id, permissions)
     await _log_owner_action(
         owner, "POST", "/api/staff",
-        f"Added staff {staff.name} with: {', '.join(permissions) or 'no permissions'}",
+        f"Added {'account admin' if staff.is_account_admin else 'staff'} {staff.name} with: {', '.join(permissions) or 'no permissions'}",
     )
     return row
 
@@ -363,6 +381,10 @@ async def update_staff(
     revoke = False
     now = datetime.utcnow()
 
+    if body.is_account_admin is not None and body.is_account_admin != bool(staff.is_account_admin):
+        staff.is_account_admin = body.is_account_admin
+        changes.append("account admin role")
+        revoke = True
     if body.name is not None and body.name != staff.name:
         staff.name = body.name
         changes.append("name")

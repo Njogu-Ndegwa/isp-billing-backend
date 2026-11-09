@@ -207,6 +207,10 @@ class PasswordResetToken(Base):
         nullable=False,
         index=True,
     )
+    # A staff/admin login has its own recovery identity within the owner account.
+    staff_id = Column(Integer, ForeignKey("reseller_staff.id", ondelete="CASCADE"), nullable=True)
+    staff_token_version = Column(Integer, nullable=True)
+    identity_email = Column(String(255), nullable=True)
     # sha256 hex of the raw token; the raw token only ever lives in the email link
     token_hash = Column(String(64), unique=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -3103,6 +3107,7 @@ class ResellerStaff(Base):
     email = Column(String(255), nullable=False)
     phone = Column(String(20), nullable=True)
     password_hash = Column(String, nullable=False)
+    is_account_admin = Column(Boolean, nullable=False, default=False, server_default="false")
     # List of permission keys, e.g. ["customers.view", "routers.view"].
     permissions = Column(JSON, nullable=False, default=list)
     is_active = Column(Boolean, nullable=False, default=True, server_default="true")
