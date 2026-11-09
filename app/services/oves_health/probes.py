@@ -112,9 +112,14 @@ REGISTRY: list[Probe] = [
       "https://keycloak.omnivoltaic.com/realms/master/.well-known/openid-configuration",
       "Prod client signup (signUpClient rolls back on failure), SSO",
       expect_text="issuer", critical=True),
+    # Since 2026-11-02 this host fronts elasticsearch-prod (Tencent), which has
+    # xpack security on, so an unauthenticated health call gets a 401. The
+    # security_exception body comes from the ES node itself (not nginx, which
+    # answers 502/503 when the pod is gone), so it still proves ES is up.
     P("elasticsearch", "Elasticsearch", "oves_dev", "http",
       "https://elasticsearch.omnivoltaic.com/_cluster/health",
-      "Prod agent + asset-account search, code-event index", expect_text='"timed_out":false'),
+      "Prod agent + asset-account search, code-event index",
+      expect_status=(401,), expect_text="security_exception"),
     P("influxdb", "InfluxDB (fluxdb)", "oves_dev", "http", "https://fluxdb.omnivoltaic.com/health",
       "Prod createItemFleet (bucket per fleet), aaas-dashboard", expect_text="pass"),
     P("vault", "Vault", "oves_dev", "http", "https://vault.omnivoltaic.com/v1/sys/health",
