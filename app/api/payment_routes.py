@@ -2014,8 +2014,9 @@ async def get_mpesa_transactions_summary(
     """
     Get transactions summary with statistics.
 
-    Uses the same two-query merge as the main transactions endpoint so
-    numbers stay consistent.
+    Uses the same sources as the main transactions endpoint so numbers stay
+    consistent: STK (mpesa_transactions), processed paybill payments
+    (c2b_transactions) and the non-M-Pesa customer_payments rows.
 
     Query Parameters:
     - router_id, payment_method, date, start_date, end_date (same as /transactions)
@@ -2079,6 +2080,51 @@ async def get_mpesa_transactions_summary(
                     "status": tx_status.value,
                     "method": "mobile_money",
                     "settlement": _settlement_of_mpesa(collection_mode),
+                    "router_name": router_name,
+                    "router_id": router_pk,
+                    "counts_as_revenue": True,
+                    "connection_type": connection_type.value if connection_type else None,
+                })
+
+            # Paybill (C2B) payments. Their customer_payments twin is skipped
+            # by _cp_ledger_condition, so without this they vanish from every
+            # tile. Only processed rows count: STK echoes duplicate a row
+            # above, and unmatched/rejected paybill money is not a sale.
+            c2b_stmt = (
+                select(
+                    C2BTransaction.trans_amount,
+                    C2BTransaction.business_shortcode,
+                    Router.name,
+                    Router.id,
+                    Plan.connection_type,
+                )
+                .outerjoin(Customer, C2BTransaction.matched_customer_id == Customer.id)
+                .outerjoin(Router, Customer.router_id == Router.id)
+                .outerjoin(CustomerPayment, and_(
+                    CustomerPayment.payment_reference == C2BTransaction.trans_id,
+                    CustomerPayment.customer_id == C2BTransaction.matched_customer_id,
+                ))
+                .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
+                .where(
+                    C2BTransaction.matched_reseller_id == user.id,
+                    C2BTransaction.status == C2BTransactionStatus.PROCESSED,
+                )
+            )
+            if router_id:
+                c2b_stmt = c2b_stmt.where(Router.id == router_id)
+            if date_start:
+                c2b_stmt = c2b_stmt.where(C2BTransaction.received_at >= date_start)
+            if date_end:
+                c2b_stmt = c2b_stmt.where(C2BTransaction.received_at <= date_end)
+
+            for amount, shortcode, router_name, router_pk, connection_type in (
+                await db.execute(c2b_stmt)
+            ).all():
+                rows.append({
+                    "amount": float(amount),
+                    "status": "completed",
+                    "method": "mobile_money",
+                    "settlement": _settlement_of_c2b(shortcode),
                     "router_name": router_name,
                     "router_id": router_pk,
                     "counts_as_revenue": True,
