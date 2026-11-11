@@ -845,7 +845,7 @@ async def get_portal_data(
             "business_name": reseller.business_name,
             "payment_methods": getattr(router_obj, 'payment_methods', None) or ["mpesa", "voucher"],
             "payment_provider": collection_gateway,
-            # Plan prices are in the owner's market currency (KES, XAF, ZMW...).
+            # Plan prices are in the owner's market currency (KES, XAF, ZMW, HTG...).
             "currency": reseller_market(reseller).currency,
             "support_phone": reseller.support_phone,
         },
