@@ -52,6 +52,7 @@ from app.services.router_availability import (
 )
 from app.services.usage_tracking import record_usage
 from app.services.pppoe_sessions import resolve_extra_session_customer
+from app.services.pppoe_device_lock import desired_caller_id
 from app.services.usage_counters import clamp_to_line_rate, record_queue_usage_sample
 from app.services.fup import hotspot_throttle_speed_for_plan
 from app.services import customer_expiry_notifications
@@ -1302,6 +1303,7 @@ def _wall_expired_pppoe_customers(api, router_info: dict, customers_data: list, 
                     "pppoe_username": c["pppoe_username"],
                     "pppoe_password": c.get("pppoe_password"),
                     "comment": f"CID:{c['id']}|{c.get('name') or ''}|expired"[:120],
+                    "caller_id": c.get("pppoe_caller_id"),
                 }
                 for c in to_wall
             ],
@@ -1842,6 +1844,7 @@ async def cleanup_expired_users_background():
                         "expiry": c.expiry, "router_id": c.router_id,
                         "pppoe_password": c.pppoe_password,
                         "paused": c.paused_at is not None,
+                        "pppoe_caller_id": desired_caller_id(c),
                     })
                     continue
 

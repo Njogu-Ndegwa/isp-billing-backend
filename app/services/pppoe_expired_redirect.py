@@ -619,7 +619,7 @@ def teardown_expired_infra(api, config: Optional[Dict[str, Any]] = None) -> Dict
 def wall_pppoe_users(api, customers: List[Dict[str, Any]], *, create_missing: bool = True) -> Dict[str, Dict[str, Any]]:
     """Move each customer's secret to the walled profile and kick the session.
 
-    ``customers``: [{"id", "pppoe_username", "pppoe_password"?, "comment"?}].
+    ``customers``: [{"id", "pppoe_username", "pppoe_password"?, "comment"?, "caller_id"?}].
     Profile first, kick second: the redial then lands in the walled profile.
     A missing secret is re-created on the walled profile when the password is
     known and ``create_missing``; otherwise there is nothing to wall (no access).
@@ -646,6 +646,8 @@ def wall_pppoe_users(api, customers: List[Dict[str, Any]], *, create_missing: bo
                         "service": "pppoe", "profile": EXPIRED_PROFILE}
                 if cust.get("comment"):
                     args["comment"] = cust["comment"]
+                if cust.get("caller_id"):  # PPPoE device lock
+                    args["caller-id"] = cust["caller_id"]
                 _write(api, "/ppp/secret/add", args)
                 action = "created_walled"
             else:
