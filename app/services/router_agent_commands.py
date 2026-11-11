@@ -102,8 +102,19 @@ def render_pppoe_provision_action(
     password: str,
     bandwidth_limit: str,
     comment: str = "",
+    caller_id: str | None = None,
 ) -> str:
     user = _safe_username(username, "pppoe_username")
+    # PPPoE device lock: None leaves caller-id alone, "" clears it, a MAC locks.
+    caller_arg = ""
+    if caller_id is not None:
+        from app.services.pppoe_device_lock import normalize_mac
+
+        mac = normalize_mac(caller_id) if caller_id else ""
+        if caller_id and not mac:
+            raise ValueError(f"router-agent: unsafe caller_id={caller_id!r}")
+        caller_arg = f' caller-id="{mac}"'
+
     rate = parse_speed_to_mikrotik(bandwidth_limit)
     if not _RATE_RE.fullmatch(rate):
         raise ValueError(f"router-agent: unsafe rate_limit={rate!r}")
@@ -121,9 +132,9 @@ def render_pppoe_provision_action(
     /ppp profile set [find name=\"{profile}\"] rate-limit=\"{rate}\"
 }}
 :if ([:len [/ppp secret find name=\"{user}\"]] = 0) do={{
-    /ppp secret add name=\"{user}\" password=\"{password_q}\" service=pppoe profile=\"{profile}\" comment=\"{comment_q}\"
+    /ppp secret add name=\"{user}\" password=\"{password_q}\" service=pppoe profile=\"{profile}\" comment=\"{comment_q}\"{caller_arg}
 }} else={{
-    /ppp secret set [find name=\"{user}\"] password=\"{password_q}\" service=pppoe profile=\"{profile}\" comment=\"{comment_q}\" disabled=no
+    /ppp secret set [find name=\"{user}\"] password=\"{password_q}\" service=pppoe profile=\"{profile}\" comment=\"{comment_q}\" disabled=no{caller_arg}
 }}
 :do {{ /ppp active remove [find name=\"{user}\"] }} on-error={{}}
 """
@@ -367,6 +378,7 @@ async def queue_pppoe_provision_command(
         password=pppoe_payload.get("pppoe_password"),
         bandwidth_limit=pppoe_payload.get("bandwidth_limit"),
         comment=pppoe_payload.get("comment", ""),
+        caller_id=pppoe_payload.get("caller_id"),
     )
     entitlement_key = (
         f"attempt:{attempt_id}"

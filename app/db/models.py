@@ -273,6 +273,18 @@ class Customer(Base):
     paused_at = Column(DateTime, nullable=True)
     paused_remaining_seconds = Column(Integer, nullable=True)
     pause_resume_at = Column(DateTime, nullable=True)
+    # PPPoE device lock (app/services/pppoe_device_lock.py): when on, the PPP
+    # secret carries caller-id=<pppoe_bound_mac> so the login only works from
+    # the customer's own CPE. The MAC is learned from the first session that
+    # starts after pppoe_lock_learn_after (NULL = any session). Off by default.
+    # pppoe_lock_applied_mac is what we last wrote to the router's caller-id
+    # (NULL = nothing of ours there), so a lock we turned off gets cleared even
+    # if the router was unreachable at the time.
+    pppoe_device_lock = Column(Boolean, nullable=False, default=False, server_default="false")
+    pppoe_bound_mac = Column(String(17), nullable=True)
+    pppoe_bound_at = Column(DateTime, nullable=True)
+    pppoe_lock_learn_after = Column(DateTime, nullable=True)
+    pppoe_lock_applied_mac = Column(String(17), nullable=True)
     # Nullable self-reference used by managed companion devices that share the
     # paying customer's subscription/expiry instead of buying their own plan.
     subscription_owner_id = Column(
@@ -676,6 +688,9 @@ class Router(Base):
     # proxy-access syntax this RouterOS accepts, whether we enabled /ip proxy).
     pppoe_expired_redirect = Column(Boolean, nullable=False, default=False, server_default="false")
     pppoe_expired_redirect_config = Column(JSON, nullable=True)
+    # New PPPoE customers registered on this router start with the device lock
+    # on (Customer.pppoe_device_lock). Existing customers are never changed.
+    pppoe_lock_new_customers = Column(Boolean, nullable=False, default=False, server_default="false")
     payment_method_id = Column(Integer, ForeignKey("reseller_payment_methods.id"), nullable=True)
     assigned_payment_method = relationship("ResellerPaymentMethod", back_populates="routers")
 

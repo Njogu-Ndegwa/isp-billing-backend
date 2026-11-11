@@ -285,6 +285,21 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   payment sites call `drop_unpaid_page_plan` first, so it only counts for a payment of exactly
   that amount. Any new payment-confirmation path that reads `pending_update_data` must do the same.
 
+## PPPoE Device Lock (login only works from the customer's own router)
+
+- Per customer, off by default: `customers.pppoe_device_lock`, `pppoe_bound_mac`, `pppoe_bound_at`,
+  `pppoe_lock_learn_after`, `pppoe_lock_applied_mac`; per-router default for NEW customers
+  `routers.pppoe_lock_new_customers`. Code: `app/services/pppoe_device_lock.py`, routes
+  `app/api/pppoe_device_lock_routes.py`. Admin: "Lock to this router" card on the PPPoE customer page,
+  switch in Edit Router.
+- Locked = the PPP secret carries `caller-id=<CPE MAC>`; RouterOS refuses the login from any other MAC.
+  The MAC is learned from the first session (after "Allow new router": only a session that STARTED
+  after the press). The `reconcile_pppoe_device_locks` job (2 min) learns and retries router writes;
+  it only reads customers with the lock on or a caller-id of ours still applied.
+- Every PPPoE push builds its payload through `build_pppoe_payload` / `add_caller_id`: a NEW push path
+  must too, or a renewal after expiry re-adds the secret without the lock. No `caller_id` key = the
+  secret's caller-id is not touched (all unlocked customers).
+
 ## Customer Audit Log
 
 - `GET /api/customers/{id}/audit-log` (`app/api/customer_audit_routes.py`) merges, at read

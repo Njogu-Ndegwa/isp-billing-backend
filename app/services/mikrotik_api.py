@@ -3460,12 +3460,17 @@ class MikroTikAPI:
             return {"error": str(e)}
 
     def add_pppoe_secret(self, username: str, password: str, profile: str,
-                         service: str = "pppoe", comment: str = "") -> Dict[str, Any]:
+                         service: str = "pppoe", comment: str = "",
+                         caller_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Add a PPPoE secret (customer credentials) on the router.
         If the secret already exists, update it instead. When password is blank
         or unknown, only an existing secret can be updated; its RouterOS password
         is preserved.
+
+        ``caller_id`` (PPPoE device lock, app/services/pppoe_device_lock.py):
+        None leaves the secret's caller-id as it is (a new secret gets none);
+        a MAC locks the login to that device; "" clears a lock.
         """
         if not self.connected:
             return {"error": "Not connected"}
@@ -3502,6 +3507,8 @@ class MikroTikAPI:
                 }
                 if comment:
                     update_args["comment"] = comment
+                if caller_id is not None:
+                    update_args["caller-id"] = caller_id
                 result = self.send_command("/ppp/secret/set", update_args)
                 if result.get("error"):
                     return result
@@ -3516,6 +3523,8 @@ class MikroTikAPI:
             }
             if comment:
                 args["comment"] = comment
+            if caller_id is not None:
+                args["caller-id"] = caller_id
 
             result = self.send_command("/ppp/secret/add", args)
             if "error" in result:
@@ -3535,6 +3544,8 @@ class MikroTikAPI:
                     }
                     if comment:
                         update_args["comment"] = comment
+                    if caller_id is not None:
+                        update_args["caller-id"] = caller_id
                     result = self.send_command("/ppp/secret/set", update_args)
                     logger.info(f"Updated existing PPPoE secret for '{username}'")
                 else:

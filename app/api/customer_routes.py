@@ -44,6 +44,7 @@ from app.services.customer_grace import (
     renewal_expiry,
 )
 from app.services.customer_events import actor_label, record_customer_event
+from app.services.pppoe_device_lock import lock_fields as pppoe_lock_fields
 from app.services.customer_pause import (
     PauseError,
     pause_customer,
@@ -346,6 +347,10 @@ async def register_customer_api(
             user_id=user.id,
             router_id=request.router_id,
             account_number=account_number,
+            # Router default "lock new PPPoE customers to their first device".
+            pppoe_device_lock=bool(
+                pppoe_username and getattr(router_obj, "pppoe_lock_new_customers", False)
+            ),
         )
 
         db.add(customer)
@@ -1635,6 +1640,7 @@ async def get_customer_detail(
             "wallet_credit_kes": customer.wallet_credit_kes,
             **grace_fields(customer, datetime.utcnow()),
             **pause_fields(customer),
+            **pppoe_lock_fields(customer),
             "subscription_owner_id": customer.subscription_owner_id,
             "plan": {
                 "id": customer.plan.id,

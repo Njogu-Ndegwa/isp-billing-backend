@@ -172,6 +172,7 @@ from app.api.staff_routes import router as staff_router
 from app.api.pppoe_expired_routes import router as pppoe_expired_router
 from app.api.router_ap_routes import router as router_ap_router
 from app.api.customer_cpe_routes import router as customer_cpe_router
+from app.api.pppoe_device_lock_routes import router as pppoe_device_lock_router
 
 app.include_router(session_monitor_router)
 app.include_router(auth_router)
@@ -230,6 +231,7 @@ app.include_router(staff_router)
 app.include_router(pppoe_expired_router)
 app.include_router(router_ap_router)
 app.include_router(customer_cpe_router)
+app.include_router(pppoe_device_lock_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -3041,6 +3043,28 @@ async def run_pppoe_expired_redirect_migrations():
     logger.info("PPPoE expired-redirect migrations complete")
 
 
+async def run_pppoe_device_lock_migrations():
+    """PPPoE device lock (app/services/pppoe_device_lock.py): per-customer
+    customers.pppoe_device_lock / pppoe_bound_mac / pppoe_bound_at /
+    pppoe_lock_learn_after / pppoe_lock_applied_mac, and the per-router default
+    routers.pppoe_lock_new_customers. All off/NULL by default, so existing
+    customers are unaffected. Idempotent."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            ALTER TABLE customers
+            ADD COLUMN IF NOT EXISTS pppoe_device_lock BOOLEAN NOT NULL DEFAULT false,
+            ADD COLUMN IF NOT EXISTS pppoe_bound_mac VARCHAR(17) NULL,
+            ADD COLUMN IF NOT EXISTS pppoe_bound_at TIMESTAMP NULL,
+            ADD COLUMN IF NOT EXISTS pppoe_lock_learn_after TIMESTAMP NULL,
+            ADD COLUMN IF NOT EXISTS pppoe_lock_applied_mac VARCHAR(17) NULL
+        """))
+        await conn.execute(sa_text("""
+            ALTER TABLE routers
+            ADD COLUMN IF NOT EXISTS pppoe_lock_new_customers BOOLEAN NOT NULL DEFAULT false
+        """))
+    logger.info("PPPoE device-lock migrations complete")
+
+
 async def run_router_reachability_probe_migrations():
     """Record, once, when the reachability probe went live: outages that began
     before it are not announced to resellers (router_status_alerts
@@ -3918,6 +3942,11 @@ async def startup_event():
     except Exception as e:
         logger.error(f"PPPoE expired-redirect migration failed (non-fatal): {e}")
 
+    try:
+        await run_pppoe_device_lock_migrations()
+    except Exception as e:
+        logger.error(f"PPPoE device-lock migration failed (non-fatal): {e}")
+
     from app.config import settings as app_settings
     if not scheduler_enabled():
         if scheduler.running:
@@ -4439,6 +4468,28 @@ async def startup_event():
             await collect_router_logs_background()
         except Exception as e:
             logger.error(f"[AUDIT] router log collector failed: {e}")
+
+    # PPPoE device lock: learn the device MAC of newly locked customers and
+    # retry caller-id writes that did not land. Only customers with the lock
+    # on (or a caller-id of ours still on the router) are read, so with no
+    # one locked this is one small query per tick.
+    async def _reconcile_pppoe_device_locks_background():
+        from app.services.pppoe_device_lock import reconcile_device_locks_background
+        try:
+            await reconcile_device_locks_background()
+        except Exception as e:
+            logger.error(f"[PPPOE-LOCK] reconcile job failed: {e}")
+
+    scheduler.add_job(
+        _reconcile_pppoe_device_locks_background,
+        trigger=IntervalTrigger(seconds=120),
+        id='reconcile_pppoe_device_locks',
+        name='Learn PPPoE device-lock MACs and sync caller-id',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=120,
+    )
 
     scheduler.add_job(
         _collect_customer_router_logs_background,

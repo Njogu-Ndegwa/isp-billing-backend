@@ -104,8 +104,10 @@ def _router_info(router: Router) -> dict[str, Any]:
 
 
 def _target_provision_item(customer: Customer, target_router: Router) -> dict[str, Any]:
+    from app.services.pppoe_device_lock import add_caller_id
+
     plan = customer.plan
-    return {
+    return add_caller_id({
         "customer_id": customer.id,
         "pppoe_username": customer.pppoe_username,
         "pppoe_password": customer.pppoe_password,
@@ -113,7 +115,7 @@ def _target_provision_item(customer: Customer, target_router: Router) -> dict[st
         "max_devices": max_devices_for_customer(customer, plan),
         "comment": f"CID:{customer.id}|{customer.name or customer.phone}|{datetime.utcnow().strftime('%Y-%m-%d')}",
         "router_id": target_router.id,
-    }
+    }, customer)
 
 
 def _failure(customer_id: int | None, username: str | None, error: str) -> dict[str, Any]:
@@ -212,6 +214,7 @@ def _provision_target_router_sync(router_info: dict[str, Any], items: list[dict[
                     password=item.get("pppoe_password"),
                     profile=profile_name,
                     comment=item.get("comment", ""),
+                    **({"caller_id": item["caller_id"]} if "caller_id" in item else {}),
                 )
                 if secret_result.get("error"):
                     failed.append(_failure(customer_id, username, f"Secret creation failed: {secret_result['error']}"))

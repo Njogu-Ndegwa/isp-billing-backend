@@ -38,6 +38,7 @@ from app.services.provisioning_retry_policy import (
 from app.services.fapshi_reconciliation import non_fapshi_attempt_clause
 from app.config import settings
 from app.services.router_availability import record_router_availability
+from app.services.pppoe_device_lock import add_caller_id
 
 logger = logging.getLogger("pppoe_provisioning")
 
@@ -243,11 +244,14 @@ def _provision_pppoe_sync(payload: dict) -> dict:
         profile_result = ensured["profile_result"]
 
         comment = payload.get("comment", "")
+        # PPPoE device lock: no "caller_id" key = leave caller-id alone.
+        lock_kwargs = {"caller_id": payload["caller_id"]} if "caller_id" in payload else {}
         secret_result = api.add_pppoe_secret(
             username=payload["pppoe_username"],
             password=payload["pppoe_password"],
             profile=profile_name,
             comment=comment,
+            **lock_kwargs,
         )
         if secret_result.get("error"):
             logger.error(f"[PPPoE] Secret creation failed: {secret_result['error']}")
@@ -751,6 +755,7 @@ async def retry_pending_pppoe_provisioning_background():
                     "router_password": router.password,
                     "router_port": router.port,
                 }
+                add_caller_id(payload, customer)
                 # A retried login or plan change on a customer FUP is holding
                 # down settles the hold, the same as when the first push works.
                 async with db_module.async_session() as db:
@@ -782,8 +787,12 @@ def _pppoe_max_devices(customer, plan) -> int:
 
 
 def build_pppoe_payload(customer, router) -> dict:
-    """Build the payload dict for PPPoE provisioning from ORM objects."""
-    return {
+    """Build the payload dict for PPPoE provisioning from ORM objects.
+
+    Carries ``caller_id`` only for customers with a PPPoE device lock (or one
+    being cleared), so every renewal/plan change/re-provision keeps the lock.
+    """
+    return add_caller_id({
         "pppoe_username": customer.pppoe_username,
         "pppoe_password": customer.pppoe_password,
         "bandwidth_limit": customer.plan.speed if customer.plan else "10Mbps",
@@ -793,7 +802,7 @@ def build_pppoe_payload(customer, router) -> dict:
         "router_username": router.username,
         "router_password": router.password,
         "router_port": router.port,
-    }
+    }, customer)
 
 
 def build_pppoe_remove_payload(customer, router) -> dict:
