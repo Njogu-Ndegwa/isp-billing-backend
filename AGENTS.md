@@ -285,6 +285,20 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   payment sites call `drop_unpaid_page_plan` first, so it only counts for a payment of exactly
   that amount. Any new payment-confirmation path that reads `pending_update_data` must do the same.
 
+## Customer Register Details
+
+- Optional per-customer details a reseller fills on the add/edit form: `national_id`
+  (ID / passport), `email`, `alt_phone`, `address_line` (house / unit), `building`
+  (building / estate), `installation_date`, `notes`. Validation, masking and the field
+  list live in `app/services/customer_profile.py` (`PROFILE_FIELDS`); the columns come
+  from `run_customer_profile_migrations` in `main.py`.
+- `national_id` is personal data: list endpoints return only `national_id_masked`
+  (`***` + last 3); the full number only on `GET/PUT /api/customers/{id}` and the
+  register response for the owning reseller. Admin search by ID goes through
+  `GET /api/customers/national-id-matches?q=` (ids only). Never log it: the audit log
+  records "ID / passport number changed", and register/edit errors go through
+  `_error_text`, which drops SQL parameters.
+
 ## Customer Audit Log
 
 - `GET /api/customers/{id}/audit-log` (`app/api/customer_audit_routes.py`) merges, at read

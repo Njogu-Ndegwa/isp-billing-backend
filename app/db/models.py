@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, Enum, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint, CheckConstraint, text
+from sqlalchemy import Column, Integer, String, Text, Enum, Date, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint, CheckConstraint, text
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import Session, relationship
 from sqlalchemy import event
@@ -273,6 +273,16 @@ class Customer(Base):
     paused_at = Column(DateTime, nullable=True)
     paused_remaining_seconds = Column(Integer, nullable=True)
     pause_resume_at = Column(DateTime, nullable=True)
+    # Customer register details the reseller fills in (all optional). See
+    # app/services/customer_profile.py. national_id is personal data: lists
+    # and exports carry it masked, it is never logged.
+    national_id = Column(String(32), nullable=True)
+    email = Column(String(254), nullable=True)
+    alt_phone = Column(String(32), nullable=True)
+    address_line = Column(String(200), nullable=True)  # house / unit
+    building = Column(String(120), nullable=True)  # building / estate
+    installation_date = Column(Date, nullable=True)
+    notes = Column(Text, nullable=True)
     # Nullable self-reference used by managed companion devices that share the
     # paying customer's subscription/expiry instead of buying their own plan.
     subscription_owner_id = Column(
