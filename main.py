@@ -2972,6 +2972,37 @@ async def run_customer_pause_migrations():
     raise last_exc
 
 
+async def run_customer_profile_migrations():
+    """Add the customers register-detail columns (app/services/customer_profile.py):
+    national_id, email, alt_phone, address_line, building, installation_date
+    and notes. All nullable with no default and no backfill, so this is a
+    metadata-only change. Idempotent.
+
+    Same retry loop as run_customer_grace_migrations: customers is the hottest
+    table and app connections carry lock_timeout.
+    """
+    last_exc = None
+    for attempt in range(1, 6):
+        try:
+            async with async_engine.begin() as conn:
+                await conn.execute(sa_text("""
+                    ALTER TABLE customers
+                    ADD COLUMN IF NOT EXISTS national_id VARCHAR(32) NULL,
+                    ADD COLUMN IF NOT EXISTS email VARCHAR(254) NULL,
+                    ADD COLUMN IF NOT EXISTS alt_phone VARCHAR(32) NULL,
+                    ADD COLUMN IF NOT EXISTS address_line VARCHAR(200) NULL,
+                    ADD COLUMN IF NOT EXISTS building VARCHAR(120) NULL,
+                    ADD COLUMN IF NOT EXISTS installation_date DATE NULL,
+                    ADD COLUMN IF NOT EXISTS notes TEXT NULL
+                """))
+            return
+        except Exception as exc:  # lock_timeout under a busy table: try again
+            last_exc = exc
+            logger.warning("Customer profile migration attempt %d failed: %s", attempt, exc)
+            await asyncio.sleep(2 * attempt)
+    raise last_exc
+
+
 async def run_standard_runtime_migrations():
     """Add the routers columns the standard-runtime installer records its work
     in (app/services/standard_runtime_enrol.py): check-in applier and
@@ -3837,6 +3868,12 @@ async def startup_event():
         logger.info("Customer pause migration completed successfully")
     except Exception as e:
         logger.error(f"Customer pause migration failed (non-fatal): {e}")
+
+    try:
+        await run_customer_profile_migrations()
+        logger.info("Customer profile migration completed successfully")
+    except Exception as e:
+        logger.error(f"Customer profile migration failed (non-fatal): {e}")
 
     try:
         await run_standard_runtime_migrations()

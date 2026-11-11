@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, update, text, and_, or_
+from sqlalchemy import select, delete, update, text, and_, or_, func
 from sqlalchemy.orm import selectinload
+from sqlalchemy.exc import StatementError
 from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime, timedelta
@@ -45,6 +46,15 @@ from app.services.customer_grace import (
 )
 from app.services.customer_events import actor_label, record_customer_event
 from app.services.pppoe_device_lock import lock_fields as pppoe_lock_fields
+from app.services.customer_profile import (
+    AUDITED_PROFILE_FIELDS,
+    CHANGED_ONLY_PROFILE_FIELDS,
+    NATIONAL_ID_SEARCH_MIN,
+    PROFILE_FIELDS,
+    clean_profile_updates,
+    normalize_id_query,
+    profile_fields,
+)
 from app.services.customer_pause import (
     PauseError,
     pause_customer,
@@ -70,6 +80,15 @@ logger = logging.getLogger(__name__)
 
 # Strong references to detached grace-restore tasks (asyncio keeps only weak ones).
 _grace_restore_tasks: set[asyncio.Task] = set()
+
+
+def _error_text(exc: Exception) -> str:
+    """An exception as text for a log line / error detail, without the SQL
+    parameters SQLAlchemy appends to database errors: those carry the
+    customer's national ID and other register details, which never go to logs."""
+    if isinstance(exc, StatementError):
+        return f"{type(exc).__name__}: {exc.orig}"
+    return str(exc)
 
 
 def _generated_pppoe_username(phone: str) -> Optional[str]:
@@ -133,12 +152,15 @@ _AUDITED_FIELDS = (
     ("name", "name"), ("phone", "phone"), ("plan_id", "plan"), ("router_id", "router"),
     ("mac_address", "MAC"), ("pppoe_username", "PPPoE username"),
     ("static_ip", "static IP"), ("expiry", "expiry"),
+    *AUDITED_PROFILE_FIELDS,
 )
 
 
 def _audit_snapshot(customer) -> dict:
     snap = {field: getattr(customer, field) for field, _ in _AUDITED_FIELDS}
     snap["pppoe_password"] = customer.pppoe_password
+    for field, _ in CHANGED_ONLY_PROFILE_FIELDS:
+        snap[field] = getattr(customer, field)
     return snap
 
 
@@ -164,6 +186,11 @@ def _audit_changes(before: dict, after: dict, names: dict) -> tuple[list[str], d
     if before.get("pppoe_password") != after.get("pppoe_password"):
         parts.append("PPPoE password changed")
         changes["pppoe_password"] = ["***", "***"]
+    # Personal data / free text: the log says that it changed, never the value.
+    for field, label in CHANGED_ONLY_PROFILE_FIELDS:
+        if before.get(field) != after.get(field):
+            parts.append(f"{label} changed")
+            changes[field] = ["***", "***"]
     return parts, changes
 
 
@@ -261,6 +288,15 @@ class CustomerRegisterRequest(BaseModel):
     # Static-IP plans: the device MAC to pin the IP to (optional; learned
     # automatically the first time the device is seen while paid up).
     static_mac: Optional[str] = None
+    # Register details (all optional; see app/services/customer_profile.py).
+    # On an edit, leaving a field out keeps it and "" clears it.
+    national_id: Optional[str] = None
+    email: Optional[str] = None
+    alt_phone: Optional[str] = None
+    address_line: Optional[str] = None
+    building: Optional[str] = None
+    installation_date: Optional[str] = None
+    notes: Optional[str] = None
 
 
 class UpdateLocationRequest(BaseModel):
@@ -278,6 +314,7 @@ async def register_customer_api(
     try:
         user = await get_current_user(token, db)
         enforce_active_subscription(user)
+        profile = clean_profile_updates(request.model_dump(include=set(PROFILE_FIELDS)))
         
         # Validate plan exists
         plan_stmt = select(Plan).where(Plan.id == request.plan_id, Plan.user_id == user.id)
@@ -351,6 +388,7 @@ async def register_customer_api(
             pppoe_device_lock=bool(
                 pppoe_username and getattr(router_obj, "pppoe_lock_new_customers", False)
             ),
+            **profile,
         )
 
         db.add(customer)
@@ -388,14 +426,15 @@ async def register_customer_api(
             "user_id": customer.user_id,
             "account_number": customer.account_number,
             "expiry": customer.expiry.isoformat() if customer.expiry else None,
-            "created_at": customer.created_at.isoformat()
+            "created_at": customer.created_at.isoformat(),
+            **profile_fields(customer, reveal_national_id=True),
         }
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error registering customer: {str(e)}")
+        logger.error(f"Error registering customer: {_error_text(e)}")
         await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to register customer: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to register customer: {_error_text(e)}")
 
 
 class CustomerEditRequest(BaseModel):
@@ -414,6 +453,15 @@ class CustomerEditRequest(BaseModel):
     # the router, WITHOUT recording money: for customers migrated from another
     # system who already paid there. Never implied by editing the expiry.
     activate_paid_until: bool = False
+    # Register details (all optional; see app/services/customer_profile.py).
+    # On an edit, leaving a field out keeps it and "" clears it.
+    national_id: Optional[str] = None
+    email: Optional[str] = None
+    alt_phone: Optional[str] = None
+    address_line: Optional[str] = None
+    building: Optional[str] = None
+    installation_date: Optional[str] = None
+    notes: Optional[str] = None
 
 
 # Furthest ahead "already paid until" may reach: a year's subscription plus a
@@ -442,6 +490,9 @@ async def edit_customer(
         customer = result.scalar_one_or_none()
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
+
+        # Before anything touches a router: a bad email must not leave half an edit.
+        profile_updates = clean_profile_updates(request.model_dump(include=set(PROFILE_FIELDS)))
 
         if customer.paused_at is not None and (
             request.activate_paid_until
@@ -583,7 +634,9 @@ async def edit_customer(
         pppoe_changed = False
         pppoe_location_changed = False
 
-        update_fields = request.model_dump(exclude_none=True, exclude={"activate_paid_until"})
+        update_fields = request.model_dump(
+            exclude_none=True, exclude={"activate_paid_until", *PROFILE_FIELDS}
+        )
         if "phone" in update_fields:
             update_fields["phone"] = update_fields["phone"].strip()
         if request.pppoe_username is not None:
@@ -595,6 +648,8 @@ async def edit_customer(
         if update_fields.get("static_mac") == "":
             update_fields["static_mac"] = None  # cleared: re-learn on next sighting
         for field, value in update_fields.items():
+            setattr(customer, field, value)
+        for field, value in profile_updates.items():
             setattr(customer, field, value)
         if target_is_static and not was_static:
             customer.mac_address = None
@@ -796,6 +851,7 @@ async def edit_customer(
                 "router_id": customer.router_id,
                 "expiry": customer.expiry.isoformat() if customer.expiry else None,
                 "created_at": customer.created_at.isoformat() if customer.created_at else None,
+                **profile_fields(customer, reveal_national_id=True),
                 "plan": {
                     "id": customer.plan.id,
                     "name": customer.plan.name,
@@ -819,9 +875,9 @@ async def edit_customer(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error editing customer {customer_id}: {e}")
+        logger.error(f"Error editing customer {customer_id}: {_error_text(e)}")
         await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to edit customer: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to edit customer: {_error_text(e)}")
 
 
 def _validate_paid_until_activation(
@@ -1497,6 +1553,7 @@ async def get_customers_api(
                 "wallet_credit_kes": c.wallet_credit_kes,
                 **grace_fields(c, now),
                 **pause_fields(c),
+                **profile_fields(c, reveal_national_id=False),
                 "subscription_owner_id": c.subscription_owner_id,
                 "has_paid": bool(c_has_paid),
                 "tier": "customer" if c_has_paid else "visitor",
@@ -1578,6 +1635,7 @@ async def get_active_customers(
                 "wallet_credit_kes": c.wallet_credit_kes,
                 **grace_fields(c, now),
                 **pause_fields(c),
+                **profile_fields(c, reveal_national_id=False),
                 "has_paid": bool(c_has_paid),
                 "tier": "customer" if c_has_paid else "visitor",
                 "plan": {
@@ -1596,6 +1654,39 @@ async def get_active_customers(
     except Exception as e:
         logger.error(f"Error fetching active customers: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch active customers")
+
+
+@router.get("/api/customers/national-id-matches")
+async def national_id_matches(
+    q: str,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """IDs of this reseller's customers whose national ID / passport number
+    contains ``q`` (compared on letters and digits only, any case).
+
+    The customer list carries the number masked, so the admin search asks here
+    instead. Returns customer ids only, never the numbers. A ``q`` shorter than
+    NATIONAL_ID_SEARCH_MIN characters matches nothing.
+    """
+    user = await get_current_user(token, db)
+    needle = normalize_id_query(q)
+    if len(needle) < NATIONAL_ID_SEARCH_MIN:
+        return {"customer_ids": []}
+    # Stored numbers are upper case already (clean_national_id); strip the
+    # separators the same way the query was stripped.
+    stored = func.replace(func.replace(func.replace(Customer.national_id, " ", ""), "-", ""), "/", "")
+    rows = await db.execute(
+        select(Customer.id)
+        .where(
+            Customer.user_id == user.id,
+            Customer.national_id.isnot(None),
+            stored.contains(needle, autoescape=True),
+        )
+        .order_by(Customer.id)
+        .limit(500)
+    )
+    return {"customer_ids": [row[0] for row in rows.all()]}
 
 
 @router.get("/api/customers/{customer_id}")
@@ -1641,6 +1732,7 @@ async def get_customer_detail(
             **grace_fields(customer, datetime.utcnow()),
             **pause_fields(customer),
             **pppoe_lock_fields(customer),
+            **profile_fields(customer, reveal_national_id=True),
             "subscription_owner_id": customer.subscription_owner_id,
             "plan": {
                 "id": customer.plan.id,
