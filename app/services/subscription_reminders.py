@@ -71,15 +71,18 @@ DEFAULT_TIMEZONE = "Africa/Nairobi"
 QUIET_START_HOUR = 22   # local, inclusive
 QUIET_END_HOUR = 7      # local, exclusive — held reminders release at 07:00
 
-# Every market we sell in has a fixed UTC offset and no daylight saving. Used
-# when the runtime has no tz database (python:slim images often don't), so a
-# missing zoneinfo never silently turns quiet hours into UTC hours.
+# Fallback UTC offset and label per market timezone. Used when the runtime has
+# no tz database (python:slim images often don't), so a missing zoneinfo never
+# silently turns quiet hours into UTC hours. The African markets have no
+# daylight saving; Haiti does (EST/EDT), so with a tz database its label comes
+# from zoneinfo and this entry is only the standard-time fallback.
 _FIXED_OFFSETS = {
     "Africa/Nairobi": (3, "EAT"),
     "Africa/Kampala": (3, "EAT"),
     "Africa/Dar_es_Salaam": (3, "EAT"),
     "Africa/Douala": (1, "WAT"),
     "Africa/Lusaka": (2, "CAT"),
+    "America/Port-au-Prince": (-5, "EST"),
 }
 
 # main.py schedules check_overdue_invoices at 08:00 UTC. That run is what
@@ -143,8 +146,18 @@ def _zone(tz_name: Optional[str]):
         return timezone(timedelta(hours=hours))
 
 
-def zone_abbreviation(tz_name: Optional[str]) -> str:
-    return _FIXED_OFFSETS.get(tz_name or DEFAULT_TIMEZONE, (0, "local time"))[1]
+def zone_abbreviation(tz_name: Optional[str], when_utc: Optional[datetime] = None) -> str:
+    """'EAT', 'CAT', 'EST'/'EDT'... for the zone, at *when_utc* when given."""
+    name = tz_name or DEFAULT_TIMEZONE
+    if when_utc is not None:
+        try:
+            label = when_utc.replace(tzinfo=timezone.utc).astimezone(ZoneInfo(name)).tzname()
+        except (ZoneInfoNotFoundError, ValueError):
+            label = None
+        # zoneinfo names some zones "+03"; keep our table's letters for those.
+        if label and label.isalpha():
+            return label
+    return _FIXED_OFFSETS.get(name, (0, "local time"))[1]
 
 
 def to_local(when_utc: datetime, tz_name: Optional[str]) -> datetime:
@@ -309,7 +322,7 @@ def render_suspended_inbox(expires_at: datetime, amount: Optional[float],
                            tz_name: Optional[str] = DEFAULT_TIMEZONE) -> tuple[str, str]:
     """(subject, body) for the post-suspension inbox message."""
     local = to_local(expires_at, tz_name).strftime("%a %d %b at %I:%M%p").replace(" 0", " ")
-    zone = zone_abbreviation(tz_name)
+    zone = zone_abbreviation(tz_name, expires_at)
     charge = _format_amount(amount, currency) or "your outstanding balance"
     subject = "Your account is suspended"
     body = (
@@ -328,7 +341,7 @@ def render_reminder_inbox(expires_at: datetime, now: datetime,
                           tz_name: Optional[str] = DEFAULT_TIMEZONE) -> tuple[str, str]:
     """(subject, body) for the in-app copy — no segment budget, so spell it out."""
     local = to_local(expires_at, tz_name).strftime("%a %d %b at %I:%M%p").replace(" 0", " ")
-    zone = zone_abbreviation(tz_name)
+    zone = zone_abbreviation(tz_name, expires_at)
     amt = _format_amount(amount, currency)
     charge = amt or "your outstanding balance"
     what = "free trial" if trial else "subscription"

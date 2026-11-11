@@ -100,6 +100,11 @@ MARKETS: dict[str, Market] = {
     # usd_rate: open.er-api.com mid-market rate on 2026-11-07.
     "ZM": Market("ZM", "Zambia", "ZMW", "en", ("en",), "Africa/Lusaka", "260",
                  _INTERNATIONAL_PRICING, (PAY_CARD,), usd_rate=20.32),
+    # Haiti: vouchers only for end users, like Zambia (router payment_methods
+    # ["voucher"]). French dashboard; English where we have no French yet.
+    # usd_rate: open.er-api.com mid-market rate on 2026-11-11.
+    "HT": Market("HT", "Haiti", "HTG", "fr", ("fr", "en"), "America/Port-au-Prince", "509",
+                 _INTERNATIONAL_PRICING, (PAY_CARD,), usd_rate=131.16),
 }
 
 

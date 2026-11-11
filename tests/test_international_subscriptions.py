@@ -201,6 +201,24 @@ async def test_zambia_reseller_above_threshold_pays_three_percent_in_usd(db):
 
 
 @pytest.mark.asyncio
+async def test_haiti_voucher_reseller_pays_usd_minimum(db):
+    # A new Haitian voucher reseller: HTG 3,000 of vouchers in the month is
+    # about USD 23, so 3% is far under the USD 10 minimum.
+    reseller = await make_reseller(db, market_code="HT")
+    await _voucher_revenue(db, reseller, 3000)
+    await _voucher_revenue(db, reseller, 1000, counts_as_revenue=False)
+
+    charges = await calculate_reseller_charges(db, reseller.id, PERIOD_START, PERIOD_END)
+
+    assert charges["currency"] == "USD"
+    assert charges["pricing_rule"]["fx_rate"] == 131.16
+    assert charges["pricing_rule"]["revenue_currency"] == "HTG"
+    assert charges["pricing_rule"]["hotspot_revenue_local"] == 3000
+    assert charges["hotspot_revenue"] == 22.87
+    assert charges["final_charge"] == 10.0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("connection_type", [ConnectionType.PPPOE, ConnectionType.STATIC_IP])
 async def test_international_pppoe_users_cost_twenty_cents(db, connection_type):
     reseller = await make_reseller(db, market_code="UG")
@@ -304,7 +322,7 @@ async def test_mpesa_refuses_usd_invoice(db, client, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("market_code", ["CM", "ZM"])
+@pytest.mark.parametrize("market_code", ["CM", "ZM", "HT"])
 async def test_card_checkout_then_admin_confirmation_activates(
     db, client, monkeypatch, session_factory, market_code,
 ):
