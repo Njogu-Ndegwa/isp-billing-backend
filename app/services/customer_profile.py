@@ -15,10 +15,18 @@ The national ID is personal data:
   reseller who owns the customer (detail, register, edit);
 - it is never written to a log line or to the audit log (an edit records only
   "national ID changed").
+
+The install location (latitude / longitude, already columns on ``customers``)
+is a pair: both or neither. It is set from the register and edit forms (an
+installer's phone GPS, typed coordinates or a pasted Google Maps link, parsed
+in the admin) and ``location_captured_at`` records when. Like the ID it is
+returned on single-customer responses only and the audit log only says that it
+changed.
 """
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import date, datetime
 from typing import Any, Callable, Optional
@@ -183,3 +191,75 @@ CHANGED_ONLY_PROFILE_FIELDS = (
     ("national_id", "ID / passport number"),
     ("notes", "notes"),
 )
+
+
+# ---------------------------------------------------------------------------
+# Install location (latitude / longitude pair)
+# ---------------------------------------------------------------------------
+
+# ~11 cm. Enough for a house; drops the noise of a pasted 15-digit float.
+LOCATION_DECIMALS = 6
+
+
+def clean_location(latitude: Any, longitude: Any) -> Optional[tuple[float, float]]:
+    """Validated (lat, lng), or None when neither was given.
+
+    Raises 400 when only one is given, when either is out of range or not a
+    number, and for exactly 0,0 (what a failed GPS read reports, never a
+    customer's house).
+    """
+    if latitude is None and longitude is None:
+        return None
+    if latitude is None or longitude is None:
+        raise _bad("Enter both latitude and longitude, or leave both empty")
+    try:
+        lat, lng = float(latitude), float(longitude)
+    except (TypeError, ValueError):
+        raise _bad("Latitude and longitude must be numbers") from None
+    if not (math.isfinite(lat) and math.isfinite(lng)):
+        raise _bad("Latitude and longitude must be numbers")
+    if not -90 <= lat <= 90:
+        raise _bad("Latitude must be between -90 and 90")
+    if not -180 <= lng <= 180:
+        raise _bad("Longitude must be between -180 and 180")
+    if lat == 0 and lng == 0:
+        raise _bad("0, 0 is not a real location. Capture the location again")
+    return round(lat, LOCATION_DECIMALS), round(lng, LOCATION_DECIMALS)
+
+
+def location_updates(
+    latitude: Any, longitude: Any, *, clear: bool = False, current=None,
+) -> dict:
+    """Column values for a register / edit.
+
+    Neither given: nothing changes (``{}``), unless ``clear`` is set, which
+    removes the location. A pair equal to the stored one (an edit form sending
+    back what it loaded) also changes nothing, so ``location_captured_at``
+    keeps saying when it was really captured.
+    """
+    pair = clean_location(latitude, longitude)
+    if pair is None:
+        if clear and current is not None and (
+            current.latitude is not None or current.longitude is not None
+        ):
+            return {"latitude": None, "longitude": None, "location_captured_at": None}
+        return {}
+    if clear:
+        raise _bad("Either clear the location or send new coordinates, not both")
+    if current is not None and (current.latitude, current.longitude) == pair:
+        return {}
+    return {
+        "latitude": pair[0],
+        "longitude": pair[1],
+        "location_captured_at": datetime.utcnow(),
+    }
+
+
+def location_fields(customer) -> dict:
+    """Location for a single-customer response (never for lists)."""
+    captured = customer.location_captured_at
+    return {
+        "latitude": customer.latitude,
+        "longitude": customer.longitude,
+        "location_captured_at": captured.isoformat() if captured else None,
+    }

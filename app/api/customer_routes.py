@@ -51,7 +51,10 @@ from app.services.customer_profile import (
     CHANGED_ONLY_PROFILE_FIELDS,
     NATIONAL_ID_SEARCH_MIN,
     PROFILE_FIELDS,
+    clean_location,
     clean_profile_updates,
+    location_fields,
+    location_updates,
     normalize_id_query,
     profile_fields,
 )
@@ -161,6 +164,7 @@ def _audit_snapshot(customer) -> dict:
     snap["pppoe_password"] = customer.pppoe_password
     for field, _ in CHANGED_ONLY_PROFILE_FIELDS:
         snap[field] = getattr(customer, field)
+    snap["location"] = (customer.latitude, customer.longitude)
     return snap
 
 
@@ -191,6 +195,13 @@ def _audit_changes(before: dict, after: dict, names: dict) -> tuple[list[str], d
         if before.get(field) != after.get(field):
             parts.append(f"{label} changed")
             changes[field] = ["***", "***"]
+    # A home location: say whether it was set, changed or removed, not where.
+    old_loc, new_loc = before.get("location"), after.get("location")
+    if old_loc != new_loc:
+        had = old_loc is not None and old_loc[0] is not None
+        has = new_loc is not None and new_loc[0] is not None
+        parts.append("location " + ("changed" if had and has else "set" if has else "removed"))
+        changes["location"] = ["***" if had else "(none)", "***" if has else "(none)"]
     return parts, changes
 
 
@@ -297,6 +308,9 @@ class CustomerRegisterRequest(BaseModel):
     building: Optional[str] = None
     installation_date: Optional[str] = None
     notes: Optional[str] = None
+    # Install location: both or neither (app/services/customer_profile.py).
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
 
 class UpdateLocationRequest(BaseModel):
@@ -315,6 +329,7 @@ async def register_customer_api(
         user = await get_current_user(token, db)
         enforce_active_subscription(user)
         profile = clean_profile_updates(request.model_dump(include=set(PROFILE_FIELDS)))
+        profile.update(location_updates(request.latitude, request.longitude))
         
         # Validate plan exists
         plan_stmt = select(Plan).where(Plan.id == request.plan_id, Plan.user_id == user.id)
@@ -428,6 +443,7 @@ async def register_customer_api(
             "expiry": customer.expiry.isoformat() if customer.expiry else None,
             "created_at": customer.created_at.isoformat(),
             **profile_fields(customer, reveal_national_id=True),
+            **location_fields(customer),
         }
     except HTTPException:
         raise
@@ -462,6 +478,11 @@ class CustomerEditRequest(BaseModel):
     building: Optional[str] = None
     installation_date: Optional[str] = None
     notes: Optional[str] = None
+    # Install location: send both to set it, neither to keep it, or
+    # clear_location=true to remove it.
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    clear_location: bool = False
 
 
 # Furthest ahead "already paid until" may reach: a year's subscription plus a
@@ -493,6 +514,10 @@ async def edit_customer(
 
         # Before anything touches a router: a bad email must not leave half an edit.
         profile_updates = clean_profile_updates(request.model_dump(include=set(PROFILE_FIELDS)))
+        profile_updates.update(location_updates(
+            request.latitude, request.longitude,
+            clear=request.clear_location, current=customer,
+        ))
 
         if customer.paused_at is not None and (
             request.activate_paid_until
@@ -635,7 +660,8 @@ async def edit_customer(
         pppoe_location_changed = False
 
         update_fields = request.model_dump(
-            exclude_none=True, exclude={"activate_paid_until", *PROFILE_FIELDS}
+            exclude_none=True,
+            exclude={"activate_paid_until", "latitude", "longitude", "clear_location", *PROFILE_FIELDS},
         )
         if "phone" in update_fields:
             update_fields["phone"] = update_fields["phone"].strip()
@@ -852,6 +878,7 @@ async def edit_customer(
                 "expiry": customer.expiry.isoformat() if customer.expiry else None,
                 "created_at": customer.created_at.isoformat() if customer.created_at else None,
                 **profile_fields(customer, reveal_national_id=True),
+                **location_fields(customer),
                 "plan": {
                     "id": customer.plan.id,
                     "name": customer.plan.name,
@@ -1733,6 +1760,7 @@ async def get_customer_detail(
             **pause_fields(customer),
             **pppoe_lock_fields(customer),
             **profile_fields(customer, reveal_national_id=True),
+            **location_fields(customer),
             "subscription_owner_id": customer.subscription_owner_id,
             "plan": {
                 "id": customer.plan.id,
@@ -1771,9 +1799,10 @@ async def update_customer_location(
         
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
-        
-        customer.latitude = request.latitude
-        customer.longitude = request.longitude
+
+        lat, lng = clean_location(request.latitude, request.longitude)
+        customer.latitude = lat
+        customer.longitude = lng
         customer.location_captured_at = datetime.utcnow()
         
         await db.commit()
@@ -1782,8 +1811,9 @@ async def update_customer_location(
             "success": True,
             "message": "Location updated successfully",
             "customer_id": customer_id,
-            "latitude": request.latitude,
-            "longitude": request.longitude
+            "latitude": lat,
+            "longitude": lng,
+            "location_captured_at": customer.location_captured_at.isoformat(),
         }
     except HTTPException:
         raise
