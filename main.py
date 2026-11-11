@@ -170,6 +170,7 @@ from app.api.customer_device_routes import router as customer_device_router
 from app.api.admin_support_desk_routes import router as admin_support_desk_router
 from app.api.staff_routes import router as staff_router
 from app.api.pppoe_expired_routes import router as pppoe_expired_router
+from app.api.pppoe_router_lock_routes import router as pppoe_router_lock_router
 from app.api.router_ap_routes import router as router_ap_router
 from app.api.customer_cpe_routes import router as customer_cpe_router
 
@@ -228,6 +229,7 @@ app.include_router(customer_device_router)
 app.include_router(admin_support_desk_router)
 app.include_router(staff_router)
 app.include_router(pppoe_expired_router)
+app.include_router(pppoe_router_lock_router)
 app.include_router(router_ap_router)
 app.include_router(customer_cpe_router)
 
@@ -2768,6 +2770,28 @@ async def run_free_setup_column_migration():
             ))
 
 
+async def run_pppoe_router_lock_user_migration():
+    """Add users.pppoe_router_lock_enabled (opt-in, default false, so nothing
+    changes for any reseller until they turn it on).
+
+    Every User query reads this column, login included, so like the
+    free-setup migration it must succeed before serving. Constant DEFAULT:
+    metadata-only on Postgres. Idempotent.
+    """
+    async with async_engine.begin() as conn:
+        if conn.dialect.name == "sqlite":
+            columns = (await conn.execute(sa_text("PRAGMA table_info(users)"))).all()
+            if "pppoe_router_lock_enabled" not in {row[1] for row in columns}:
+                await conn.execute(sa_text(
+                    "ALTER TABLE users ADD COLUMN pppoe_router_lock_enabled BOOLEAN NOT NULL DEFAULT 0"
+                ))
+        else:
+            await conn.execute(sa_text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS pppoe_router_lock_enabled "
+                "BOOLEAN NOT NULL DEFAULT false"
+            ))
+
+
 async def run_settlement_mode_migrations():
     """Add users.settlement_mode ('platform' | 'direct').
 
@@ -2966,6 +2990,37 @@ async def run_customer_pause_migrations():
         except Exception as exc:  # lock_timeout under a busy table: try again
             last_exc = exc
             logger.warning("Customer pause migration attempt %d failed: %s", attempt, exc)
+            await asyncio.sleep(2 * attempt)
+    raise last_exc
+
+
+async def run_customer_register_migrations():
+    """Add the optional customer-register columns (location text, ID number,
+    house, email, install date, notes) and customers.pppoe_locked_router_id
+    for the opt-in PPPoE router lock. All nullable with no default, so this is
+    a metadata-only change. Idempotent.
+
+    Same retry loop as run_customer_grace_migrations: customers is the hottest
+    table and app connections carry lock_timeout.
+    """
+    last_exc = None
+    for attempt in range(1, 6):
+        try:
+            async with async_engine.begin() as conn:
+                await conn.execute(sa_text("""
+                    ALTER TABLE customers
+                    ADD COLUMN IF NOT EXISTS location VARCHAR(255) NULL,
+                    ADD COLUMN IF NOT EXISTS id_number VARCHAR(50) NULL,
+                    ADD COLUMN IF NOT EXISTS house VARCHAR(120) NULL,
+                    ADD COLUMN IF NOT EXISTS email VARCHAR(255) NULL,
+                    ADD COLUMN IF NOT EXISTS install_date DATE NULL,
+                    ADD COLUMN IF NOT EXISTS notes TEXT NULL,
+                    ADD COLUMN IF NOT EXISTS pppoe_locked_router_id INTEGER NULL
+                """))
+            return
+        except Exception as exc:  # lock_timeout under a busy table: try again
+            last_exc = exc
+            logger.warning("Customer register migration attempt %d failed: %s", attempt, exc)
             await asyncio.sleep(2 * attempt)
     raise last_exc
 
@@ -3603,6 +3658,7 @@ async def startup_event():
     # Auth queries below include users.token_version; migrate before any user reads.
     await run_staff_migrations()
     await run_free_setup_column_migration()
+    await run_pppoe_router_lock_user_migration()
 
     # Recovery is part of authentication; never serve an incomplete auth schema.
     await run_password_reset_migrations()
@@ -3813,6 +3869,12 @@ async def startup_event():
         logger.info("Customer pause migration completed successfully")
     except Exception as e:
         logger.error(f"Customer pause migration failed (non-fatal): {e}")
+
+    try:
+        await run_customer_register_migrations()
+        logger.info("Customer register migration completed successfully")
+    except Exception as e:
+        logger.error(f"Customer register migration failed (non-fatal): {e}")
 
     try:
         await run_standard_runtime_migrations()

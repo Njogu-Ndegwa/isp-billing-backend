@@ -4,7 +4,7 @@ from sqlalchemy import select, delete, update, text, and_, or_
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel, Field
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import asyncio
 import re
 import secrets
@@ -25,6 +25,7 @@ from app.db.models import (
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
+from app.services import pppoe_router_lock
 from app.services.pppoe_provisioning import (
     call_pppoe_provision, call_pppoe_remove, provision_pppoe_customer,
     build_pppoe_payload, build_pppoe_remove_payload,
@@ -132,6 +133,8 @@ _AUDITED_FIELDS = (
     ("name", "name"), ("phone", "phone"), ("plan_id", "plan"), ("router_id", "router"),
     ("mac_address", "MAC"), ("pppoe_username", "PPPoE username"),
     ("static_ip", "static IP"), ("expiry", "expiry"),
+    ("location", "location"), ("id_number", "ID number"), ("house", "house/building"),
+    ("email", "email"), ("install_date", "install date"), ("notes", "notes"),
 )
 
 
@@ -248,7 +251,58 @@ async def _pay_by_mpesa_map(db: AsyncSession, customers, paybills: dict) -> dict
 router = APIRouter(tags=["customers"])
 
 
-class CustomerRegisterRequest(BaseModel):
+# Optional customer-register fields (shown on the add/edit form and detail
+# view). On edit, an empty string clears a field; omitted leaves it alone.
+REGISTER_TEXT_FIELDS = {"location": 255, "id_number": 50, "house": 120, "email": 255, "notes": 2000}
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _clean_register_fields(values: dict) -> dict:
+    """Trim the optional register fields; "" becomes None. 400 on bad input."""
+    out = {}
+    for field, limit in REGISTER_TEXT_FIELDS.items():
+        if field not in values:
+            continue
+        raw = values[field]
+        value = raw.strip() if isinstance(raw, str) else raw
+        if value == "":
+            value = None
+        if value is not None and len(value) > limit:
+            raise HTTPException(status_code=400, detail=f"{field} is too long (max {limit} characters)")
+        if field == "email" and value is not None and not _EMAIL_RE.match(value):
+            raise HTTPException(status_code=400, detail="Enter a valid email address")
+        out[field] = value
+    if "install_date" in values:
+        out["install_date"] = values["install_date"] or None
+    return out
+
+
+def _register_fields(customer) -> dict:
+    return {
+        "location": customer.location,
+        "latitude": customer.latitude,
+        "longitude": customer.longitude,
+        "id_number": customer.id_number,
+        "house": customer.house,
+        "email": customer.email,
+        "install_date": customer.install_date.isoformat() if customer.install_date else None,
+        "notes": customer.notes,
+    }
+
+
+class CustomerRegisterFields(BaseModel):
+    location: Optional[str] = None
+    # Optional map pin, same columns as POST /api/customers/{id}/location.
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+    id_number: Optional[str] = None
+    house: Optional[str] = None
+    email: Optional[str] = None
+    install_date: Optional[date] = None
+    notes: Optional[str] = None
+
+
+class CustomerRegisterRequest(CustomerRegisterFields):
     name: str
     phone: str
     plan_id: int
@@ -331,9 +385,18 @@ async def register_customer_api(
                 )
 
         account_number = await generate_account_number(db)
+        register_fields = _clean_register_fields(
+            request.model_dump(include=set(REGISTER_TEXT_FIELDS) | {"install_date"}, exclude_none=True)
+        )
+        if request.latitude is not None and request.longitude is not None:
+            register_fields.update(
+                latitude=request.latitude, longitude=request.longitude,
+                location_captured_at=datetime.utcnow(),
+            )
 
         # Create customer
         customer = Customer(
+            **register_fields,
             name=request.name,
             phone=phone,
             mac_address=mac_address,
@@ -347,6 +410,7 @@ async def register_customer_api(
             router_id=request.router_id,
             account_number=account_number,
         )
+        pppoe_router_lock.stamp_if_unlocked(user, customer)
 
         db.add(customer)
         await db.commit()
@@ -383,7 +447,9 @@ async def register_customer_api(
             "user_id": customer.user_id,
             "account_number": customer.account_number,
             "expiry": customer.expiry.isoformat() if customer.expiry else None,
-            "created_at": customer.created_at.isoformat()
+            "created_at": customer.created_at.isoformat(),
+            **_register_fields(customer),
+            **pppoe_router_lock.lock_fields(user, customer),
         }
     except HTTPException:
         raise
@@ -393,7 +459,7 @@ async def register_customer_api(
         raise HTTPException(status_code=500, detail=f"Failed to register customer: {str(e)}")
 
 
-class CustomerEditRequest(BaseModel):
+class CustomerEditRequest(CustomerRegisterFields):
     name: Optional[str] = None
     phone: Optional[str] = None
     plan_id: Optional[int] = None
@@ -469,6 +535,14 @@ async def edit_customer(
             router_result = await db.execute(router_stmt)
             if not router_result.scalar_one_or_none():
                 raise HTTPException(status_code=404, detail="Router not found")
+            try:
+                pppoe_router_lock.check_router_change(user, customer, request.router_id)
+            except pppoe_router_lock.PppoeRouterLocked as exc:
+                raise HTTPException(status_code=409, detail={
+                    "status": "pppoe_router_locked",
+                    "message": str(exc),
+                    "locked_router_id": exc.locked_router_id,
+                })
 
         if request.mac_address is not None and request.mac_address != customer.mac_address:
             mac_stmt = select(Customer).where(
@@ -578,7 +652,20 @@ async def edit_customer(
         pppoe_changed = False
         pppoe_location_changed = False
 
-        update_fields = request.model_dump(exclude_none=True, exclude={"activate_paid_until"})
+        update_fields = request.model_dump(
+            exclude_none=True,
+            exclude={"activate_paid_until", "latitude", "longitude", *REGISTER_TEXT_FIELDS, "install_date"},
+        )
+        # Register fields: sent = set (an empty string clears it), omitted = kept.
+        update_fields.update(_clean_register_fields(
+            request.model_dump(include=set(REGISTER_TEXT_FIELDS) | {"install_date"}, exclude_unset=True)
+        ))
+        if request.latitude is not None and request.longitude is not None:
+            if (request.latitude, request.longitude) != (customer.latitude, customer.longitude):
+                update_fields.update(
+                    latitude=request.latitude, longitude=request.longitude,
+                    location_captured_at=datetime.utcnow(),
+                )
         if "phone" in update_fields:
             update_fields["phone"] = update_fields["phone"].strip()
         if request.pppoe_username is not None:
@@ -593,6 +680,9 @@ async def edit_customer(
             setattr(customer, field, value)
         if target_is_static and not was_static:
             customer.mac_address = None
+        # Opt-in PPPoE router lock: an unstamped login (released, or never
+        # stamped) is locked to wherever this edit leaves it.
+        pppoe_router_lock.stamp_if_unlocked(user, customer)
 
         activation_payment = None
         if activating:
@@ -791,6 +881,8 @@ async def edit_customer(
                 "router_id": customer.router_id,
                 "expiry": customer.expiry.isoformat() if customer.expiry else None,
                 "created_at": customer.created_at.isoformat() if customer.created_at else None,
+                **_register_fields(customer),
+                **pppoe_router_lock.lock_fields(user, customer),
                 "plan": {
                     "id": customer.plan.id,
                     "name": customer.plan.name,
@@ -1481,6 +1573,8 @@ async def get_customers_api(
                 "pppoe_password": c.pppoe_password,
                 "static_ip": c.static_ip,
                 "static_mac": c.static_mac,
+                **_register_fields(c),
+                "pppoe_locked_router_id": c.pppoe_locked_router_id,
                 "status": c.status.value,
                 "expiry": c.expiry.isoformat() if c.expiry else None,
                 "created_at": c.created_at.isoformat() if c.created_at else None,
@@ -1561,6 +1655,8 @@ async def get_active_customers(
                 "pppoe_password": c.pppoe_password,
                 "static_ip": c.static_ip,
                 "static_mac": c.static_mac,
+                **_register_fields(c),
+                "pppoe_locked_router_id": c.pppoe_locked_router_id,
                 "status": c.status.value,
                 "expiry": c.expiry.isoformat() if c.expiry else None,
                 "hours_remaining": (c.expiry - now).total_seconds() / 3600 if c.expiry and c.expiry > now else 0,
@@ -1636,6 +1732,8 @@ async def get_customer_detail(
             **grace_fields(customer, datetime.utcnow()),
             **pause_fields(customer),
             "subscription_owner_id": customer.subscription_owner_id,
+            **_register_fields(customer),
+            **pppoe_router_lock.lock_fields(user, customer),
             "plan": {
                 "id": customer.plan.id,
                 "name": customer.plan.name,

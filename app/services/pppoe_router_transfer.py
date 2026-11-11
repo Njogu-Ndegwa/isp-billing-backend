@@ -384,6 +384,10 @@ async def transfer_pppoe_customers_between_routers(
 
     for customer in customers:
         customer.router_id = target_router_id
+        # Opt-in PPPoE router lock (app/services/pppoe_router_lock.py): a
+        # whole-router transfer replaces the box, so the lock follows it.
+        if customer.pppoe_locked_router_id == source_router_id:
+            customer.pppoe_locked_router_id = target_router_id
 
     if customer_ids:
         usage_result = await db.execute(

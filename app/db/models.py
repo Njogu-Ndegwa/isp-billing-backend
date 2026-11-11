@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, Enum, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint, CheckConstraint, text
+from sqlalchemy import Column, Integer, String, Text, Enum, Date, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint, CheckConstraint, text
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import Session, relationship
 from sqlalchemy import event
@@ -197,6 +197,11 @@ class User(Base):
     # issued before this column existed carry no tv and count as 0, so nobody
     # is logged out by the deploy itself.
     token_version = Column(Integer, nullable=False, default=0, server_default="0")
+    # Opt-in (default off): every PPPoE login stays on the router it was first
+    # put on (Customer.pppoe_locked_router_id). Moving a locked login to another
+    # router is refused until the reseller releases that one account.
+    # See app/services/pppoe_router_lock.py.
+    pppoe_router_lock_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
 
 class PasswordResetToken(Base):
     __tablename__ = "password_reset_tokens"
@@ -249,6 +254,19 @@ class Customer(Base):
     latitude = Column(Float, nullable=True)
     longitude = Column(Float, nullable=True)
     location_captured_at = Column(DateTime, nullable=True)
+    # Customer register (optional, mostly PPPoE): free-text location/address
+    # next to the lat/lng above, plus the details an ISP keeps on file.
+    location = Column(String(255), nullable=True)
+    id_number = Column(String(50), nullable=True)
+    house = Column(String(120), nullable=True)
+    email = Column(String(255), nullable=True)
+    install_date = Column(Date, nullable=True)
+    notes = Column(Text, nullable=True)
+    # PPPoE router lock (User.pppoe_router_lock_enabled): the router this login
+    # is locked to. NULL = not stamped yet (taken from the current router the
+    # first time the lock applies) or released by the reseller for one move.
+    # No FK on purpose: a second FK to routers would make Customer.router ambiguous.
+    pppoe_locked_router_id = Column(Integer, nullable=True)
     # C2B Paybill: 8-digit Luhn-validated account number a customer types
     # into the M-Pesa Paybill menu. Nullable during backfill; flipped to
     # NOT NULL once migrations/make_customer_account_number_not_null.py runs.
