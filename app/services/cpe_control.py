@@ -98,6 +98,15 @@ _OFFLINE = {
 }
 
 
+_OFFLINE_LINE = {
+    "error": "offline",
+    "offline": True,
+    "message": "The customer is offline: no active PPPoE session on this router right now, "
+               "so there is no line to reconnect. Ask them to check power and the WAN/fibre; "
+               "the router redials by itself once the line is back up.",
+}
+
+
 def _locate_cpe(api, cred: ApCredential, username: str):
     """Resolve the device IP from the live session, or refuse as offline.
 
@@ -223,10 +232,10 @@ def disconnect_cpe_session_sync(router_info: Dict[str, Any], username: str,
             return {"error": "disconnect_failed", "message": result["error"],
                     "disconnected": int(result.get("disconnected") or 0)}
         disconnected = int(result.get("disconnected") or 0)
+        if not disconnected:
+            return {**_OFFLINE_LINE, "disconnected": 0}
         return {"success": True, "action": ACTION_DISCONNECT, "disconnected": disconnected,
                 "message": ("Line disconnected; the router will redial within a few seconds. "
-                            "This reconnects the line -- it does not reboot the device.")
-                           if disconnected else
-                           ("The customer had no active session to disconnect; nothing to redial.")}
+                            "This reconnects the line -- it does not reboot the device.")}
 
     return _with_api(router_info, api_factory, run)

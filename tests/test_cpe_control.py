@@ -268,10 +268,13 @@ def test_disconnect_fallback_drops_the_session():
     assert "does not reboot" in res["message"]
 
 
-def test_disconnect_when_no_session_says_nothing_to_redial():
+def test_disconnect_when_no_session_is_offline():
     fake = FakeMikroTik(FakeTendaCpe(), ppp_rows=_ppp_active(user=None))
     res = cpe_control.disconnect_cpe_session_sync(ROUTER_INFO, PPPOE_USER, api_factory=fake.factory)
-    assert res["success"] and res["disconnected"] == 0
+    assert not res.get("success")
+    assert res["error"] == "offline" and res["offline"] and res["disconnected"] == 0
+    assert "offline" in res["message"].lower()
+    assert fake.removed_sessions == []
 
 
 def test_ip_is_resolved_live_not_from_a_stale_hint():
@@ -447,6 +450,75 @@ async def test_reboot_and_disconnect(client, db, patch_router):
     assert disc.status_code == 200, disc.text
     assert disc.json()["disconnected"] == 1
     assert fake.removed_sessions == ["*1"]
+
+
+@pytest.mark.asyncio
+async def test_disconnect_works_without_a_saved_password(client, db, patch_router):
+    # The line reconnect is the always-works fallback: no CPE credential row at all.
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_IP)
+    customer = await _pppoe_customer(db, owner, router)
+    fake = patch_router(FakeTendaCpe())
+    disc = await client.post(f"/api/customers/{customer.id}/cpe/disconnect",
+                             headers=headers(_owner_token(owner)), json={"confirm": True})
+    assert disc.status_code == 200, disc.text
+    assert disc.json()["disconnected"] == 1
+    assert fake.removed_sessions == ["*1"]
+    assert fake.fetches == []  # the device itself is never contacted
+    assert (await db.execute(select(CustomerCpeCredential))).scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio
+async def test_disconnect_without_password_when_offline_is_409(client, db, patch_router):
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_IP)
+    customer = await _pppoe_customer(db, owner, router)
+    fake = patch_router(FakeTendaCpe(), ppp_rows=_ppp_active(user=None))
+    disc = await client.post(f"/api/customers/{customer.id}/cpe/disconnect",
+                             headers=headers(_owner_token(owner)), json={"confirm": True})
+    assert disc.status_code == 409, disc.text
+    assert "offline" in disc.json()["detail"].lower()
+    assert fake.removed_sessions == []
+
+
+@pytest.mark.asyncio
+async def test_disconnect_still_needs_confirm_without_password(client, db, patch_router):
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_IP)
+    customer = await _pppoe_customer(db, owner, router)
+    fake = patch_router(FakeTendaCpe())
+    resp = await client.post(f"/api/customers/{customer.id}/cpe/disconnect",
+                             headers=headers(_owner_token(owner)), json={})
+    assert resp.status_code == 400
+    assert fake.commands == []
+
+
+@pytest.mark.asyncio
+async def test_status_and_reboot_still_need_a_saved_password(client, db, patch_router):
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_IP)
+    customer = await _pppoe_customer(db, owner, router)
+    fake = patch_router(FakeTendaCpe())
+    token = headers(_owner_token(owner))
+    status = await client.get(f"/api/customers/{customer.id}/cpe/status", headers=token)
+    reboot = await client.post(f"/api/customers/{customer.id}/cpe/reboot",
+                               headers=token, json={"confirm": True})
+    assert status.status_code == 404 and reboot.status_code == 404
+    assert "no saved password" in status.json()["detail"].lower()
+    assert fake.commands == []
+
+
+@pytest.mark.asyncio
+async def test_disconnect_for_non_pppoe_customer_is_rejected(client, db, patch_router):
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_IP)
+    plan = await make_plan(db, owner, connection_type=ConnectionType.HOTSPOT)
+    customer = await make_customer(db, owner, plan, router)
+    fake = patch_router(FakeTendaCpe())
+    resp = await client.post(f"/api/customers/{customer.id}/cpe/disconnect",
+                             headers=headers(_owner_token(owner)), json={"confirm": True})
+    assert resp.status_code == 400
+    assert fake.commands == []
 
 
 @pytest.mark.asyncio

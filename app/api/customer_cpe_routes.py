@@ -297,6 +297,25 @@ async def delete_cpe_credential(
 # Status / reboot / disconnect
 # ---------------------------------------------------------------------------
 
+async def _prepare_line(db: AsyncSession, customer_id: int, token: str):
+    """Customer + router context for an action on the PPPoE *line* only.
+
+    No device credential is read: dropping the session needs nothing but the
+    customer's PPPoE username and the MikroTik, so it must work even when no
+    router (CPE) password was ever saved.
+    """
+    customer, _user = await _load_customer(db, customer_id, token)
+    router_obj = _require_pppoe(customer)
+    ctx = {
+        "router_id": router_obj.id,
+        "router_name": router_obj.name,
+        "router_info": router_info_of(router_obj),
+        "username": customer.pppoe_username,
+    }
+    await db.commit()
+    return ctx
+
+
 async def _prepare_action(db: AsyncSession, customer_id: int, token: str):
     customer, user = await _load_customer(db, customer_id, token)
     router_obj = _require_pppoe(customer)
@@ -344,7 +363,8 @@ async def cpe_status(
 
 
 async def _run_write(request, db, customer_id, token, action, sync_fn, *, needs_device: bool):
-    ctx = await _prepare_action(db, customer_id, token)
+    ctx = await (_prepare_action(db, customer_id, token) if needs_device
+                 else _prepare_line(db, customer_id, token))
     router_id = ctx["router_id"]
     claim = ap_control.try_claim(router_id)
     if claim is None:
@@ -408,7 +428,10 @@ async def disconnect_cpe(
     token: str = Depends(verify_token),
 ):
     """Fallback restart: drop the PPPoE session so the device redials. This
-    reconnects the line; it does not reboot the device."""
+    reconnects the line; it does not reboot the device.
+
+    Needs no saved router (CPE) password -- only a PPPoE customer with a live
+    session. No live session -> 409 "customer is offline"."""
     body = body or ConfirmRequest()
     if not body.confirm:
         raise HTTPException(status_code=400, detail="Set confirm=true to disconnect the line")
