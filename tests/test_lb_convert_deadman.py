@@ -9,7 +9,7 @@ confirms the router is online, and cancels it.
 from app.api import load_balancing_routes as lbr
 from app.services import mikrotik_lb
 from tests.test_mikrotik_lb import FakeLBAPI, _commands, _no_settle  # noqa: F401
-from tests.test_mikrotik_lb_ros6 import _on_dhcp_add, _router537
+from tests.test_mikrotik_lb_ros6 import _on_dhcp_add, _router537, _router537_renumbered
 
 WANS = ["ether1", "ether2"]
 
@@ -23,9 +23,10 @@ def _run_enable(monkeypatch, api):
 
 
 def _bound_537():
-    api = _router537()
-    _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.100.1",
-                       "address": "192.168.100.3/24"})
+    """Router 537 with modem B renumbered to 192.168.101.1 (no subnet clash)."""
+    api = _router537_renumbered()
+    _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.101.1",
+                       "address": "192.168.101.3/24"})
     return api
 
 
@@ -122,3 +123,48 @@ def test_enable_without_linked_secondary_ports_sets_no_scheduler(monkeypatch):
     assert result["dormant_ports"] == ["ether2"]
     assert "deadman" not in result
     assert _commands(api, "/system/scheduler/add") == []
+
+
+# --- second line in WAN1's range ------------------------------------------------------
+
+def test_enable_stops_at_preflight_when_modem_shares_wan1_range(monkeypatch):
+    api = _router537()  # modem B on 192.168.100.1, same as WAN1's gateway
+    result = _run_enable(monkeypatch, api)
+
+    assert result["error"] == "preflight_blocked"
+    assert any("same IP range" in b for b in result["preflight"]["blockers"])
+    assert [c for c, _ in api.commands if c != "/ping"] == []
+
+
+def test_enable_lease_time_clash_reverts_port_and_takes_fresh_lb_off(monkeypatch):
+    # the modem looks foreign while it sits on the LAN, but leases 192.168.100.x
+    api = _router537_renumbered()
+    _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.100.1",
+                       "address": "192.168.100.3/24"})
+    result = _run_enable(monkeypatch, api)
+
+    assert result["error"] == "wan_subnet_clash"
+    assert result["success"] is False
+    assert result["subnet_clash"]["detected_by"] == "lease"
+    assert result["converted_ports"] == []
+    assert result["rollback"]["success"] is True
+    assert result["seed"] is None
+    assert not [m for m in api.mangle_rules
+                if (m.get("comment") or "").startswith("ISP_BILLING")]
+    assert not [r for r in api.routes if (r.get("comment") or "").startswith("ISP_BILLING")]
+    assert any(p["interface"] == "ether2" for p in api.bridge_ports)
+    assert not any(d["interface"] == "ether2" for d in api.dhcp_clients)
+    assert result["deadman_disarmed"] is True
+
+
+def test_enable_lease_time_clash_keeps_existing_lb(monkeypatch):
+    api = _router537_renumbered()
+    mikrotik_lb.lb_apply(api, WANS)  # LB already on from an earlier run
+    _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.100.1",
+                       "address": "192.168.100.3/24"})
+    result = _run_enable(monkeypatch, api)
+
+    assert result["error"] == "wan_subnet_clash"
+    assert "rollback" not in result
+    assert [m for m in api.mangle_rules
+            if m.get("comment") == mikrotik_lb.GUARD_COMMENT]

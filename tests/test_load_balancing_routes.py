@@ -388,3 +388,38 @@ async def test_enable_quiet_when_safety_net_disarmed(db, monkeypatch):
         db, _token(reseller),
     )
     assert not any("revert" in w for w in resp["warnings"])
+
+
+async def test_enable_subnet_clash_is_422_with_the_message_and_does_not_persist(db, monkeypatch):
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller)
+    msg = ("Your second line uses the same IP range as the first (192.168.1.x). "
+           "Change the second modem's LAN IP (e.g. to 192.168.2.1) and try again.")
+    clash_result = {
+        "error": "wan_subnet_clash",
+        "success": False,
+        "preflight": {"blockers": [], "warnings": [], "existing_pcc_rules": []},
+        "convert": {"ether2": {"aborted": msg, "reverted": True}},
+        "subnet_clash": {"port": "ether2", "clashes_with": "ether1",
+                         "network": "192.168.1.0/24", "detected_by": "lease",
+                         "suggested_modem_ip": "192.168.2.1", "message": msg},
+        "rollback": {"steps": [], "success": True},
+        "converted_ports": [], "dormant_ports": ["ether2"],
+    }
+    monkeypatch.setattr(lbr, "_run_locked_router_thread", _fake_runner(clash_result))
+
+    with pytest.raises(HTTPException) as exc:
+        await lbr.enable_load_balancing(
+            router.id,
+            lbr.LBEnableRequest(wan_ports=["ether1", "ether2"], confirm=True),
+            db, _token(reseller),
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["message"] == msg
+    assert exc.value.detail["blockers"] == [msg]
+    assert exc.value.detail["subnet_clash"]["suggested_modem_ip"] == "192.168.2.1"
+    assert "load balancing was not left on" in exc.value.detail["router_state"]
+
+    await db.refresh(router)
+    assert router.lb_enabled is False
+    assert router.lb_config is None
