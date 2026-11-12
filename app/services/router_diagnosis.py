@@ -143,7 +143,7 @@ TITLES = {
     "tunnel_down": "Tunnel down, site online",
     "offline": "Site dark",
     "healthy_now": "Reachable now",
-    "login_rejected": "API login rejected",
+    "login_rejected": "API credentials mismatch",
     "inconclusive": "Inconclusive",
 }
 
@@ -163,7 +163,8 @@ ACTION_HEALTHY = "Reachable again — waiting payments will retry"
 ACTION_TUNNEL_DOWN = "Router is online but its management tunnel is down — check the tunnel"
 ACTION_TUNNEL_DOWN_CHECKIN = ("Management tunnel is down; payments still deliver via check-in — "
                               "fix the tunnel")
-ACTION_LOGIN_REJECTED = "API login rejected — check the router's API username/password"
+ACTION_LOGIN_REJECTED = ("API credentials mismatch — the router answers over its tunnel but refuses "
+                         "our password (setup code run twice?); re-run setup")
 ACTION_INCONCLUSIVE = "Probe inconclusive — will retry next round"
 
 # router_id -> public diagnosis + private "_probed_at"

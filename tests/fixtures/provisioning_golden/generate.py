@@ -13,7 +13,10 @@ was added (fix/provision-anti-tunnel: a hotspot security fix for every token),
 and when STEP 10 moved the reboot into an :execute job (an inline reboot
 waits for a y/N prompt and hung a terminal import on router 689), and when
 STEP 8b made anti-tethering the default for new routers (feat/anti-
-tethering-default: same raw rules as MikroTikAPI.enable_anti_tethering).
+tethering-default: same raw rules as MikroTikAPI.enable_anti_tethering),
+and when STEP 8 became add-or-set for the bitwave-api account (fix/setup-
+api-user-idempotent: a bare add kept the OLD password on a router set up
+twice, router 714 on 2026-11-12).
 tests/test_provisioning_hetzner.py asserts the flag-off output -- and the
 output for legacy tokens with the flag on -- is byte-for-byte identical to
 them. Only regenerate on purpose, and explain the diff in the PR.
