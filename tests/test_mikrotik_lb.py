@@ -175,7 +175,15 @@ class FakeLBAPI(MikroTikAPI):
             self._remove_by_id(self.address_lists, args.get(".id"))
         elif command == "/ip/firewall/mangle/add":
             row.setdefault("disabled", "false")
-            self.mangle_rules.append(row)
+            before = row.pop("place-before", None)
+            if before is None:
+                self.mangle_rules.append(row)
+            else:
+                idx = next((i for i, r in enumerate(self.mangle_rules)
+                            if r.get(".id") == before), None)
+                if idx is None:
+                    return {"error": "no such item (place-before)"}
+                self.mangle_rules.insert(idx, row)
         elif command == "/ip/firewall/mangle/set":
             for r in self.mangle_rules:
                 if r.get(".id") == args.get(".id"):
