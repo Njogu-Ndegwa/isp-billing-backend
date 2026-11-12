@@ -358,9 +358,21 @@
 # ---- STEP 8: CREATE API SERVICE ACCOUNT & SET IDENTITY ----
 
 /system identity set name=Router-0001
-:do { /user add name=bitwave-api password="ApiPassword123" group=full comment="Bitwave backend API account" } on-error={}
+# add-or-set: a router set up before already has bitwave-api with an older
+# password; it must get this setup's password or the server cannot log in.
+:do {
+    :if ([:len [/user find where name=bitwave-api]] = 0) do={
+        /user add name=bitwave-api password="ApiPassword123" group=full comment="Bitwave backend API account"
+        :log info "Provisioning: API user bitwave-api created"
+    } else={
+        /user set [find where name=bitwave-api] password="ApiPassword123" group=full comment="Bitwave backend API account" disabled=no
+        :log info "Provisioning: API user bitwave-api already existed -- password reset for this setup"
+    }
+} on-error={
+    :log error "PROVISION WARNING: could not create or update API user bitwave-api -- the server will not be able to log in"
+}
 
-:log info "Provisioning: Identity set to Router-0001, API user created" 
+:log info "Provisioning: Identity set to Router-0001, API user ready" 
 
 # ---- STEP 9: REMOVE LEGACY OUTBOUND COMMAND AGENT ----
 

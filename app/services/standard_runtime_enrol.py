@@ -55,7 +55,7 @@ from app.db.models import Router, RouterAuthMethod, SubscriptionStatus, User
 from app.services import checkin_delivery
 from app.services.checkin_applier_script import install_checkin_applier
 from app.services.expiry_reaper_enrol import routeros_version_ok
-from app.services.mikrotik_api import LANE_BACKGROUND, MikroTikAPI
+from app.services.mikrotik_api import LANE_BACKGROUND, MikroTikAPI, api_credentials_rejected
 from app.services.mgmt_watchdog_script import detect_kind, install_watchdog
 
 logger = logging.getLogger(__name__)
@@ -72,6 +72,9 @@ _PERMANENT_REASON_PREFIXES = (
     "scheduler_failed: failure: configuration flagged",
 )
 _OK_STATUSES = ("installed", "updated", "unchanged")
+# Recorded as the component reason (routers.checkin_install_reason /
+# mgmt_watchdog_reason) when the router refuses our API password.
+CREDENTIALS_MISMATCH_REASON = "API credentials mismatch -- re-run setup"
 
 
 def is_small_board(board_name: Optional[str], architecture: Optional[str]) -> bool:
@@ -276,6 +279,19 @@ def probe_and_install_sync(c: Candidate, api_factory=None) -> Outcome:
     api = factory(c.ip_address, c.username, c.password, c.port,
                   timeout=60, connect_timeout=6, lane=LANE_BACKGROUND)
     if not api.connect():
+        error = getattr(api, "last_connect_error", None)
+        if api_credentials_rejected(error):
+            # The router answered over its tunnel and refused our password:
+            # its bitwave-api account has a different password than the one
+            # stored for it -- typically the setup code was run a second time
+            # on the same MikroTik by a script that kept the old account
+            # (router 714, 2026-11-12). Nothing can be installed or delivered
+            # until the setup is re-run.
+            logger.warning(
+                "[API-CREDS-MISMATCH] router %s (%s, %s): %s -- API credentials mismatch, re-run setup",
+                c.id, c.name, c.ip_address, error,
+            )
+            return _both(c, CREDENTIALS_MISMATCH_REASON)
         return _both(c, "unreachable")
     try:
         ident = _first(api, "/system/identity/print").get("name")

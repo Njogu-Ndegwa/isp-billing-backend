@@ -1072,6 +1072,23 @@ def _rsc_input_accept_first(comment: str, match: str) -> str:
 }}"""
 
 
+def _rsc_drop_stale_addresses(interface: str, keep: str) -> str:
+    """Remove every address on one of OUR interfaces except this setup's.
+
+    The address `add` is wrapped in on-error={} so a re-run does not abort --
+    but a router set up before (a new token, so a new address) then carries
+    the OLD address next to the new one. On the tunnel interface both sit in
+    the same /16, the router may source its own traffic (watchdog, check-in)
+    from the old one, and the server drops it because that address belongs to
+    no peer any more. Only our dedicated interfaces (wg-hz, lo-mgmt) are
+    cleaned, never a reseller's.
+    """
+    return (
+        f':do {{ /ip address remove [find where interface={interface} and address!="{keep}"] }} '
+        f'on-error={{ :log warning "Provisioning: could not remove stale addresses on {interface}" }}'
+    )
+
+
 def _rsc_mgmt_loopback_pin(token: ProvisioningToken) -> str:
     """Pin the router's DB address 10.0.X.Y on the `lo-mgmt` loopback bridge.
 
@@ -1089,6 +1106,7 @@ def _rsc_mgmt_loopback_pin(token: ProvisioningToken) -> str:
 :if ([:len [/interface bridge find where name={loopback}]] = 0) do={{
     :do {{ /interface bridge add name={loopback} comment="Management IP pin" }} on-error={{}}
 }}
+{_rsc_drop_stale_addresses(loopback, f"{mgmt_ip}/32")}
 :if ([:len [/ip address find where address="{mgmt_ip}/32" and interface={loopback}]] = 0) do={{
     :do {{ /ip address add address={mgmt_ip}/32 interface={loopback} comment="Management IP pin" }} on-error={{}}
 }}"""
@@ -1114,6 +1132,7 @@ def _rsc_vpn_hetzner_wireguard(token: ProvisioningToken) -> str:
 }} on-error={{
     /interface wireguard set [find where name={iface}] listen-port={port} private-key="{token.wg_private_key}"
 }}
+{_rsc_drop_stale_addresses(iface, f"{tunnel_ip}/16")}
 :do {{ /ip address add address={tunnel_ip}/16 interface={iface} }} on-error={{}}
 :do {{
     /interface wireguard peers add interface={iface} {peer_params}
@@ -1684,13 +1703,39 @@ def _rsc_api_access_hetzner(token: ProvisioningToken) -> str:
 
 
 def _rsc_identity_and_user(token: ProvisioningToken) -> str:
+    """Create the API account, or reset it when it already exists.
+
+    The router is registered with THIS token's password, so the account must
+    end up with it whatever state the router is in. A plain `add` inside
+    `:do ... on-error={}` failed silently on a router that already had
+    bitwave-api from an earlier setup run: the router kept the old password,
+    the server stored the new one, and every API login was refused with
+    "invalid user name or password" (router 714, SPEEDNET, 2026-11-12, the
+    same MikroTik set up the day before as router 711). So: add when missing,
+    otherwise set the password (and what the add would set) on the existing
+    account, and say so loudly in the log if neither works.
+    """
+    user = API_USERNAME
+    params = f'password="{token.router_admin_password}" group=full comment="Bitwave backend API account"'
     return f"""
 # ---- STEP 8: CREATE API SERVICE ACCOUNT & SET IDENTITY ----
 
 /system identity set name={token.identity}
-:do {{ /user add name={API_USERNAME} password="{token.router_admin_password}" group=full comment="Bitwave backend API account" }} on-error={{}}
+# add-or-set: a router set up before already has {user} with an older
+# password; it must get this setup's password or the server cannot log in.
+:do {{
+    :if ([:len [/user find where name={user}]] = 0) do={{
+        /user add name={user} {params}
+        :log info "Provisioning: API user {user} created"
+    }} else={{
+        /user set [find where name={user}] {params} disabled=no
+        :log info "Provisioning: API user {user} already existed -- password reset for this setup"
+    }}
+}} on-error={{
+    :log error "PROVISION WARNING: could not create or update API user {user} -- the server will not be able to log in"
+}}
 
-:log info "Provisioning: Identity set to {token.identity}, API user created" """
+:log info "Provisioning: Identity set to {token.identity}, API user ready" """
 
 
 def _rsc_remove_router_command_agent() -> str:

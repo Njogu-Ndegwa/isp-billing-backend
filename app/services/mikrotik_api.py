@@ -254,6 +254,20 @@ def plan_speed_error(speed: Optional[str]) -> Optional[str]:
     return None
 
 
+# What RouterOS says when the API user exists but the password (or name) is
+# wrong: "invalid user name or password (6)" on 6.43+ and 7, "cannot log in"
+# on older builds. login() puts it in last_connect_error after the TCP
+# connect succeeded, i.e. the router answered over the management tunnel.
+_CREDENTIALS_REJECTED_MARKERS = ("invalid user name or password", "cannot log in")
+
+
+def api_credentials_rejected(error: Optional[str]) -> bool:
+    """True when ``last_connect_error`` says the router refused our API
+    username/password (as opposed to a timeout, a refused port or a breaker)."""
+    err = str(error or "").lower()
+    return "api login rejected" in err and any(m in err for m in _CREDENTIALS_REJECTED_MARKERS)
+
+
 def _router_error_is_duplicate(error: str) -> bool:
     """Return True when RouterOS is reporting an idempotent duplicate/existing object."""
     if not error:
