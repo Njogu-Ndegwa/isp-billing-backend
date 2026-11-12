@@ -302,6 +302,7 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     ((R,), "/api/routers/{router_id}/interfaces", "routers.view", None),
     ((R,), "/api/routers/{router_id}/interfaces/restart-options", "routers.view", None),
     ((R,), "/api/routers/{router_id}/access-points", "routers.view", None),
+    ((R,), "/api/routers/{router_id}/wifi", "routers.view", None),
     ((R,), "/api/routers/{router_id}/access-points/{ap_mac}/status", "routers.view", None),
     ((R,), "/api/routers/{router_id}/load-balancing", "routers.view", None),
     ((R,), "/api/routers/{router_id}/port-analytics", "routers.view", None),
@@ -342,6 +343,8 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
      "Changed the expired PPPoE payment-page redirect on router {router_id}"),
     (("PUT",), "/api/routers/{router_id}/pppoe-device-lock-default", "routers.manage",
      "Changed the PPPoE device-lock default on router {router_id}"),
+    (("PUT",), "/api/routers/{router_id}/wifi/ssid", "routers.manage",
+     "Renamed the Wi-Fi on router {router_id}"),
     (("PUT",), "/api/routers/{router_id}/status-alerts", "routers.manage",
      "Changed status alerts on router {router_id}"),
     (("POST",), "/api/routers/{router_id}/remediate-captive-portal", "routers.manage",
@@ -566,6 +569,8 @@ OWNER_LOGGED_TEMPLATES = OWNER_ALERT_TEMPLATES | frozenset({
     "/api/routers/{router_id}/access-points/{ap_mac}/reboot",
     "/api/routers/{router_id}/access-points/{ap_mac}/make-safe",
     "/api/routers/{router_id}/access-points/{ap_mac}/credential",
+    # A Wi-Fi rename drops every Wi-Fi client: keep who/when/old and new name.
+    "/api/routers/{router_id}/wifi/ssid",
 })
 
 
