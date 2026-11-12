@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import PlainTextResponse, HTMLResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 import logging
 
@@ -19,6 +19,8 @@ from app.services.provisioning import (
     derive_insurance_ip,
     router_mgmt_ca_pem,
     DEVICE_MODE_UPDATE_COMMAND,
+    sanitize_wifi_ssid,
+    wifi_ssid_for_owner,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,6 +42,10 @@ class ProvisionCreateRequest(BaseModel):
     # plain `hotspot` as the html-directory and the captive-portal redirect
     # works correctly.
     is_routerboard: Optional[bool] = False
+    # Hotspot Wi-Fi name the setup script gives wlan1 on a fresh router.
+    # Omitted/blank -> the reseller's business name (then organisation name,
+    # then "Bitwave WiFi"). Sanitised for RouterOS: printable ASCII, max 32.
+    ssid: Optional[str] = Field(default=None, max_length=64)
 
 
 # ── Authenticated endpoints ──────────────────────────────────────────────
@@ -70,6 +76,16 @@ async def create_provision_token(
     # works for wireguard/v7 provisioning.
     is_routerboard = bool(request.is_routerboard) if vpn_type == "l2tp" else False
 
+    if request.ssid is not None and request.ssid.strip():
+        ssid = sanitize_wifi_ssid(request.ssid)
+        if not ssid:
+            raise HTTPException(
+                status_code=400,
+                detail="Use English letters, numbers and spaces in the Wi-Fi name (max 32 characters).",
+            )
+    else:
+        ssid = wifi_ssid_for_owner(user)
+
     try:
         token_obj = await create_provisioning_token(
             db=db,
@@ -77,6 +93,7 @@ async def create_provision_token(
             payment_methods=request.payment_methods,
             vpn_type=vpn_type,
             is_routerboard=is_routerboard,
+            ssid=ssid,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -129,6 +146,7 @@ async def create_provision_token(
         "vpn_type": token_obj.vpn_type,
         "management_tunnel": token_obj.management_tunnel,
         "is_routerboard": token_obj.is_routerboard,
+        "ssid": getattr(token_obj, "ssid", None),
         "vpn_ip": token_obj.wireguard_ip,
         "backup_vpn_ip": derive_insurance_ip(token_obj.wireguard_ip),
         "command": command,
@@ -161,6 +179,7 @@ async def list_provision_tokens(
             "vpn_type": t.vpn_type,
             "management_tunnel": t.management_tunnel,
             "is_routerboard": t.is_routerboard,
+            "ssid": getattr(t, "ssid", None),
             "vpn_ip": t.wireguard_ip,
             "backup_vpn_ip": derive_insurance_ip(t.wireguard_ip),
             "status": t.status.value if hasattr(t.status, "value") else t.status,

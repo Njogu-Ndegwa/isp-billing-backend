@@ -171,6 +171,7 @@ from app.api.admin_support_desk_routes import router as admin_support_desk_route
 from app.api.staff_routes import router as staff_router
 from app.api.pppoe_expired_routes import router as pppoe_expired_router
 from app.api.router_ap_routes import router as router_ap_router
+from app.api.router_wifi_routes import router as router_wifi_router
 from app.api.customer_cpe_routes import router as customer_cpe_router
 from app.api.pppoe_device_lock_routes import router as pppoe_device_lock_router
 
@@ -230,6 +231,7 @@ app.include_router(admin_support_desk_router)
 app.include_router(staff_router)
 app.include_router(pppoe_expired_router)
 app.include_router(router_ap_router)
+app.include_router(router_wifi_router)
 app.include_router(customer_cpe_router)
 app.include_router(pppoe_device_lock_router)
 

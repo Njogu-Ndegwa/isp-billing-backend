@@ -4,6 +4,7 @@ import hmac
 import uuid
 import secrets
 import string
+import unicodedata
 import ipaddress
 import logging
 import os
@@ -623,20 +624,38 @@ def _rsc_parse_block(code: str, var: str, failure_log: str) -> str:
 }}"""
 
 
-def hotspot_wifi_ssid(token: ProvisioningToken) -> str:
-    """SSID for the hotspot AP: the token's ssid, or DEFAULT_WIFI_SSID.
+def sanitize_wifi_ssid(raw: Optional[str]) -> str:
+    """`raw` as a safe SSID, or "" when nothing usable is left.
 
-    Kept to printable ASCII without RouterOS-special characters and at most
-    32 bytes (the 802.11 limit) so it can never break the generated script.
+    Accents are folded to ASCII ("Café" -> "Cafe"), then only printable ASCII
+    without RouterOS-special characters is kept, whitespace runs collapse to
+    one space, and the result is cut to 32 bytes (the 802.11 limit), so it can
+    never break the generated script.
     """
+    folded = unicodedata.normalize("NFKD", raw or "").encode("ascii", "ignore").decode("ascii")
+    cleaned = "".join(
+        ch for ch in folded
+        if 0x20 <= ord(ch) < 0x7F and ch not in '"\\$?;{}[]`'
+    )
+    return " ".join(cleaned.split())[:32].strip()
+
+
+def wifi_ssid_for_owner(user) -> str:
+    """Default hotspot SSID for a new router: the reseller's business name,
+    else their organisation (account) name, else DEFAULT_WIFI_SSID."""
+    for raw in (getattr(user, "business_name", None), getattr(user, "organization_name", None)):
+        ssid = sanitize_wifi_ssid(raw)
+        if ssid and "@" not in ssid and ssid.upper() != "N/A":
+            return ssid
+    return DEFAULT_WIFI_SSID
+
+
+def hotspot_wifi_ssid(token: ProvisioningToken) -> str:
+    """SSID for the hotspot AP: the token's ssid, or DEFAULT_WIFI_SSID."""
     raw = (getattr(token, "ssid", None) or "").strip()
     if raw.upper() in ("", "N/A"):
         raw = DEFAULT_WIFI_SSID
-    cleaned = "".join(
-        ch for ch in raw
-        if 0x20 <= ord(ch) < 0x7F and ch not in '"\\$?;{}[]`'
-    ).strip()[:32].strip()
-    return cleaned or DEFAULT_WIFI_SSID
+    return sanitize_wifi_ssid(raw) or DEFAULT_WIFI_SSID
 
 
 def _rsc_header(token: ProvisioningToken) -> str:
@@ -1895,6 +1914,7 @@ async def _create_hetzner_provisioning_token(
     payment_methods: Optional[list],
     vpn_type: str,
     is_routerboard: bool,
+    ssid: Optional[str] = None,
 ) -> ProvisioningToken:
     """PROVISION_MGMT_TO_HETZNER: one management tunnel, to Hetzner, nothing on AWS.
 
@@ -1947,7 +1967,7 @@ async def _create_hetzner_provisioning_token(
             router_name=router_name,
             identity=identity,
             wireguard_ip=vpn_ip,
-            ssid=DEFAULT_WIFI_SSID,
+            ssid=sanitize_wifi_ssid(ssid) or DEFAULT_WIFI_SSID,
             router_admin_password=api_password,
             vpn_type=vpn_type,
             wg_private_key=wg_private_key,
@@ -2000,6 +2020,7 @@ async def create_provisioning_token(
     payment_methods: Optional[list] = None,
     vpn_type: str = "wireguard",
     is_routerboard: bool = False,
+    ssid: Optional[str] = None,
 ) -> ProvisioningToken:
     """
     By default (PROVISION_MGMT_TO_HETZNER) the token gets one management
@@ -2018,7 +2039,7 @@ async def create_provisioning_token(
 
     if mgmt_to_hetzner_active(vpn_type):
         return await _create_hetzner_provisioning_token(
-            db, user_id, payment_methods, vpn_type, is_routerboard
+            db, user_id, payment_methods, vpn_type, is_routerboard, ssid
         )
 
     if not settings.SERVER_PUBLIC_IP:
@@ -2079,7 +2100,7 @@ async def create_provisioning_token(
             router_name=router_name,
             identity=identity,
             wireguard_ip=vpn_ip,
-            ssid=DEFAULT_WIFI_SSID,
+            ssid=sanitize_wifi_ssid(ssid) or DEFAULT_WIFI_SSID,
             router_admin_password=api_password,
             vpn_type=vpn_type,
             wg_private_key=wg_private_key,
