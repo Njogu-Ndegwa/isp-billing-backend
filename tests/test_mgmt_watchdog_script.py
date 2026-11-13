@@ -7,6 +7,8 @@ after the delay and leave a tunnel that came back alone.
 """
 import re
 
+import pytest
+
 from app.services import mgmt_watchdog_script as wd
 
 def _health_check(indent: str, var: str) -> str:
@@ -93,3 +95,107 @@ def test_sstp_script_uses_no_v7_only_syntax():
     src = _sstp()
     assert "/interface/" not in src and "/ip/" not in src
     assert ":return" not in src and ":onerror" not in src and ":retry" not in src
+
+
+# --- WireGuard variant ---------------------------------------------------------
+
+def _wg(mgmt_ip="10.0.7.15"):
+    return wd.render_watchdog_source(wd.KIND_WG, mgmt_ip)
+
+
+def test_wg_reset_only_happens_after_a_fresh_handshake_read_that_follows_the_splay_delay():
+    src = _wg()
+    delay = src.index(":delay 15s")                     # 15 % 20
+    assert src.count(":delay 15s") == 1
+    reread = src.index(":set hs2 [/interface wireguard peers get $p last-handshake]")
+    assert delay < reread
+    assert src.count("/interface wireguard peers disable $p") == 1
+    branch = src.index(":if ($back) do={", reread)
+    skipped, after = _block(src, branch)
+    assert re.match(r"\s*else=\{", src[after:])
+    reset, _ = _block(src, after)
+    for step in ("/ip firewall connection remove $cx", "/interface wireguard peers disable $p",
+                 "/interface wireguard peers enable $p"):
+        assert step in reset and step not in skipped
+    assert src.index("/ip firewall connection find") > branch     # conntrack cleanup moved inside
+
+
+def test_wg_reread_uses_the_same_staleness_test():
+    src = _wg()
+    assert ':if ([:typeof $hs] = "time") do={ :if ($hs < $staleAfter) do={ :set stale false } }' in src
+    assert ':if ([:typeof $hs2] = "time") do={ :if ($hs2 < $staleAfter) do={ :set back true } }' in src
+    # the test hook (staleAfter 0s) is set before either check, so a test reset still happens
+    assert src.index(":set staleAfter 0s") < src.index(":set hs2")
+
+
+def test_wg_peer_that_handshook_meanwhile_drops_the_hold_it_just_got():
+    src = _wg()
+    skipped, _ = _block(src, src.index(":if ($back) do={"))
+    assert "/ip firewall address-list remove [find where list=$hl]" in skipped
+    assert "/ip firewall address-list remove [find where list=$bl]" in skipped
+    assert "reset skipped" in skipped
+    assert "bw-wd-busy" not in skipped
+    # the hold is still written BEFORE the delay (v4 guarantee kept)
+    assert src.index("add list=$hl") < src.index(":delay 15s")
+
+
+# --- text-only refresh for the rollout ----------------------------------------------
+
+def _fake(**kw):
+    from tests.test_standard_runtime_enrol import FakeRouterOS
+    return FakeRouterOS("R", **kw)
+
+
+@pytest.mark.parametrize("kind", [wd.KIND_SSTP, wd.KIND_WG])
+def test_refresh_rewrites_only_the_source_of_the_installed_script(kind):
+    fake = _fake()
+    assert wd.install_watchdog(fake, kind, "10.0.7.15").status == "installed"
+    name = wd.script_name(kind)
+    script = fake.named("/system/script", name)
+    script["source"] = "# bw-mgmt-watchdog old"
+    sched_before = dict(fake.named("/system/scheduler", name))
+
+    fake.commands.clear()
+    assert wd.refresh_installed_source(fake, "10.0.7.15", apply=False) == {name: "would update"}
+    assert fake.writes() == []
+
+    assert wd.refresh_installed_source(fake, "10.0.7.15", apply=True) == {name: "updated"}
+    assert [c for c in fake.writes()] == ["/system/script/set"]
+    assert script["source"] == wd.render_watchdog_source(kind, "10.0.7.15")
+    assert script["policy"] == wd.POLICY and script["comment"] == wd.COMMENT
+    assert fake.named("/system/scheduler", name) == sched_before
+
+    fake.commands.clear()
+    assert wd.refresh_installed_source(fake, "10.0.7.15", apply=True) == {name: "unchanged"}
+    assert fake.writes() == []
+
+
+def test_refresh_never_installs_and_leaves_a_paused_scheduler_paused():
+    fake = _fake()
+    assert wd.refresh_installed_source(fake, "10.0.7.15", apply=True) == {}
+    assert fake.writes() == []
+
+    wd.install_watchdog(fake, wd.KIND_SSTP, "10.0.7.15")
+    fake.named("/system/script", wd.SCRIPT_NAME_SSTP)["source"] = "# old"
+    fake.named("/system/scheduler", wd.SCRIPT_NAME_SSTP)["disabled"] = "true"
+    fake.commands.clear()
+    res = wd.refresh_installed_source(fake, "10.0.7.15", apply=True)
+    assert res == {wd.SCRIPT_NAME_SSTP: "updated (scheduler paused)"}
+    assert fake.writes() == ["/system/script/set"]
+    assert fake.named("/system/scheduler", wd.SCRIPT_NAME_SSTP)["disabled"] == "true"
+
+
+def test_refresh_reports_a_refused_write():
+    fake = _fake()
+    wd.install_watchdog(fake, wd.KIND_SSTP, "10.0.7.15")
+    fake.named("/system/script", wd.SCRIPT_NAME_SSTP)["source"] = "# old"
+    real = fake.send_command
+
+    def refuse(cmd, args=None):
+        if cmd == "/system/script/set":
+            return {"error": "failure: not enough permissions"}
+        return real(cmd, args)
+
+    fake.send_command = refuse
+    res = wd.refresh_installed_source(fake, "10.0.7.15", apply=True)
+    assert res[wd.SCRIPT_NAME_SSTP].startswith("failed: failure: not enough permissions")
