@@ -272,6 +272,31 @@
   "wallet_after_kes",
   "wallet_before_kes"
  ],
+ "customer_charge_events": [
+  "actor_id",
+  "charge_id",
+  "created_at",
+  "delta_minor",
+  "external_reference",
+  "id",
+  "idempotency_key",
+  "kind",
+  "owner_id",
+  "reason",
+  "request_hash",
+  "reverses_event_id"
+ ],
+ "customer_charges": [
+  "created_at",
+  "currency",
+  "customer_id",
+  "customer_id_snapshot",
+  "customer_name_snapshot",
+  "description",
+  "id",
+  "original_minor",
+  "owner_id"
+ ],
  "customer_cpe_credentials": [
   "created_at",
   "customer_id",

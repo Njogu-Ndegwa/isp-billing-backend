@@ -427,6 +427,48 @@ class Payment(Base):
     paid_on = Column(DateTime, default=datetime.utcnow)
     customer = relationship("Customer")
 
+class CustomerCharge(Base):
+    """Installation debt, independent of wallet, service and platform accounting."""
+    __tablename__ = "customer_charges"
+    id = Column(Integer, primary_key=True)
+    # Immutable tenant/actor snapshots deliberately survive account deletion.
+    owner_id = Column(Integer, nullable=False, index=True)
+    customer_id = Column(Integer, ForeignKey("customers.id", ondelete="SET NULL"), nullable=True, index=True)
+    customer_id_snapshot = Column(Integer, nullable=False)
+    customer_name_snapshot = Column(String(255), nullable=False)
+    description = Column(String(200), nullable=False)
+    original_minor = Column(BigInteger, nullable=False)
+    currency = Column(String(3), nullable=False, default="KES", server_default="KES")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    __table_args__ = (
+        CheckConstraint("original_minor > 0", name="ck_customer_charge_positive"),
+        CheckConstraint("currency = 'KES'", name="ck_customer_charge_currency"),
+    )
+
+
+class CustomerChargeEvent(Base):
+    __tablename__ = "customer_charge_events"
+    id = Column(Integer, primary_key=True)
+    charge_id = Column(Integer, ForeignKey("customer_charges.id"), nullable=False, index=True)
+    owner_id = Column(Integer, nullable=False)
+    actor_id = Column(Integer, nullable=False)
+    kind = Column(String(20), nullable=False)
+    delta_minor = Column(BigInteger, nullable=False)
+    reason = Column(String(500), nullable=False)
+    external_reference = Column(String(120), nullable=True)
+    reverses_event_id = Column(Integer, ForeignKey("customer_charge_events.id"), nullable=True, unique=True)
+    idempotency_key = Column(String(80), nullable=False)
+    request_hash = Column(String(64), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint("owner_id", "idempotency_key", name="uq_charge_event_request"),
+        CheckConstraint("kind IN ('charge', 'external_payment', 'waiver', 'reversal')", name="ck_charge_event_kind"),
+        CheckConstraint("delta_minor != 0", name="ck_charge_event_nonzero"),
+        CheckConstraint("(kind = 'reversal' AND reverses_event_id IS NOT NULL) OR (kind != 'reversal' AND reverses_event_id IS NULL)", name="ck_charge_event_reversal"),
+        CheckConstraint("kind = 'reversal' OR (kind = 'charge' AND delta_minor > 0) OR (kind IN ('external_payment', 'waiver') AND delta_minor < 0)", name="ck_charge_event_sign"),
+    )
+
+
 class CustomerPayment(Base):
     __tablename__ = "customer_payments"
     id = Column(Integer, primary_key=True, autoincrement=True)

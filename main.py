@@ -123,6 +123,7 @@ from app.api.router_operations import router as router_ops_router
 from app.api.admin_routes import router as admin_router
 from app.api.plan_routes import router as plan_router
 from app.api.customer_routes import router as customer_router
+from app.api.customer_charge_routes import router as customer_charge_router
 from app.api.customer_audit_routes import router as customer_audit_router
 from app.api.payment_routes import router as payment_router
 from app.api.dashboard_routes import router as dashboard_router
@@ -184,6 +185,7 @@ app.include_router(router_ops_router)
 app.include_router(admin_router)
 app.include_router(plan_router)
 app.include_router(customer_router)
+app.include_router(customer_charge_router)
 app.include_router(customer_audit_router)
 app.include_router(payment_router)
 app.include_router(dashboard_router)
@@ -3018,6 +3020,22 @@ async def run_customer_pause_migrations():
     raise last_exc
 
 
+async def run_customer_charge_migrations():
+    """Add customer_charges and customer_charge_events only; safe to rerun.
+
+    The new nullable customer reference uses SET NULL so existing customer
+    deletion preserves ledger history. No billing columns or balances change.
+    """
+    from app.db.models import CustomerCharge, CustomerChargeEvent
+    async with async_engine.begin() as conn:
+        if conn.dialect.name == "postgresql":
+            # Serialize simultaneous application-worker startup (checkfirst
+            # alone races between catalog inspection and CREATE TABLE).
+            await conn.execute(sa_text("SELECT pg_advisory_xact_lock(5971301)"))
+        await conn.run_sync(lambda sync_conn: Base.metadata.create_all(
+            sync_conn, tables=[CustomerCharge.__table__, CustomerChargeEvent.__table__], checkfirst=True))
+
+
 async def run_customer_profile_migrations():
     """Add the customers register-detail columns (app/services/customer_profile.py):
     national_id, email, alt_phone, address_line, building, installation_date
@@ -4045,6 +4063,12 @@ async def startup_event():
         logger.info("Customer profile migration completed successfully")
     except Exception as e:
         logger.error(f"Customer profile migration failed (non-fatal): {e}")
+
+    try:
+        await run_customer_charge_migrations()
+        logger.info("Installation charge migration completed successfully")
+    except Exception as e:
+        logger.error(f"Installation charge migration failed (non-fatal): {e}")
 
     try:
         await run_standard_runtime_migrations()

@@ -177,6 +177,7 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     ((R,), "/api/customers/{customer_id}", "customers.view", None),
     ((R,), "/api/customers/{customer_id}/related", "customers.view", None),
     ((R,), "/api/customers/{customer_id}/audit-log", "customers.view", None),
+    ((R,), "/api/customers/{customer_id}/installation-charges", "customers.view", None),
     (("POST",), "/api/customers/{customer_id}/audit-log/router-logs", "customers.view",
      "Read router logs for customer {customer_id}"),
     ((R,), "/api/customers/{customer_id}/devices", "customers.view", None),

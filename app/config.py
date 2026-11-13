@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 load_dotenv()  # Optional if you use a .env file
 
 class Settings(BaseSettings):
+    # Approved tracking-only canary. No service/payment behavior depends on this.
+    TECHMID_INSTALLATION_CHARGES_ENABLED: bool = False
     # A restored migration/DR stack must be safe to start alongside production.
     # Shadow mode makes application DB connections read-only, skips startup
     # migrations/schedulers, blocks unsafe HTTP methods, and guards outbound
