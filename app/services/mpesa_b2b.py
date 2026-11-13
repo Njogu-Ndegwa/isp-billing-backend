@@ -1077,6 +1077,53 @@ async def get_unpaid_balance(db: AsyncSession, reseller_id: int) -> float:
     return round(mpesa_rev + ad_credits + correction - paid - charges, 2)
 
 
+async def _sum_by_reseller(db: AsyncSession, key_col, amount_col, ids, *filters) -> dict:
+    stmt = (
+        select(key_col, func.coalesce(func.sum(amount_col), 0))
+        .where(key_col.in_(ids), *filters)
+        .group_by(key_col)
+    )
+    return {row[0]: float(row[1]) for row in (await db.execute(stmt)).all()}
+
+
+async def get_unpaid_balances(db: AsyncSession, reseller_ids) -> dict:
+    """get_unpaid_balance for many resellers at once: {reseller_id: balance}.
+
+    The same five terms with the same filters, one GROUP BY query each instead
+    of five queries per reseller (the admin reseller list ran ~5,000 queries,
+    7-15 s, for 730 resellers). Equality with get_unpaid_balance is asserted in
+    tests; the payout job keeps using the single-reseller function.
+    """
+    from app.services.ad_sales import ad_credit_totals
+
+    ids = list({int(i) for i in reseller_ids})
+    if not ids:
+        return {}
+    revenue = await _sum_by_reseller(
+        db, CustomerPayment.reseller_id, CustomerPayment.amount, ids, *PAYOUT_REVENUE_FILTERS
+    )
+    ad_credits = await ad_credit_totals(db, ids)
+    paid = await _sum_by_reseller(db, ResellerPayout.reseller_id, ResellerPayout.amount, ids)
+    charges = await _sum_by_reseller(
+        db, ResellerTransactionCharge.reseller_id, ResellerTransactionCharge.amount, ids
+    )
+    corrections = {
+        row[0]: float(row[1] or 0)
+        for row in (await db.execute(
+            select(ResellerFinancials.user_id, ResellerFinancials.balance_correction)
+            .where(ResellerFinancials.user_id.in_(ids))
+        )).all()
+    }
+    return {
+        rid: round(
+            revenue.get(rid, 0.0) + ad_credits.get(rid, 0.0) + corrections.get(rid, 0.0)
+            - paid.get(rid, 0.0) - charges.get(rid, 0.0),
+            2,
+        )
+        for rid in ids
+    }
+
+
 # ---------------------------------------------------------------------------
 # Per-router balances
 # ---------------------------------------------------------------------------
