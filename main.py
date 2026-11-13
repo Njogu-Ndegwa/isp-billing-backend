@@ -3533,6 +3533,80 @@ async def run_customer_audit_index_migrations():
     logger.info("Customer audit index migrations complete")
 
 
+async def run_provisioning_log_index_migrations():
+    """Indexes for the background reads of provisioning_logs (Postgres only).
+
+    provisioning_logs (1.2M rows) had only id, attempt_id and
+    (customer_id, log_date) indexes, so three regular reads scanned the whole
+    table, ~80 ms and three CPU workers each, 1.39 million times by Nov 2026:
+
+    - deleted-customer cleanup retries filter on action + status
+      (deleted_customer_cleanup.retry_pending_cleanups, every housekeeping run);
+    - ops-health filters on action IN (...) + status + a log_date window,
+      newest first (ops_health / ops_health_window, every 60 s);
+    - router delete clears router_id on that router's rows.
+
+    It also kept the table out of cache: 3% of its reads were cache hits.
+    Same pattern as run_customer_audit_index_migrations: CONCURRENTLY, outside
+    a transaction, invalid leftovers dropped and rebuilt.
+    """
+    if async_engine.dialect.name != "postgresql":
+        return
+    indexes = (
+        ("ix_provisioning_logs_action_status_date", "provisioning_logs", "(action, status, log_date DESC)"),
+        ("ix_provisioning_logs_router", "provisioning_logs", "(router_id)"),
+    )
+    async with async_engine.connect() as conn:
+        conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+        await conn.execute(sa_text("SET maintenance_work_mem = '16MB'"))
+        await conn.execute(sa_text("SET max_parallel_maintenance_workers = 0"))
+        # A concurrent build waits for older transactions to finish; the app's
+        # 5 s lock_timeout would cancel it and leave an invalid index behind.
+        await conn.execute(sa_text("SET lock_timeout = '2min'"))
+        try:
+            for name, table, columns in indexes:
+                valid = (await conn.execute(sa_text(
+                    f"SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass('public.{name}')"
+                ))).scalar_one_or_none()
+                if valid is True:
+                    continue
+                if valid is False:
+                    await conn.execute(sa_text(f"DROP INDEX CONCURRENTLY IF EXISTS public.{name}"))
+                started = asyncio.get_running_loop().time()
+                await conn.execute(sa_text(
+                    f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON public.{table} {columns}"
+                ))
+                logger.info(
+                    "Built index %s in %.1fs", name, asyncio.get_running_loop().time() - started
+                )
+        finally:
+            # These are session settings on a pooled connection: put them back.
+            await conn.execute(sa_text("RESET lock_timeout"))
+            await conn.execute(sa_text("RESET maintenance_work_mem"))
+            await conn.execute(sa_text("RESET max_parallel_maintenance_workers"))
+    logger.info("Provisioning log index migrations complete")
+
+
+# Index builds that can take longer than the deploy's 90 s /health window run
+# after startup instead of before it. A deploy that rolled back mid-build would
+# leave an invalid index that every later deploy rebuilt, and failed, again.
+_startup_background_tasks: set = set()
+PROVISIONING_LOG_INDEX_DELAY_SECONDS = 60
+
+
+def start_provisioning_log_index_build():
+    async def _run():
+        await asyncio.sleep(PROVISIONING_LOG_INDEX_DELAY_SECONDS)
+        try:
+            await run_provisioning_log_index_migrations()
+        except Exception as e:
+            logger.error(f"Provisioning log index migration failed (non-fatal, retried next start): {e}")
+
+    task = asyncio.create_task(_run())
+    _startup_background_tasks.add(task)
+    task.add_done_callback(_startup_background_tasks.discard)
+
+
 async def run_hero_ads_migrations():
     """Hero ads (2026-10): placement, media, ownership, targeting and approval
     columns on ads; advertiser_id and image_url made optional; and the
@@ -3960,6 +4034,9 @@ async def startup_event():
         await run_customer_audit_index_migrations()
     except Exception as e:
         logger.error(f"Customer audit index migration failed (non-fatal): {e}")
+
+    # Built in the background (see start_provisioning_log_index_build).
+    start_provisioning_log_index_build()
 
     try:
         await run_support_desk_migrations()
