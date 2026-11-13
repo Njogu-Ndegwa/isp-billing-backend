@@ -11,7 +11,10 @@ What the scripts do (patient, never reboot):
   is running and 10.251.0.1 answers a ping. A failure only counts when the
   router's own internet works (1.1.1.1 / 8.8.8.8 answer). After 3 counted
   failures the client is disabled/enabled once, then held off 10 min, doubling
-  to 60 min while it stays broken.
+  to 60 min while it stays broken. Right before the restart (after the splay
+  delay) the same health check runs again: a tunnel that reconnected in the
+  meantime clears the failure count and is left alone (router 715,
+  2026-11-13: a working session was cut 37 s after it had reconnected).
 * WireGuard (``bw-mgmt-watchdog-wg``, RouterOS 7): watches the peers of
   ``wg-hz`` / ``wg-aws`` whose INTERFACE is enabled. A peer whose handshake is
   older than 5 min is reset (conntrack for its endpoint flow removed, peer
@@ -52,8 +55,9 @@ WG_INTERFACES = ("wg-hz", "wg-aws")
 SPLAY_MOD = {KIND_SSTP: 40, KIND_WG: 20}
 STATE_LIST_PREFIX = "bw-wd"
 
-_SSTP_TEMPLATE = r'''# bw-mgmt-watchdog v3 (Bitwave): restart the SSTP management tunnel if it stays dead. Never reboots.
+_SSTP_TEMPLATE = r'''# bw-mgmt-watchdog v4 (Bitwave): restart the SSTP management tunnel if it stays dead. Never reboots.
 # v3: healthy fast path (tunnel running + 1 ping answered) exits before any address-list scan.
+# v4: re-check after the splay delay; a tunnel that came back meanwhile is not restarted.
 :local iface "sstp-hetzner"
 :local srv "10.251.0.1"
 :local fid [/interface sstp-client find where name=$iface]
@@ -91,17 +95,27 @@ _SSTP_TEMPLATE = r'''# bw-mgmt-watchdog v3 (Bitwave): restart the SSTP managemen
       }
       :log warning ("bw-watchdog: " . $iface . " dead for " . $fails . " checks, restarting it; hold " . $hold . " min")
       :delay __SPLAY__
-      /ip firewall address-list add list=bw-wd-busy address=0.0.0.1 timeout=5m
-      /interface sstp-client disable $id
-      :delay 5s
-      /interface sstp-client enable $id
-      /ip firewall address-list remove [find where list="bw-wd-busy"]
-      /ip firewall address-list remove [find where list="bw-wd-fail"]
-      /ip firewall address-list add list=bw-wd-hold address=0.0.0.1 timeout=[:totime ($hold . "m")]
-      :local next ($hold * 2)
-      :if ($next > 60) do={ :set next 60 }
-      /ip firewall address-list remove [find where list="bw-wd-backoff"]
-      /ip firewall address-list add list=bw-wd-backoff address=("0.0.0." . $next) timeout=3h
+      :local back false
+      :if ([/interface sstp-client get $id running] = true) do={
+        :if ([/ping $srv count=3 interval=1s] > 0) do={ :set back true }
+      }
+      :if ($back) do={
+        :log warning ("bw-watchdog: " . $iface . " is back, restart skipped")
+        /ip firewall address-list remove [find where list="bw-wd-fail"]
+        /ip firewall address-list remove [find where list="bw-wd-backoff"]
+      } else={
+        /ip firewall address-list add list=bw-wd-busy address=0.0.0.1 timeout=5m
+        /interface sstp-client disable $id
+        :delay 5s
+        /interface sstp-client enable $id
+        /ip firewall address-list remove [find where list="bw-wd-busy"]
+        /ip firewall address-list remove [find where list="bw-wd-fail"]
+        /ip firewall address-list add list=bw-wd-hold address=0.0.0.1 timeout=[:totime ($hold . "m")]
+        :local next ($hold * 2)
+        :if ($next > 60) do={ :set next 60 }
+        /ip firewall address-list remove [find where list="bw-wd-backoff"]
+        /ip firewall address-list add list=bw-wd-backoff address=("0.0.0." . $next) timeout=3h
+      }
     }
   }
 }
