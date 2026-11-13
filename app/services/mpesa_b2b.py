@@ -8,6 +8,7 @@ paybill numbers or bank accounts via the Safaricom B2B API.
 import asyncio
 import base64
 import logging
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -96,6 +97,50 @@ def _provider_id_or_none(value: object) -> Optional[str]:
         return None
     text = str(value).strip()
     return text or None
+
+
+DARAJA_REMARKS_MAX = 100
+DARAJA_REMARKS_FALLBACK = "Payout"
+_NON_ALNUM_SPACE = re.compile(r"[^A-Za-z0-9 ]+")
+_MULTI_SPACE = re.compile(r" {2,}")
+
+
+def sanitize_daraja_text(value: object, fallback: str = DARAJA_REMARKS_FALLBACK) -> str:
+    """Make a free-text field safe to send to Safaricom Daraja.
+
+    Daraja silently rejects some characters in free-text fields: a B2B request
+    whose Remarks was "Payout to I&M" came back as an all-empty ack (every
+    field ""), so two resellers' nightly payouts failed for weeks with no
+    reason (26 Oct). Keep ASCII letters, digits and spaces only (everything
+    else is dropped, so "I&M" becomes "IM"), collapse runs of spaces, cap at 100 chars and never send an empty string.
+    Display labels in our DB keep whatever the reseller typed; this runs only
+    at the Daraja boundary.
+    """
+    text = _NON_ALNUM_SPACE.sub("", str(value or ""))
+    text = _MULTI_SPACE.sub(" ", text).strip()
+    text = text[:DARAJA_REMARKS_MAX].strip()
+    return text or fallback
+
+
+EMPTY_ACK_DESC = (
+    "Safaricom returned an empty response (request rejected; check payout details)"
+)
+
+
+def _ack_failure_desc(response_data: dict) -> str:
+    """Readable reason for a B2B ack that was not ResponseCode 0.
+
+    Safaricom has two silent shapes: the all-empty ack (every field "") and
+    the gateway error body ({"errorCode", "errorMessage"}) with no
+    ResponseDescription at all. Both used to leave result_desc blank."""
+    desc = str(response_data.get("ResponseDescription") or "").strip()
+    if desc:
+        return desc
+    error_message = str(response_data.get("errorMessage") or "").strip()
+    error_code = str(response_data.get("errorCode") or "").strip()
+    if error_message or error_code:
+        return " ".join(p for p in (error_code, error_message) if p)
+    return EMPTY_ACK_DESC
 
 # ---------------------------------------------------------------------------
 # Business Bouquet Tariff – fee paid by sender (business), receiver pays 0
@@ -308,6 +353,10 @@ async def initiate_b2b_payment(
         raise ValueError(f"Net payout amount must be positive (amount={amount}, fee={fee})")
 
     party_a = settings.MPESA_SHORTCODE
+    # Remarks is built from reseller-typed labels ("Payout to I&M"); Daraja
+    # returns an all-empty ack for some characters, so send (and record)
+    # only the sanitised form.
+    remarks = sanitize_daraja_text(remarks)
 
     # ── Phase 1: committed write-ahead intent, atomically guarded ──────────
     if not await _try_payout_advisory_lock(db, reseller_id):
@@ -373,7 +422,7 @@ async def initiate_b2b_payment(
         "Amount": str(net_amount),
         "PartyA": party_a,
         "PartyB": party_b,
-        "Remarks": remarks[:100],
+        "Remarks": remarks,
         "QueueTimeOutURL": timeout_url,
         "ResultURL": result_url,
     }
@@ -437,7 +486,11 @@ async def initiate_b2b_payment(
     if str(response_code) != "0":
         txn.status = B2BTransactionStatus.FAILED
         txn.result_code = str(response_code)
-        txn.result_desc = response_data.get("ResponseDescription", "")
+        txn.result_desc = _ack_failure_desc(response_data)[:500]
+        logger.warning(
+            "B2B request for txn %s (reseller %s) rejected in ack: code=%r desc=%s",
+            txn.id, reseller_id, response_code, txn.result_desc,
+        )
 
     await db.commit()
     return txn
