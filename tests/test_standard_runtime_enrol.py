@@ -269,7 +269,7 @@ def test_watchdog_install_is_idempotent_and_swaps_kind():
 
 def test_wg_watchdog_rotates_the_listen_port_only_after_a_failed_reset():
     src = wd.render_watchdog_source(wd.KIND_WG, "10.0.0.154")
-    assert "bw-mgmt-watchdog-wg v5" in src and "__" not in src
+    assert "bw-mgmt-watchdog-wg v6" in src and "__" not in src
     assert f":rndnum from={wd.ROTATE_PORT_MIN} to={wd.ROTATE_PORT_MAX}" in src
     assert "/interface wireguard set $wi listen-port=$np" in src
     # rotate is armed only inside the "backoff entry already there" branch, and only with working internet
@@ -286,7 +286,7 @@ def test_wg_watchdog_rotates_the_listen_port_only_after_a_failed_reset():
 
 def test_wg_watchdog_without_rotation_keeps_the_reset_but_never_moves_the_port():
     src = wd.render_watchdog_source(wd.KIND_WG, "10.0.0.154", rotate=False)
-    assert "bw-mgmt-watchdog-wg v5" in src and "__" not in src
+    assert "bw-mgmt-watchdog-wg v6" in src and "__" not in src
     assert ":set rotate true" not in src and "rotation off" in src
     assert "peers disable $p" in src and "peers enable $p" in src          # the reset is still there
     # the arm line really is in the normal template (so the replace above can never silently miss)
@@ -400,21 +400,21 @@ async def test_unreadable_firewall_changes_nothing_and_retries_soon(db, wired):
     assert enrol.recheck_after(o.watchdog.reason) == timedelta(minutes=30)
     fake.broken = False
     [o] = await enrol.standard_runtime_enrol_background(now=datetime.utcnow() + timedelta(minutes=31))
-    assert o.watchdog.installed and o.watchdog.reason == "installed (wg v5, installed)"
+    assert o.watchdog.installed and o.watchdog.reason == "installed (wg v6, installed)"
     assert (await _reload(db, r.id)).mgmt_watchdog_installed_at
 
 
 def test_watchdog_version_tag():
-    assert wd.version_tag(wd.KIND_WG) == "wg v5"
-    assert wd.is_current("wg", "installed (wg v5, updated)")
+    assert wd.version_tag(wd.KIND_WG) == "wg v6"
+    assert wd.is_current("wg", "installed (wg v6, updated)")
     assert not wd.is_current("wg", "installed (wg, installed)")        # recorded before versions
-    assert not wd.is_current(None, "installed (wg v5, updated)")
+    assert not wd.is_current(None, "installed (wg v6, updated)")
     assert wd.is_current("sstp", f"installed ({wd.version_tag(wd.KIND_SSTP)}, unchanged)")
     assert enrol.watchdog_needed(None, None, None)
     assert enrol.watchdog_needed(datetime.utcnow(), "wg", "installed (wg, installed)")
-    assert not enrol.watchdog_needed(datetime.utcnow(), "wg", "installed (wg v5, unchanged)")
+    assert not enrol.watchdog_needed(datetime.utcnow(), "wg", "installed (wg v6, unchanged)")
     # rotation-less install: not current (looked at again), on the weekly cadence
-    norot = "firewall: drop rule *5 in input before established-accept; installed (wg v5 norotate, updated)"
+    norot = "firewall: drop rule *5 in input before established-accept; installed (wg v6 norotate, updated)"
     assert not wd.is_current("wg", norot) and enrol.watchdog_needed(datetime.utcnow(), "wg", norot)
     assert enrol.recheck_after(norot) == timedelta(days=7)
 
@@ -546,7 +546,7 @@ async def test_wireguard_router_gets_the_wg_watchdog(db, wired):
 
 @pytest.mark.asyncio
 async def test_outdated_watchdog_is_upgraded_in_place_once(db, wired):
-    """Routers enrolled with the v4 WG watchdog get v5 from the background job."""
+    """Routers enrolled with the v4 WG watchdog get v6 from the background job."""
     old = datetime.utcnow() - timedelta(days=2)
     r = await _router(db, "10.0.0.154", "Router-0983", mgmt_watchdog_installed_at=old,
                       mgmt_watchdog_checked_at=old, mgmt_watchdog_kind="wg",
@@ -560,8 +560,8 @@ async def test_outdated_watchdog_is_upgraded_in_place_once(db, wired):
     fake.commands.clear()
     [o] = await enrol.standard_runtime_enrol_background()
     assert o.checkin is None                                   # installed check-in is not touched
-    assert o.watchdog.installed and "wg v5, updated" in o.watchdog.reason
-    assert "v5" in fake.named("/system/script", wd.SCRIPT_NAME_WG)["source"]
+    assert o.watchdog.installed and "wg v6, updated" in o.watchdog.reason
+    assert "v6" in fake.named("/system/script", wd.SCRIPT_NAME_WG)["source"]
     assert fake.menus["/system/scheduler"] == [sched]           # scheduler left as it was
     row = await _reload(db, r.id)
     assert wd.is_current(row.mgmt_watchdog_kind, row.mgmt_watchdog_reason)
@@ -572,7 +572,7 @@ async def test_outdated_watchdog_is_upgraded_in_place_once(db, wired):
 
 @pytest.mark.asyncio
 async def test_wg_rotation_follows_the_routers_firewall(db, wired):
-    """A firewall that could drop replies on a rotated port: v5 without rotation,
+    """A firewall that could drop replies on a rotated port: v6 without rotation,
     checked again a week later, rotation switched on once the firewall passes."""
     r = await _router(db, "10.0.0.160", "Router-5010")
     fake = wired["10.0.0.160"] = FakeRouterOS("Router-5010", filter_rules=[DROP_NOT_LAN, ACCEPT_EST], **WG)
@@ -580,7 +580,7 @@ async def test_wg_rotation_follows_the_routers_firewall(db, wired):
     assert o.watchdog.installed and o.watchdog.reason.startswith("firewall: drop rule *5")
     assert wd.NOROTATE in o.watchdog.reason
     src = fake.named("/system/script", wd.SCRIPT_NAME_WG)["source"]
-    assert "v5" in src and ":set rotate true" not in src
+    assert "v6" in src and ":set rotate true" not in src
     assert not any(c.startswith("/ip/firewall/filter/") and not c.endswith("/print") for c in fake.writes())
     row = await _reload(db, r.id)
     assert row.mgmt_watchdog_installed_at and not wd.is_current(row.mgmt_watchdog_kind, row.mgmt_watchdog_reason)
@@ -591,7 +591,7 @@ async def test_wg_rotation_follows_the_routers_firewall(db, wired):
     # the reseller fixed the rule order: the weekly re-check switches rotation on
     fake.menus["/ip/firewall/filter"] = list(DEFCONF)
     [o] = await enrol.standard_runtime_enrol_background(now=datetime.utcnow() + timedelta(days=8))
-    assert o.watchdog.installed and o.watchdog.reason == "installed (wg v5, updated)"
+    assert o.watchdog.installed and o.watchdog.reason == "installed (wg v6, updated)"
     assert ":set rotate true" in fake.named("/system/script", wd.SCRIPT_NAME_WG)["source"]
     row = await _reload(db, r.id)
     assert wd.is_current(row.mgmt_watchdog_kind, row.mgmt_watchdog_reason)

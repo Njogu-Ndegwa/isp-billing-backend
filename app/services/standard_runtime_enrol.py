@@ -259,7 +259,7 @@ def _watchdog_sync(api, c: Candidate, version: str) -> Component:
     if kind is None:
         return Component(False, f"no watched tunnel: {why}")
     # Listen-port rotation only where the firewall is known to let the replies
-    # in on any port; everywhere else v5 goes in with the rotation disarmed.
+    # in on any port; everywhere else v6 goes in with the rotation disarmed.
     fw = wd.check_wg_firewall(api) if kind == wd.KIND_WG else wd.FirewallCheck(True, "")
     if fw.transient:
         # No verdict (the rules could not be read): change nothing, retry on the
