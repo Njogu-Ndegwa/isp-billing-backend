@@ -412,3 +412,92 @@ async def test_pppoe_deltas_land_in_the_pppoe_ledger_fields(db, session_factory)
     )
 
     assert await _ledger_totals(session_factory, router.id) == (0, 0, MB, 3 * MB)
+
+
+# ---------------------------------------------------------------------------
+# Static-IP customers are counted apart from hotspot.
+#
+# A static customer reaches the internet as a *bypassed* hotspot host (its IP
+# has a bypassed ip-binding), so the router's own ``hotspot_active`` includes
+# them. A reseller with only static customers saw them all under "Hotspot" in
+# the Router Health "Active users" tile (router 606, 2026-10-14).
+# ---------------------------------------------------------------------------
+
+
+async def _setup_with_statics(db, ips=("172.172.10.5", "172.172.10.6")):
+    router, _ = await _setup(db)
+    reseller_id = router.user_id
+    from app.db.models import User
+    reseller = await db.get(User, reseller_id)
+    static_plan = await make_plan(db, reseller, connection_type=ConnectionType.STATIC_IP)
+    for ip in ips:
+        customer = await make_customer(
+            db, reseller, static_plan, router,
+            static_ip=ip, status=CustomerStatus.ACTIVE,
+            expiry=datetime.utcnow() + timedelta(days=30),
+        )
+        customer.mac_address = None  # static customers carry no hotspot MAC
+        await db.commit()
+    return router
+
+
+@pytest.mark.asyncio
+async def test_push_counts_online_static_customers_apart_from_hotspot(db, session_factory):
+    router = await _setup_with_statics(db)
+    metrics = _metrics(hotspot=5, pppoe=2)
+    # Two static customers online, plus one non-static bypassed host (an owner
+    # device) that must stay counted as hotspot.
+    metrics.bypassed_host_ips = frozenset({"172.172.10.5", "172.172.10.6", "172.172.10.99"})
+
+    result = await usage_push.ingest_usage_reports(
+        router.id, [], router_metrics=metrics, session_factory=session_factory,
+    )
+    assert result.snapshot_written is True
+
+    async with session_factory() as s:
+        snap = (await s.execute(
+            select(BandwidthSnapshot).where(BandwidthSnapshot.router_id == router.id)
+        )).scalar_one()
+
+    assert snap.active_static_users == 2
+    assert snap.active_hotspot_users == 3
+    assert snap.active_queues == 7  # combined total is unchanged
+
+    payload = _health_payload_from_snapshot(
+        latest_snapshot=snap, router_id=router.id, router_name=router.name, reason="test",
+    )
+    assert payload["active_static_users"] == 2
+    assert payload["active_hotspot_users"] == 3
+    assert payload["active_pppoe_users"] == 2
+    assert payload["active_total_users"] == 7
+
+
+@pytest.mark.asyncio
+async def test_push_without_host_list_leaves_static_unknown(db, session_factory):
+    router = await _setup_with_statics(db)
+
+    await usage_push.ingest_usage_reports(
+        router.id, [], router_metrics=_metrics(hotspot=5, pppoe=2), session_factory=session_factory,
+    )
+
+    async with session_factory() as s:
+        snap = (await s.execute(
+            select(BandwidthSnapshot).where(BandwidthSnapshot.router_id == router.id)
+        )).scalar_one()
+
+    assert snap.active_static_users is None
+    assert snap.active_hotspot_users == 5
+    payload = _health_payload_from_snapshot(
+        latest_snapshot=snap, router_id=router.id, router_name=router.name, reason="test",
+    )
+    assert payload["active_static_users"] == 0
+    assert payload["active_pppoe_users"] == 2
+    assert payload["active_total_users"] == 7
+
+
+def test_online_static_count():
+    from app.services.usage_push import online_static_count
+
+    assert online_static_count(None, frozenset({"10.0.0.2"})) is None
+    assert online_static_count(frozenset({"10.0.0.9"}), frozenset()) == 0
+    assert online_static_count(frozenset({"10.0.0.2", "10.0.0.9"}), frozenset({"10.0.0.2", "10.0.0.3"})) == 1
