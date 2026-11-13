@@ -18,7 +18,10 @@ What the scripts do (patient, never reboot):
 * WireGuard (``bw-mgmt-watchdog-wg``, RouterOS 7): watches the peers of
   ``wg-hz`` / ``wg-aws`` whose INTERFACE is enabled. A peer whose handshake is
   older than 5 min is reset (conntrack for its endpoint flow removed, peer
-  disabled/enabled), with the same hold-off and backoff.
+  disabled/enabled), with the same hold-off and backoff. As in the SSTP
+  variant, the handshake is read again after the splay delay: a peer that
+  handshook in the meantime is not reset, and the hold-off just written is
+  removed again.
 * State lives in RAM-only dynamic address-list entries (``bw-wd-*``, with
   timeouts): script ``:global`` variables do NOT persist between scheduler runs
   of an API-created script (verified on RouterOS 6.48.6).
@@ -122,11 +125,12 @@ _SSTP_TEMPLATE = r'''# bw-mgmt-watchdog v4 (Bitwave): restart the SSTP managemen
 }
 '''
 
-_WG_TEMPLATE = r'''# bw-mgmt-watchdog-wg v4 (Bitwave, RouterOS 7): reset a WireGuard management peer whose handshake is stale.
+_WG_TEMPLATE = r'''# bw-mgmt-watchdog-wg v5 (Bitwave, RouterOS 7): reset a WireGuard management peer whose handshake is stale.
 # Never reboots. State in RAM-only address-list entries (bw-wd-*). Test hook: list bw-wd-test-stale => treat all as stale.
 # v3: healthy fast path (every watched peer enabled with a fresh handshake) exits before pings/address-list scans.
 # v4: only tunnels whose INTERFACE is enabled are watched, so a Hetzner-only router with wg-aws switched off is not
 # treated as stale every minute (and the AWS peer is never touched).
+# v5: re-check the handshake after the splay delay; a peer that handshook meanwhile is not reset.
 :local hzOn ([:len [/interface wireguard find where name="wg-hz" disabled=no]] > 0)
 :local awsOn ([:len [/interface wireguard find where name="wg-aws" disabled=no]] > 0)
 :local fresh true
@@ -188,14 +192,24 @@ _WG_TEMPLATE = r'''# bw-mgmt-watchdog-wg v4 (Bitwave, RouterOS 7): reset a WireG
         :do { /ip firewall address-list remove [find where list=$bl] } on-error={}
         :do { /ip firewall address-list add list=$bl address=("0.0.0." . $next) timeout=3h } on-error={}
         :delay __SPLAY__
-        :foreach cx in=[/ip firewall connection find where protocol="udp" dst-address=($ep . ":" . $epp)] do={
-          :do { /ip firewall connection remove $cx } on-error={}
+        :local hs2
+        :do { :set hs2 [/interface wireguard peers get $p last-handshake] } on-error={}
+        :local back false
+        :if ([:typeof $hs2] = "time") do={ :if ($hs2 < $staleAfter) do={ :set back true } }
+        :if ($back) do={
+          :log warning ("bw-watchdog: " . $ifn . " handshake fresh again (" . [:tostr $hs2] . "), reset skipped")
+          :do { /ip firewall address-list remove [find where list=$hl] } on-error={}
+          :do { /ip firewall address-list remove [find where list=$bl] } on-error={}
+        } else={
+          :foreach cx in=[/ip firewall connection find where protocol="udp" dst-address=($ep . ":" . $epp)] do={
+            :do { /ip firewall connection remove $cx } on-error={}
+          }
+          :do { /ip firewall address-list add list=("bw-wd-busy-" . $ifn) address=0.0.0.1 timeout=5m } on-error={}
+          :do { /interface wireguard peers disable $p } on-error={}
+          :delay 2s
+          :do { /interface wireguard peers enable $p } on-error={}
+          :do { /ip firewall address-list remove [find where list=("bw-wd-busy-" . $ifn)] } on-error={}
         }
-        :do { /ip firewall address-list add list=("bw-wd-busy-" . $ifn) address=0.0.0.1 timeout=5m } on-error={}
-        :do { /interface wireguard peers disable $p } on-error={}
-        :delay 2s
-        :do { /interface wireguard peers enable $p } on-error={}
-        :do { /ip firewall address-list remove [find where list=("bw-wd-busy-" . $ifn)] } on-error={}
       }
     }
   }
@@ -332,3 +346,45 @@ def uninstall_watchdog(api) -> None:
     for entry in _data(api.send_command("/ip/firewall/address-list/print")):
         if str(entry.get("list", "")).startswith(STATE_LIST_PREFIX):
             api.send_command("/ip/firewall/address-list/remove", {".id": entry[".id"]})
+
+
+def refresh_installed_source(api, mgmt_ip: Optional[str], *, apply: bool) -> dict[str, str]:
+    """Bring the watchdog script(s) ALREADY on a router to the current source.
+
+    For the rollout of a new template to routers that have the watchdog
+    (``scripts/mgmt_watchdog_rollout.py``). Unlike ``install_watchdog`` it only
+    rewrites the ``source`` of a script that is already there: nothing is
+    added or removed, the scheduler is never touched (a paused one stays
+    paused), and the kind is the one the router already runs.
+
+    Returns ``{script_name: status}``; status is ``unchanged``, ``would update``
+    (``apply=False``), ``updated``, ``verify_failed`` or ``failed: <error>``,
+    with `` (scheduler paused)`` / `` (no scheduler)`` appended when that applies.
+    An empty dict means no watchdog is installed.
+    """
+    out: dict[str, str] = {}
+    scripts = {s.get("name"): s for s in _data(api.send_command("/system/script/print"))}
+    scheds = {s.get("name"): s for s in _data(api.send_command("/system/scheduler/print"))}
+    for kind, name in SCRIPT_NAMES.items():
+        script = scripts.get(name)
+        if script is None:
+            continue
+        source = render_watchdog_source(kind, mgmt_ip)
+        if script.get("source") == source:
+            status = "unchanged"
+        elif not apply:
+            status = "would update"
+        else:
+            res = api.send_command("/system/script/set", {".id": script[".id"], "source": source})
+            if (res or {}).get("error"):
+                status = f"failed: {str(res['error'])[:100]}"
+            else:
+                live = _find(api, "/system/script", name)
+                status = "updated" if live and live.get("source") == source else "verify_failed"
+        sched = scheds.get(name)
+        if sched is None:
+            status += " (no scheduler)"
+        elif sched.get("disabled") == "true":
+            status += " (scheduler paused)"
+        out[name] = status
+    return out
