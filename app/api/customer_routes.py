@@ -1,10 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, update, text, and_, or_, func
 from sqlalchemy.orm import selectinload
 from sqlalchemy.exc import StatementError
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Annotated, Optional
 from datetime import datetime, timedelta
 import asyncio
 import re
@@ -1519,10 +1519,37 @@ async def set_customer_grace_period(
     }
 
 
+# Paging for the customer lists. Without page/per_page the endpoints keep
+# returning the full plain array (older clients rely on it). With both, they
+# return one page plus totals, so a dashboard that only needs a count no longer
+# downloads every customer (2-3 MB for a large reseller).
+CUSTOMER_LIST_MAX_PER_PAGE = 500
+
+
+def _wants_page(page: Optional[int], per_page: Optional[int]) -> bool:
+    return page is not None and per_page is not None
+
+
+async def _count_rows(db: AsyncSession, conditions) -> int:
+    return (await db.execute(select(func.count(Customer.id)).where(*conditions))).scalar_one()
+
+
+def _page_envelope(items: list, page: int, per_page: int, total: int) -> dict:
+    return {
+        "data": items,
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "total_pages": max(1, -(-total // per_page)),
+    }
+
+
 @router.get("/api/customers")
 async def get_customers_api(
     router_id: Optional[int] = None,
     tier: Optional[str] = None,
+    page: Annotated[Optional[int], Query(ge=1)] = None,
+    per_page: Annotated[Optional[int], Query(ge=1, le=CUSTOMER_LIST_MAX_PER_PAGE)] = None,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
@@ -1532,6 +1559,9 @@ async def get_customers_api(
     "customer" = has at least one completed payment or currently-active paid
     time; "visitor" = never paid. Each item also carries computed `has_paid`
     and `tier` fields.
+
+    With both `page` and `per_page`, returns one page (ordered by id) as
+    `{data, page, per_page, total, total_pages}`; otherwise the full array.
     """
     tier_filter = _validate_tier(tier)
     try:
@@ -1540,26 +1570,32 @@ async def get_customers_api(
         now = datetime.utcnow()
         has_paid = _has_paid_condition(now)
 
+        conditions = [Customer.user_id == user.id]
+        if router_id is not None:
+            conditions.append(Customer.router_id == router_id)
+        if tier_filter == "customer":
+            conditions.append(has_paid)
+        elif tier_filter == "visitor":
+            conditions.append(~has_paid)
         stmt = (
             select(Customer, has_paid.label("has_paid"))
-            .where(Customer.user_id == user.id)
+            .where(*conditions)
             .options(
                 selectinload(Customer.plan),
                 selectinload(Customer.router)
             )
         )
-        if router_id is not None:
-            stmt = stmt.where(Customer.router_id == router_id)
-        if tier_filter == "customer":
-            stmt = stmt.where(has_paid)
-        elif tier_filter == "visitor":
-            stmt = stmt.where(~has_paid)
+        paged = _wants_page(page, per_page)
+        total = None
+        if paged:
+            total = await _count_rows(db, conditions)
+            stmt = stmt.order_by(Customer.id).offset((page - 1) * per_page).limit(per_page)
         result = await db.execute(stmt)
         rows = result.all()
         paybills = await _payment_paybills(db, user, {c.router_id for c, _ in rows})
         pay_cards = await _pay_by_mpesa_map(db, (c for c, _ in rows), paybills)
 
-        return [
+        items = [
             {
                 "id": c.id,
                 "name": c.name,
@@ -1597,6 +1633,7 @@ async def get_customers_api(
             }
             for c, c_has_paid in rows
         ]
+        return _page_envelope(items, page, per_page, total) if paged else items
     except Exception as e:
         logger.error(f"Error fetching customers: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch customers")
@@ -1606,6 +1643,8 @@ async def get_customers_api(
 async def get_active_customers(
     router_id: Optional[int] = None,
     tier: Optional[str] = None,
+    page: Annotated[Optional[int], Query(ge=1)] = None,
+    per_page: Annotated[Optional[int], Query(ge=1, le=CUSTOMER_LIST_MAX_PER_PAGE)] = None,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
@@ -1613,6 +1652,9 @@ async def get_active_customers(
 
     `tier` (optional, default "all") filters by payment history exactly like
     `/api/customers`; each item carries computed `has_paid` and `tier`.
+
+    With both `page` and `per_page`, returns one page (soonest expiry first)
+    as `{data, page, per_page, total, total_pages}`; otherwise the full array.
     """
     tier_filter = _validate_tier(tier)
     try:
@@ -1621,26 +1663,32 @@ async def get_active_customers(
         now = datetime.utcnow()
         has_paid = _has_paid_condition(now)
 
-        stmt = select(Customer, has_paid.label("has_paid")).where(
+        conditions = [
             Customer.user_id == user.id,
-            Customer.status == CustomerStatus.ACTIVE
-        ).options(
+            Customer.status == CustomerStatus.ACTIVE,
+        ]
+        if router_id is not None:
+            conditions.append(Customer.router_id == router_id)
+        if tier_filter == "customer":
+            conditions.append(has_paid)
+        elif tier_filter == "visitor":
+            conditions.append(~has_paid)
+        stmt = select(Customer, has_paid.label("has_paid")).where(*conditions).options(
             selectinload(Customer.plan),
             selectinload(Customer.router)
-        ).order_by(Customer.expiry)
-        if router_id is not None:
-            stmt = stmt.where(Customer.router_id == router_id)
-        if tier_filter == "customer":
-            stmt = stmt.where(has_paid)
-        elif tier_filter == "visitor":
-            stmt = stmt.where(~has_paid)
+        ).order_by(Customer.expiry, Customer.id)
+        paged = _wants_page(page, per_page)
+        total = None
+        if paged:
+            total = await _count_rows(db, conditions)
+            stmt = stmt.offset((page - 1) * per_page).limit(per_page)
 
         result = await db.execute(stmt)
         rows = result.all()
         paybills = await _payment_paybills(db, user, {c.router_id for c, _ in rows})
         pay_cards = await _pay_by_mpesa_map(db, (c for c, _ in rows), paybills)
 
-        return [
+        items = [
             {
                 "id": c.id,
                 "name": c.name,
@@ -1678,6 +1726,7 @@ async def get_active_customers(
             }
             for c, c_has_paid in rows
         ]
+        return _page_envelope(items, page, per_page, total) if paged else items
     except Exception as e:
         logger.error(f"Error fetching active customers: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch active customers")
