@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,6 +31,7 @@ from app.services.device_classifier import classify_device, infer_hotspot_subnet
 from app.core.protected_devices import is_protected_device
 from app.services.router_availability import record_router_availability
 from app.services.router_concurrency import run_with_guard
+from app.services import port_restart
 from app.services.router_remote_access import configure_router_remote_access_sync
 from app.services.provisioning import provision_base_url_for_vpn, fetch_certificate_flag_for_url
 from app.services.pppoe_customer_import import (
@@ -39,6 +40,7 @@ from app.services.pppoe_customer_import import (
     import_pppoe_customers,
 )
 from app.services.pppoe_router_transfer import transfer_pppoe_customers_between_routers
+from app.services.customer_grace import effective_expiry_of, has_access_time
 from app.config import settings
 
 import logging
@@ -47,6 +49,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import tempfile
 import uuid
 
@@ -1196,7 +1199,10 @@ async def cleanup_expired_customers_for_router(
         )
         
         result = await db.execute(stmt)
-        expired_customers = result.scalars().all()
+        # Customers inside their reseller-set grace window are not expired yet.
+        expired_customers = [
+            c for c in result.scalars().all() if not has_access_time(c, now)
+        ]
         
         if not expired_customers:
             return {
@@ -1208,14 +1214,20 @@ async def cleanup_expired_customers_for_router(
             }
         
         current_state = await db.execute(
-            select(Customer.id, Customer.status, Customer.expiry).where(
+            select(
+                Customer.id, Customer.status, Customer.expiry, Customer.grace_period_minutes
+            ).where(
                 Customer.id.in_([customer.id for customer in expired_customers])
             )
         )
         now_before_router_cleanup = datetime.utcnow()
         still_expired_ids = set()
-        for customer_id, status, expiry in current_state.all():
-            if status == CustomerStatus.ACTIVE and expiry and expiry <= now_before_router_cleanup:
+        for customer_id, status, expiry, grace in current_state.all():
+            if (
+                status == CustomerStatus.ACTIVE
+                and expiry
+                and effective_expiry_of(expiry, grace) <= now_before_router_cleanup
+            ):
                 still_expired_ids.add(customer_id)
 
         expired_customers = [
@@ -1275,7 +1287,7 @@ async def cleanup_expired_customers_for_router(
         for customer in expired_customers:
             if customer.id in successful_ids:
                 await db.refresh(customer)
-                if customer.expiry and customer.expiry > now_after_cleanup:
+                if customer.expiry and has_access_time(customer, now_after_cleanup):
                     logger.warning(
                         "[ROUTER-CLEANUP] Customer %s renewed during cleanup; skipping deactivation",
                         customer.id,
@@ -2995,6 +3007,8 @@ def _analyze_port_rows(
     bridge_port_by_interface = {
         row.get("interface"): row for row in bridge_port_rows if row.get("interface")
     }
+    lb_config = router_info.get("lb_config") or {}
+    wan_ports = set(lb_config.get("wan_ports") or []) if router_info.get("lb_enabled") else set()
 
     learned_macs_by_port: Dict[str, Set[str]] = {}
     for row in bridge_host_rows:
@@ -3250,7 +3264,11 @@ def _analyze_port_rows(
         tx_errors = _safe_routeros_int(iface.get("tx-error"))
         port_warnings = []
         health = "down"
-        if link_up and learned_macs:
+        # WAN ports are routed interfaces: bridge MAC learning says nothing
+        # about their health. Only trust configured WANs that are unbridged;
+        # stale LB configuration must not hide an access-port warning.
+        is_wan = port_name in wan_ports and not bridge_port.get("bridge")
+        if link_up and (learned_macs or is_wan):
             health = "active"
         elif link_up:
             health = "silent_link"
@@ -3262,6 +3280,8 @@ def _analyze_port_rows(
                 port_warnings.append(
                     "Link is up but no downstream MACs are currently learned"
                 )
+        elif is_wan:
+            port_warnings.append("Configured WAN port has no physical link")
         if rx_errors or tx_errors:
             port_warnings.append("Interface errors are present")
         if port_warnings:
@@ -3602,6 +3622,8 @@ async def get_router_port_analytics(
         "username": router_obj.username,
         "password": router_obj.password,
         "port": router_obj.port,
+        "lb_enabled": router_obj.lb_enabled,
+        "lb_config": router_obj.lb_config,
     }
     await db.commit()
 
@@ -4104,6 +4126,195 @@ async def reboot_router(
         "connection_closed": bool(result.get("connection_closed", False)),
         "message": result.get("message", "Reboot command sent to router"),
         "reason": reason,
+        "requested_at": datetime.utcnow().isoformat(),
+    }
+
+
+# =========================================================================
+# RESTART ONE LAN PORT (power-cycle / bounce the access point behind it)
+# =========================================================================
+
+class RestartPortRequest(BaseModel):
+    confirm: bool = False
+
+
+_PORT_RESTART_TIMEOUT_SECONDS = 50
+
+_PORT_RESTART_REFUSAL_STATUS = {
+    port_restart.REASON_NOT_FOUND: 404,
+}
+
+
+def _port_restart_router_info(router_obj: Router) -> dict:
+    lb_config = router_obj.lb_config if isinstance(router_obj.lb_config, dict) else {}
+    return {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+        # Kept even while LB is off: that port is usually still cabled to an ISP.
+        "lb_wan_ports": list(lb_config.get("wan_ports") or []),
+    }
+
+
+def _set_activity_summary(request: Optional[Request], summary: str) -> None:
+    """Hand the staff-activity middleware a precise line for this write."""
+    if request is None:
+        return
+    try:
+        request.state.staff_activity_summary = summary[:300]
+    except Exception:
+        pass
+
+
+@router.get("/api/routers/{router_id}/interfaces/restart-options")
+async def get_port_restart_options(
+    router_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Which ethernet ports can be restarted remotely, and why not for the rest.
+
+    Read-only. Uses the exact guard evaluation the restart endpoint applies.
+    """
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, getattr(user, "role", None))
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+    router_info = _port_restart_router_info(router_obj)
+    router_name = router_obj.name
+    await db.commit()
+
+    result = await run_with_guard(
+        router_id,
+        port_restart.restart_options_sync,
+        router_info,
+        acquire_timeout_seconds=5,
+        timeout_seconds=30,
+    )
+    if result.get("error") == "busy":
+        raise HTTPException(status_code=429, detail=result.get("detail", "Router is busy, try again shortly"))
+    if result.get("error") == "timeout":
+        raise HTTPException(status_code=504, detail=result.get("detail", "Router did not answer in time"))
+    if result.get("error") == "connect_failed":
+        await record_router_availability(db, router_id, False, "port_restart_options")
+        raise HTTPException(status_code=503, detail=result.get("message") or f"Failed to connect to router: {router_name}")
+    if result.get("error"):
+        raise HTTPException(status_code=502, detail=result.get("message") or result["error"])
+
+    return {
+        "router_id": router_id,
+        "router_name": router_name,
+        "restart_in_progress": port_restart.restart_in_progress(router_id),
+        "ports": result.get("ports", []),
+    }
+
+
+@router.post("/api/routers/{router_id}/interfaces/{interface_name}/restart")
+async def restart_router_port(
+    router_id: int,
+    interface_name: str,
+    request: Request,
+    body: Optional[RestartPortRequest] = None,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Restart whatever is plugged into one LAN port (e.g. a hung access point).
+
+    PoE-powered port: power-cycle the PoE. Otherwise: disable the port for a
+    few seconds and enable it again. The previous state is always restored.
+    WAN, management, API-ingress, non-ethernet and non-LAN ports are refused.
+    One restart per router at a time (a second request gets 409).
+    """
+    body = body or RestartPortRequest()
+    interface_name = (interface_name or "").strip()
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Set confirm=true to restart this port")
+    if not interface_name or len(interface_name) > 64:
+        raise HTTPException(status_code=400, detail="Invalid port name")
+
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, getattr(user, "role", None))
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+    router_info = _port_restart_router_info(router_obj)
+    router_name = router_obj.name
+    user_id = user.id
+    await db.commit()
+
+    claim = port_restart.try_claim(router_id)
+    if claim is None:
+        _set_activity_summary(
+            request, f"Port restart of {interface_name} on router {router_id} refused: another restart is running",
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Another port restart is already running on this router. Wait for it to finish.",
+        )
+
+    try:
+        result = await run_with_guard(
+            router_id,
+            port_restart.restart_port_sync,
+            router_info,
+            interface_name,
+            claim,
+            acquire_timeout_seconds=5,
+            timeout_seconds=_PORT_RESTART_TIMEOUT_SECONDS,
+        )
+    finally:
+        port_restart.abandon_if_not_started(claim)
+
+    method = result.get("method")
+    method_label = port_restart.METHOD_LABELS.get(method, method or "none")
+    error = result.get("error")
+    outcome = "ok" if not error else error
+    _set_activity_summary(
+        request,
+        f"Restarted port {interface_name} on router {router_id} by {method_label}: {outcome}"
+        if not error else
+        f"Port restart of {interface_name} on router {router_id} ({method_label}) failed: "
+        f"{outcome} - {result.get('message') or result.get('detail') or ''}",
+    )
+    logger.info(
+        "[port-restart] router=%s (%s) port=%s user_id=%s method=%s result=%s %s",
+        router_id, router_name, interface_name, user_id, method, outcome,
+        result.get("message") or "",
+    )
+
+    if error == "busy":
+        raise HTTPException(status_code=429, detail=result.get("detail", "Router is busy, try again shortly"))
+    if error == "timeout":
+        raise HTTPException(
+            status_code=504,
+            detail="The router is slow to answer. The port is put back automatically; check it in a minute.",
+        )
+    if error == "connect_failed":
+        await record_router_availability(db, router_id, False, "port_restart")
+        raise HTTPException(status_code=503, detail=result.get("message") or f"Failed to connect to router: {router_name}")
+    if error == "refused":
+        status = _PORT_RESTART_REFUSAL_STATUS.get(result.get("reason_code"), 400)
+        raise HTTPException(status_code=status, detail=result.get("message") or "This port cannot be restarted")
+    if error == "restore_failed":
+        raise HTTPException(
+            status_code=502,
+            detail=(result.get("message") or "The port may not have come back")
+            + ". Open the router's ports and turn it back on, or reboot the router.",
+        )
+    if error:
+        raise HTTPException(status_code=502, detail=result.get("message") or "Port restart failed")
+
+    _port_status_cache.pop(router_id, None)
+    return {
+        "success": True,
+        "router_id": router_id,
+        "router_name": router_name,
+        "interface": interface_name,
+        "method": method,
+        "method_label": method_label,
+        "restored": bool(result.get("restored")),
+        "off_seconds": result.get("off_seconds"),
+        "message": f"{interface_name} restarted ({method_label}). Devices on it reconnect in a few seconds.",
         "requested_at": datetime.utcnow().isoformat(),
     }
 
@@ -5973,7 +6184,12 @@ async def get_hotspot_diagnostics_by_identity(
 # result; someone on site must finish the physical step.
 # ---------------------------------------------------------------------------
 
-ALLOWED_DEVICE_MODES = {"home", "enterprise", "basic"}
+ALLOWED_DEVICE_MODES = {"home", "advanced", "enterprise", "basic"}
+
+# RouterOS 7.17 renamed the `enterprise` preset to `advanced`. Callers may ask
+# for either name; the router only understands the one its version uses.
+_ADVANCED_MODE_NAMES = {"advanced", "enterprise"}
+_ADVANCED_MODE_SINCE = (7, 17)
 
 # Per-feature flags accepted by /system/device-mode/update on RouterOS 7.13+.
 # We keep an allowlist so a bad key doesn't get passed straight through to
@@ -5987,12 +6203,27 @@ ALLOWED_DEVICE_MODE_FLAGS = {
 
 
 class DeviceModeUpdateRequest(BaseModel):
-    # Use either `mode` (a preset like "enterprise") OR `flags` (per-feature
+    # Use either `mode` (a preset like "advanced") OR `flags` (per-feature
     # toggles, e.g. {"hotspot": "yes"}). Newer RouterOS builds only accept
     # the flags form — the response message tells you which one this device
     # expects.
     mode: Optional[str] = None
     flags: Optional[dict] = None
+
+
+def _device_mode_name_for_version(mode: Optional[str], version: Optional[str]) -> Optional[str]:
+    """The name this RouterOS version uses for `mode`.
+
+    Only `advanced`/`enterprise` differ by version. An unreadable version keeps
+    the caller's name, and the router's own reply reports any mismatch.
+    """
+    if mode not in _ADVANCED_MODE_NAMES:
+        return mode
+    match = re.match(r"\s*(\d+)\.(\d+)", version or "")
+    if not match:
+        return mode
+    parsed = (int(match.group(1)), int(match.group(2)))
+    return "advanced" if parsed >= _ADVANCED_MODE_SINCE else "enterprise"
 
 
 def _get_device_mode_sync(router_info: dict) -> dict:
@@ -6036,13 +6267,20 @@ def _update_device_mode_sync(
         before = (before_resp.get("data") or [{}])[0] if before_resp.get("success") else {}
         current_mode = before.get("mode", "")
 
+        sent_mode = mode
+        if mode in _ADVANCED_MODE_NAMES:
+            resource_resp = api.send_command("/system/resource/print")
+            resource = (resource_resp.get("data") or [{}])[0] if resource_resp.get("success") else {}
+            sent_mode = _device_mode_name_for_version(mode, resource.get("version"))
+
         # If the caller asked for a preset that's already active and didn't
         # also pass per-feature flags, there's nothing to do.
-        if mode and current_mode == mode and not flags:
+        if mode and current_mode == sent_mode and not flags:
             return {
                 "success": True,
                 "status": "already_in_mode",
-                "message": f"Router is already in device-mode '{mode}'. Nothing to do.",
+                "sent_mode": None,
+                "message": f"Router is already in device-mode '{sent_mode}'. Nothing to do.",
                 "device_mode_before": before,
                 "device_mode_after": before,
             }
@@ -6051,8 +6289,8 @@ def _update_device_mode_sync(
         # `flags` switches the router into the per-feature ("flagged") form
         # and toggles individual capabilities.
         args: dict = {}
-        if mode:
-            args["mode"] = mode
+        if sent_mode:
+            args["mode"] = sent_mode
         if flags:
             args["flagged"] = "yes"
             for key, value in flags.items():
@@ -6104,15 +6342,15 @@ def _update_device_mode_sync(
         elif "does not match any value of mode" in raw_router_message_lower:
             status = "mode_value_rejected"
             human_message = (
-                "This RouterOS build does not accept a preset for `mode` — it "
-                "expects per-feature flags. Retry with body "
-                "{\"flags\": {\"hotspot\": \"yes\"}} (add other features as "
-                "needed). That puts the router into `flagged` device-mode and "
-                "enables only what you list."
+                f"This RouterOS build did not accept mode '{sent_mode}'. Retry "
+                "with per-feature flags, body {\"flags\": {\"fetch\": \"yes\", "
+                "\"scheduler\": \"yes\", \"hotspot\": \"yes\"}} (add other "
+                "features as needed). That puts the router into `flagged` "
+                "device-mode and enables only what you list."
             )
         elif update_resp.get("success") and not raw_router_message:
             status = "applied"
-            human_message = f"Device-mode changed to '{mode}' without requiring confirmation."
+            human_message = f"Device-mode changed to '{sent_mode}' without requiring confirmation."
         else:
             status = "router_responded_unrecognised"
             human_message = (
@@ -6131,6 +6369,7 @@ def _update_device_mode_sync(
         return {
             "success": True,
             "status": status,
+            "sent_mode": sent_mode,
             "message": human_message,
             "router_response_message": raw_router_message or None,
             "router_response_raw": update_resp,
@@ -6198,6 +6437,10 @@ async def update_device_mode(
     at the site to press the reset button briefly or power-cycle the router
     within ~5 minutes to physically confirm the change. Poll the GET
     endpoint afterwards to see whether the mode flipped.
+
+    `advanced` and `enterprise` are the same preset: `sent_mode` in the
+    response is the name this router's RouterOS version was actually sent
+    (`advanced` on 7.17 and newer, `enterprise` before).
     """
     mode = (request.mode or "").strip().lower() or None
     flags = request.flags or None

@@ -44,7 +44,9 @@ async def resolve_recipients(db, reseller_id: int, *, filter: str = "all",
         stmt = stmt.where(Customer.status == CustomerStatus.ACTIVE)
     elif filter == "expiring":
         cutoff = datetime.utcnow() + timedelta(days=expiring_days)
-        stmt = stmt.where(Customer.expiry.isnot(None), Customer.expiry <= cutoff)
+        # Paused customers are not expiring: their expiry is frozen at the pause.
+        stmt = stmt.where(Customer.expiry.isnot(None), Customer.expiry <= cutoff,
+                          Customer.paused_at.is_(None))
     if exclude_customer_ids and not customer_ids:
         stmt = stmt.where(Customer.id.notin_(exclude_customer_ids))
     if search:

@@ -12,6 +12,7 @@ Two flavors of endpoint live here:
    - POST /api/payment-methods/{id}/register-c2b
    - GET  /api/c2b/unmatched
    - POST /api/c2b/unmatched/{id}/attribute
+   - POST /api/admin/c2b/unmatched/{id}/credit-reseller  (admin only)
 
 The handler logic itself lives in app/services/c2b_handler.py so it stays
 unit-testable without spinning up an HTTP client.
@@ -38,6 +39,7 @@ from app.db.models import (
     C2BTransactionStatus,
     ConnectionType,
     Customer,
+    CustomerPayment,
     PaymentMethod,
     ResellerPaymentMethod,
     ResellerPaymentMethodType,
@@ -173,6 +175,14 @@ async def register_reseller_c2b(
             status_code=400,
             detail="C2B registration only applies to mpesa_paybill_with_keys methods",
         )
+    # Register (and keep) the shortcode exactly as Safaricom will send it
+    # back, so the confirmation handler's exact match finds this method.
+    from app.services.payment_numbers import InvalidNumber, normalize_fields
+
+    try:
+        normalize_fields(pm, ("mpesa_shortcode",))
+    except InvalidNumber as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     if not pm.mpesa_consumer_key_encrypted or not pm.mpesa_consumer_secret_encrypted or not pm.mpesa_shortcode:
         raise HTTPException(
             status_code=400,
@@ -205,11 +215,16 @@ async def register_reseller_c2b(
 async def list_unmatched_c2b(
     resolved: bool = False,
     limit: int = 100,
+    include_stk_echo: bool = False,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ) -> list[dict]:
     """List unmatched C2B payments assigned to the current reseller for triage.
-    Admins see all rows (no reseller scope)."""
+    Admins see all rows (no reseller scope).
+
+    STK echoes (the C2B copy Safaricom sends of an STK hotspot payment that
+    was already credited) are left out unless include_stk_echo=true: the
+    list is for genuine paybill payments that still need a customer."""
     user = await get_current_user(token, db)
     stmt = (
         select(UnmatchedC2BPayment)
@@ -221,6 +236,12 @@ async def list_unmatched_c2b(
         stmt = stmt.where(UnmatchedC2BPayment.assigned_reseller_id == user.id)
     if not resolved:
         stmt = stmt.where(UnmatchedC2BPayment.resolved_at.is_(None))
+    if not include_stk_echo:
+        stmt = stmt.where(
+            ~UnmatchedC2BPayment.c2b_transaction.has(
+                C2BTransaction.status == C2BTransactionStatus.STK_ECHO
+            )
+        )
 
     rows = (await db.execute(stmt)).scalars().all()
     return [_serialize_unmatched(r) for r in rows]
@@ -254,6 +275,9 @@ async def attribute_unmatched_c2b(
             select(UnmatchedC2BPayment)
             .options(joinedload(UnmatchedC2BPayment.c2b_transaction))
             .where(UnmatchedC2BPayment.id == unmatched_id)
+            # Serialise against a concurrent attribution or STK-echo retirement
+            # of the same row.
+            .with_for_update(of=UnmatchedC2BPayment)
         )
     ).scalar_one_or_none()
     if unmatched is None:
@@ -262,6 +286,29 @@ async def attribute_unmatched_c2b(
         raise HTTPException(status_code=403, detail="Not your unmatched payment")
     if unmatched.resolved_at is not None:
         raise HTTPException(status_code=409, detail="Already resolved")
+
+    # Never double-credit: if a payment carrying this receipt is already
+    # recorded (normally the STK hotspot payment this C2B row echoes),
+    # attributing it would add a second revenue row and extra access for the
+    # same money.
+    receipt = unmatched.c2b_transaction.trans_id
+    already_paid = (
+        await db.execute(
+            select(CustomerPayment.id, CustomerPayment.customer_id)
+            .where(CustomerPayment.payment_reference == receipt)
+            .limit(1)
+        )
+    ).first()
+    if already_paid is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"M-Pesa receipt {receipt} is already recorded as a payment for "
+                f"customer {already_paid.customer_id} (usually the hotspot STK payment "
+                "this paybill copy belongs to). Attributing it again would credit the "
+                "same money twice, so nothing was changed."
+            ),
+        )
 
     customer = (
         await db.execute(
@@ -346,6 +393,13 @@ async def attribute_unmatched_c2b(
     ):
         background_tasks.add_task(call_pppoe_provision, build_pppoe_payload(customer, customer.router))
 
+    if customer.plan and customer.plan.connection_type == ConnectionType.STATIC_IP and customer.router:
+        # Static IP: re-enable the binding/queue (fire-and-forget after commit;
+        # the static-IP enforcement job re-applies if the router was unreachable).
+        from app.services.static_ip import schedule_static_provision
+
+        schedule_static_provision(customer.id)
+
     return {
         "ok": True,
         "customer_id": customer.id,
@@ -355,8 +409,74 @@ async def attribute_unmatched_c2b(
 
 
 # ---------------------------------------------------------------------------
+# Admin: credit an unmatched platform-paybill payment to a reseller
+# ---------------------------------------------------------------------------
+
+
+class CreditUnmatchedToResellerRequest(BaseModel):
+    reseller_id: int
+    reason: str
+
+
+@router.post("/api/admin/c2b/unmatched/{unmatched_id}/credit-reseller")
+async def credit_unmatched_c2b_to_reseller(
+    unmatched_id: int,
+    request: CreditUnmatchedToResellerRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+) -> dict:
+    """Bitwave admins only. Add an unmatched platform-paybill payment to a
+    reseller's earnings (withdrawable like any platform-collected payment)
+    without linking a customer, plan or subscription. Refuses a second credit.
+    See app/services/c2b_reseller_credit.py."""
+    user = await get_current_user(token, db)
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    from app.services.c2b_reseller_credit import credit_unmatched_to_reseller
+
+    return await credit_unmatched_to_reseller(
+        db,
+        unmatched_id=unmatched_id,
+        reseller_id=request.reseller_id,
+        reason=request.reason,
+        admin=user,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+# Safaricom's error text is shown to the reseller as-is; cap it so a stray HTML
+# error page can't flood the dashboard alert or the log line.
+_SAFARICOM_ERROR_TEXT_LIMIT = 300
+
+
+def _safaricom_error_text(body: object) -> str:
+    """Pull the human-readable reason out of a Safaricom error body.
+
+    Daraja errors look like {"errorCode": "...", "errorMessage": "Urls are
+    already registered"}; some answers carry ResponseDescription instead, and
+    gateway failures come back as plain text/HTML (kept under "raw")."""
+    text = ""
+    if isinstance(body, dict):
+        for key in ("errorMessage", "ResponseDescription", "error_description", "message", "raw"):
+            value = body.get(key)
+            if isinstance(value, str) and value.strip():
+                text = value
+                break
+        else:
+            text = str(body) if body else ""
+    elif body is not None:
+        text = str(body)
+    text = " ".join(text.split())
+    if not text:
+        return "no reason given"
+    if len(text) > _SAFARICOM_ERROR_TEXT_LIMIT:
+        text = text[:_SAFARICOM_ERROR_TEXT_LIMIT] + "..."
+    return text
 
 
 async def _call_daraja_registerurl(
@@ -370,11 +490,31 @@ async def _call_daraja_registerurl(
 ) -> dict:
     """Call Safaricom Daraja /mpesa/c2b/v2/registerurl. Returns Safaricom's
     response verbatim so the caller can show ResponseDescription / errors
-    back to the operator."""
+    back to the operator.
+
+    Failures are raised as 4xx/503 with a plain-string ``detail``, never 502:
+    the API sits behind Cloudflare, which swaps an origin 502/504 for its own
+    page without CORS headers, so the dashboard only saw "Failed to fetch" and
+    the reseller never learned why Safaricom said no."""
     require_external_side_effects_enabled("M-Pesa C2B callback registration")
-    access_token = await get_access_token(
-        consumer_key=consumer_key, consumer_secret=consumer_secret
-    )
+    try:
+        access_token = await get_access_token(
+            consumer_key=consumer_key, consumer_secret=consumer_secret
+        )
+    except HTTPException as exc:
+        logger.warning(
+            "[C2B] registerurl token request failed shortcode=%s: %s",
+            shortcode,
+            exc.detail,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Could not get a Safaricom access token for this paybill. "
+                "Check the consumer key and secret; if they are correct, "
+                "Safaricom may be down, so try again in a few minutes."
+            ),
+        ) from exc
     base_url = (
         "https://api.safaricom.co.ke"
         if settings.MPESA_ENVIRONMENT == "production"
@@ -386,22 +526,53 @@ async def _call_daraja_registerurl(
         "ConfirmationURL": confirmation_url,
         "ValidationURL": validation_url,
     }
-    async with httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT) as client:
-        resp = await client.post(
-            f"{base_url}/mpesa/c2b/v2/registerurl",
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-            },
+    try:
+        async with httpx.AsyncClient(timeout=SAFARICOM_TIMEOUT) as client:
+            resp = await client.post(
+                f"{base_url}/mpesa/c2b/v2/registerurl",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+    except httpx.TimeoutException as exc:
+        logger.warning(
+            "[C2B] registerurl timed out shortcode=%s: %s", shortcode, type(exc).__name__
         )
-        try:
-            body = resp.json()
-        except Exception:
-            body = {"raw": resp.text}
-        if resp.status_code >= 400:
-            raise HTTPException(status_code=502, detail={"safaricom_status": resp.status_code, "body": body})
-        return body
+        raise HTTPException(
+            status_code=503,
+            detail="Safaricom did not respond in time to the C2B registration. Please try again in a few minutes.",
+        ) from exc
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "[C2B] registerurl transport error shortcode=%s: %s: %s",
+            shortcode,
+            type(exc).__name__,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Could not reach Safaricom to register the C2B URLs. Please try again in a few minutes.",
+        ) from exc
+
+    try:
+        body = resp.json()
+    except Exception:
+        body = {"raw": resp.text}
+    if resp.status_code >= 400:
+        reason = _safaricom_error_text(body)
+        logger.warning(
+            "[C2B] registerurl rejected shortcode=%s safaricom_status=%s body=%s",
+            shortcode,
+            resp.status_code,
+            str(body)[:1000],
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=f"Safaricom rejected C2B registration ({resp.status_code}): {reason}",
+        )
+    return body
 
 
 def _serialize_unmatched(row: UnmatchedC2BPayment) -> dict:

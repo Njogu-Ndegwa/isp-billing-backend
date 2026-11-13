@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.database import get_db
 from app.db.models import Customer, Router
 from app.services import mikrotik_lb
+from app.services.customer_grace import access_prefilter, effective_expiry, has_access_time
 from app.services.auth import get_current_user, verify_token
 from app.services.mikrotik_api import MikroTikAPI
 from app.services.router_availability import record_router_availability
@@ -219,19 +220,30 @@ def _lb_enable_sync(router_info: dict, wan_ports: List[str],
             report["error"] = apply_report.get("aborted") or "apply reported failed steps"
             return report
 
+        per_port = pre.get("per_port") or {}
         to_convert = [
             port for port in wan_ports[1:]
-            if ((pre.get("per_port") or {}).get(port) or {}).get("link") == "true"
+            if (per_port.get(port) or {}).get("link") == "true"
         ]
+        # Ports that are already working WANs (out of the bridge, DHCP bound) —
+        # e.g. WAN2 when a third line is added — are re-checked by convert but
+        # must NOT be in the dead-man plan: if it fired it would strip a line
+        # that was fine before this change.
+        already_wan = [
+            port for port in to_convert
+            if not (per_port.get(port) or {}).get("in_bridge")
+            and ((per_port.get(port) or {}).get("dhcp") or {}).get("status") == "bound"
+        ]
+        to_arm = [port for port in to_convert if port not in already_wan]
         deadman = None
-        if to_convert:
+        if to_arm:
             # Router-side safety net: if converting cuts our management path,
             # the router reverts the ports itself (see lb_arm_convert_deadman).
-            deadman = mikrotik_lb.lb_arm_convert_deadman(api, to_convert, wan_ports)
+            deadman = mikrotik_lb.lb_arm_convert_deadman(api, to_arm, wan_ports)
             report["deadman"] = deadman
             if deadman.get("aborted"):
-                report["deadman_not_armed"] = to_convert
-                to_convert = []  # never convert without it; lines stay dormant
+                report["deadman_not_armed"] = to_arm
+                to_convert = already_wan  # never convert without it; lines stay dormant
 
         for idx, port in enumerate(wan_ports[1:], start=1):
             if port in to_convert:
@@ -249,10 +261,11 @@ def _lb_enable_sync(router_info: dict, wan_ports: List[str],
                 report["dormant_ports"].append(port)
 
         report["seed"] = mikrotik_lb.lb_seed_paid(api, active_customers)
-        report["verify"] = mikrotik_lb.lb_verify(api)
+        report["verify"] = mikrotik_lb.lb_verify(api, wan_ports)
         if deadman and not deadman.get("aborted"):
-            if report["converted_ports"] and not mikrotik_lb.lb_internet_ok(api):
-                report["deadman_left_armed"] = report["converted_ports"]
+            armed_converted = [p for p in report["converted_ports"] if p in to_arm]
+            if armed_converted and not mikrotik_lb.lb_internet_ok(api):
+                report["deadman_left_armed"] = armed_converted
             else:
                 report["deadman_disarmed"] = mikrotik_lb.lb_disarm_convert_deadman(api)
         report["success"] = True
@@ -271,12 +284,12 @@ def _lb_rollback_sync(router_info: dict) -> dict:
         api.disconnect()
 
 
-def _lb_verify_sync(router_info: dict) -> dict:
+def _lb_verify_sync(router_info: dict, wan_ports: Optional[List[str]] = None) -> dict:
     api = _connect(router_info, timeout=30)
     if not api.connect():
         return {"error": "connect_failed", "detail": api.last_connect_error}
     try:
-        return mikrotik_lb.lb_verify(api)
+        return mikrotik_lb.lb_verify(api, wan_ports)
     finally:
         api.disconnect()
 
@@ -371,15 +384,16 @@ async def enable_load_balancing(
             select(Customer).where(
                 Customer.router_id == router_id,
                 Customer.expiry.isnot(None),
-                Customer.expiry > datetime.utcnow(),
+                access_prefilter(datetime.utcnow()),
                 Customer.mac_address.isnot(None),
             )
         )
     ).scalars().all()
+    seed_now = datetime.utcnow()
     active_customers = [
-        {"mac": (c.mac_address or "").upper(), "expiry": c.expiry}
+        {"mac": (c.mac_address or "").upper(), "expiry": effective_expiry(c)}
         for c in rows
-        if c.mac_address
+        if c.mac_address and has_access_time(c, seed_now)
     ]
     await db.commit()  # release the DB before router I/O
 
@@ -443,8 +457,13 @@ async def enable_load_balancing(
         )
     converted = result.get("converted_ports", [])
     dormant = result.get("dormant_ports", [])
+    # The rules are on the router, but if a configured WAN can't receive
+    # connections the enable did NOT do what was asked — say so, don't
+    # report success (router 606, 2026-11-12: WAN3 silently got nothing).
+    pcc_order = verify_report.get("pcc_order") or {}
+    pcc_ok = pcc_order.get("ok", True)
     return {
-        "success": True,
+        "success": pcc_ok,
         "router_id": router_id,
         "enabled": True,
         "wan_ports": request.wan_ports,
@@ -458,7 +477,14 @@ async def enable_load_balancing(
         "seed": result.get("seed"),
         "verify": verify_report,
         "message": (
-            f"Load balancing enabled on {', '.join(request.wan_ports)}"
+            (
+                f"Load balancing applied on {', '.join(request.wan_ports)} but NOT "
+                "working for "
+                + ", ".join(pcc_order.get("unreachable", []) + pcc_order.get("unrouted", []))
+                + " (rule order check failed)"
+                if not pcc_ok
+                else f"Load balancing enabled on {', '.join(request.wan_ports)}"
+            )
             + (f"; converted: {', '.join(converted)}" if converted else "")
             + (
                 f"; dormant (no link yet, will fall back to WAN1): {', '.join(dormant)}"
@@ -533,8 +559,9 @@ async def verify_load_balancing(
     )
     await db.commit()  # release the DB before router I/O
 
+    wan_ports = list((config or {}).get("wan_ports") or []) if enabled else []
     result = await _run_locked_router_thread(
-        router_obj, _lb_verify_sync, router_info
+        router_obj, _lb_verify_sync, router_info, wan_ports or None
     )
     await _record_availability(router_id, result)
     _raise_for_router_error(result, router_obj)

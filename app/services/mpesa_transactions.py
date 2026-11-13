@@ -484,6 +484,7 @@ async def _handle_successful_reconciliation(
     pppoe_payload = None
     hotspot_payload = None
     hotspot_context = None
+    static_customer_id = None
 
     async with async_session() as db:
         # Atomically claim the pending -> completed transition.
@@ -538,6 +539,9 @@ async def _handle_successful_reconciliation(
             return
 
         # --- Handle pending plan change ---
+        from app.services.pppoe_expired_guards import drop_unpaid_page_plan
+
+        drop_unpaid_page_plan(customer, mpesa_txn.amount)
         pending_data = None
         if customer.pending_update_data:
             try:
@@ -599,6 +603,8 @@ async def _handle_successful_reconciliation(
                     "missing pppoe_username or router",
                     customer.id,
                 )
+        elif customer.plan and customer.plan.connection_type == ConnectionType.STATIC_IP:
+            static_customer_id = customer.id
         elif customer.mac_address and customer.router:
             router_obj = customer.router
             hotspot_payload = build_hotspot_payload(
@@ -633,6 +639,11 @@ async def _handle_successful_reconciliation(
 
     if pppoe_payload:
         await call_pppoe_provision(pppoe_payload)
+
+    if static_customer_id is not None:
+        from app.services.static_ip import schedule_static_provision
+
+        schedule_static_provision(static_customer_id)
 
     if hotspot_payload and hotspot_context:
         await log_provisioning_event(

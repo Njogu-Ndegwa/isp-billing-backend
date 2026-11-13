@@ -229,6 +229,7 @@ garbage credential.
 | `africastalking` | Africa's Talking | username + API key header |
 | `hostpinnacle` | HostPinnacle Kenya | portal username + password in the form body |
 | `textsms` | TextSMS Kenya (textsms.co.ke) | API key + partner ID inside each message |
+| `fourknet` | 4K Net SMS (sms.4knet.co.ke) | bearer API key |
 
 ### A note on TextSMS
 
@@ -238,6 +239,18 @@ matched back on it (falling back to the phone number), so delivery status is
 per-recipient. The vendor spells the code key `respose-code`; both spellings
 are accepted. Code `1004` (low bulk credits) is stored as `low_credits`, which
 makes an empty TextSMS balance easy to spot in the message log.
+
+### A note on 4K Net
+
+4K Net (https://sms.4knet.co.ke/docs) takes a bearer API key and up to 100
+recipients per `/sms/send-bulk` call; larger sends are chunked with a short
+pause between calls to stay under its 60 requests/minute limit, and each call
+carries an `Idempotency-Key`. The sender ID is optional: left empty, the
+account's default sender ID is used. Results are matched per recipient by
+phone number. HTTP errors are stored as `http_<code>: <vendor reason>`, so a
+401 reads as bad credentials, a 429 as the sending limit, and a 400's own text
+("Insufficient balance", "Recipient must be a valid Kenyan phone number")
+drives the failure explanation. Balance comes from `GET /balance`.
 
 ### A note on HostPinnacle
 

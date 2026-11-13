@@ -21,6 +21,8 @@ Some failures in this project are cross-cutting: FastAPI request handlers, SQLAl
 
 ## Current High-Value Context
 
+- Accounting rotations must advance only past attempted routers on time/pool exits; see [budget-skipped routers](incidents/2026-10-20-bandwidth-budget-skips-unvisited-routers.md). Per-router deadline and polling-freshness limits remain separate work.
+
 - The backend talks to MikroTik routers over direct RouterOS API for many direct-api routers.
 - Router calls can be slow or hang when an edge device is overloaded, offline, or reachable over a weak management path.
 - DB sessions must not be held while waiting on MikroTik, payment-provider, or other slow network I/O.

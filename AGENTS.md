@@ -248,6 +248,72 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   protocol, safety rules and runbook:
   [`docs/expiry-enforcement-architecture.md`](docs/expiry-enforcement-architecture.md).
 
+## Customer Pause / Resume
+
+- `POST /api/customers/{id}/pause` / `/resume` (`app/services/customer_pause.py`), PPPoE and
+  static IP only. Paused = `INACTIVE` + `paused_at` set + `expiry` frozen at the pause moment;
+  the unused paid time is in `paused_remaining_seconds`. Every expiry/reminder/retry job keys on
+  ACTIVE or "expiry in the future", so they ignore paused customers without knowing about pauses;
+  `customer_grace.effective_expiry` gives no grace while paused.
+- Invariant enforced by a `before_flush` hook in `app/db/models.py`: an ACTIVE customer is never
+  paused. A payment while paused ends the pause and adds the paused time to the new expiry.
+
+## PPPoE Expired Redirect (payment page for expired PPPoE customers)
+
+- Per-router opt-in `routers.pppoe_expired_redirect` (admin: Edit Router switch,
+  `PUT /api/routers/{id}/pppoe-expired-redirect`, staff `routers.manage`). Code:
+  `app/services/pppoe_expired_redirect.py`, routes `app/api/pppoe_expired_routes.py`.
+- With it on, expiry (and the inactive safety net) keeps the PPP secret, moves it to the
+  `bw-pppoe-expired` profile (own /22 pool, address list `BW_PPPOE_EXPIRED`) and kicks the
+  session. DNS + portal/API hosts are allowed, tcp/80 is redirected to the router's web
+  proxy whose access list redirects to the portal's `expired.html`, everything else is
+  rejected (tcp-reset). Every router object is tagged `ISP_BILLING_PPPOE_EXPIRED*`; apply
+  is idempotent and runs again on each expiry batch, so a reset router self-repairs.
+- If the walled state can't be ensured, expiry falls back to removing the secret: an
+  expired customer never keeps access. Paused customers are always removed, never walled.
+- Any normal PPPoE provisioning (STK/C2B/Activate/resume) puts the plan profile back and
+  kicks: no special restore path. The recovery sweep treats a walled secret of a paying
+  customer as missing. Turning the switch off removes walled secrets (old behaviour) and
+  every walled-state object.
+- Walled sessions are real PPP sessions: they appear in the router's active PPPoE list.
+- Those sessions have queues and traffic, so the usage jobs reach `fup.evaluate_and_enforce`. It
+  takes no router action for an expired customer on a router with the switch on: a throttle or
+  restore points the secret at a real profile, which would give an unpaid customer internet.
+- The public page endpoints go through `app/services/pppoe_expired_guards.py`: lookup misses are
+  capped per caller and per router (so usernames can't be tested), prompts per customer and per
+  phone. A plan picked on the page goes in `pending_update_data` tagged `source` and `amount`;
+  payment sites call `drop_unpaid_page_plan` first, so it only counts for a payment of exactly
+  that amount. Any new payment-confirmation path that reads `pending_update_data` must do the same.
+
+## PPPoE Device Lock (login only works from the customer's own router)
+
+- Per customer, off by default: `customers.pppoe_device_lock`, `pppoe_bound_mac`, `pppoe_bound_at`,
+  `pppoe_lock_learn_after`, `pppoe_lock_applied_mac`; per-router default for NEW customers
+  `routers.pppoe_lock_new_customers`. Code: `app/services/pppoe_device_lock.py`, routes
+  `app/api/pppoe_device_lock_routes.py`. Admin: "Lock to this router" card on the PPPoE customer page,
+  switch in Edit Router.
+- Locked = the PPP secret carries `caller-id=<CPE MAC>`; RouterOS refuses the login from any other MAC.
+  The MAC is learned from the first session (after "Allow new router": only a session that STARTED
+  after the press). The `reconcile_pppoe_device_locks` job (2 min) learns and retries router writes;
+  it only reads customers with the lock on or a caller-id of ours still applied.
+- Every PPPoE push builds its payload through `build_pppoe_payload` / `add_caller_id`: a NEW push path
+  must too, or a renewal after expiry re-adds the secret without the lock. No `caller_id` key = the
+  secret's caller-id is not touched (all unlocked customers).
+
+## Customer Register Details
+
+- Optional per-customer details a reseller fills on the add/edit form: `national_id`
+  (ID / passport), `email`, `alt_phone`, `address_line` (house / unit), `building`
+  (building / estate), `installation_date`, `notes`. Validation, masking and the field
+  list live in `app/services/customer_profile.py` (`PROFILE_FIELDS`); the columns come
+  from `run_customer_profile_migrations` in `main.py`.
+- `national_id` is personal data: list endpoints return only `national_id_masked`
+  (`***` + last 3); the full number only on `GET/PUT /api/customers/{id}` and the
+  register response for the owning reseller. Admin search by ID goes through
+  `GET /api/customers/national-id-matches?q=` (ids only). Never log it: the audit log
+  records "ID / passport number changed", and register/edit errors go through
+  `_error_text`, which drops SQL parameters.
+
 ## Customer Audit Log
 
 - `GET /api/customers/{id}/audit-log` (`app/api/customer_audit_routes.py`) merges, at read
@@ -258,6 +324,12 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   flushed every 30 s, never written on the push path); router log lines naming the customer
   (`app/services/customer_router_logs.py`, de-duplicated by `dedup_key`); and who edited
   the customer. Session and router-log rows are pruned after `CUSTOMER_EVENT_RETENTION_DAYS`.
+- "Site went offline" vs "management tunnel down": everything uptime is judged on (usage
+  reports, RouterOS checks) travels through the management tunnel, so a dead tunnel looks
+  like a dead site. The expiry reaper falls back to public HTTPS when the tunnel fails; each
+  such call is kept in `router_public_contacts`, and `split_tunnel_outages`
+  (`app/services/router_availability.py`) turns an outage with calls inside into a tunnel
+  outage — listed apart in uptime and the activity log, not counted as downtime.
 - Router logs live in router RAM (~1000 lines). They are kept only when read: the
   per-customer "Pull router logs now" button, or the collector job, which is OFF unless
   `CUSTOMER_LOG_COLLECTOR_ENABLED=true` (a few PPPoE routers per 2-min tick, each at most

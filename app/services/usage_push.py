@@ -42,7 +42,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
 from sqlalchemy import select
@@ -60,9 +60,12 @@ from app.db.models import (
     User,
 )
 from app.services.mikrotik_api import normalize_mac_address
+from app.services.pppoe_sessions import resolve_extra_session_customer
+from app.services.static_ip import STATIC_KEY_PREFIX, normalize_static_ip
 from app.services.router_availability import record_router_availability
 from app.services.usage_counters import record_queue_usage_sample
-from app.services.usage_tracking import pooled_period_usage_bytes
+from app.services.usage_tracking import fup_cap_mb, fup_usage_bytes
+from app.services.customer_grace import has_access_time
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +79,12 @@ PUSH_COMMIT_CHUNK = 100
 MAX_REPORTS_PER_BATCH = 500
 
 _MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}$|^[0-9A-Fa-f]{12}$")
-_PPPOE_USERNAME_RE = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
+# RouterOS accepts almost any text as a PPP secret name, and resellers use it:
+# "house 24", "TELV!AN", "Mama mishel" are live usernames. Rejecting them here
+# drops the customer's usage and live queue. Only control characters and the
+# JSON-breaking quote/backslash are refused; the key must still match a
+# customer on the router before anything is banked.
+_PPPOE_USERNAME_RE = re.compile(r'^[^\x00-\x1f\x7f"\\]{1,64}$')
 
 # No real queue counter reaches 9 PB. A value above this is a corrupt read or a
 # hostile router, and banking it would instantly trip FUP and cut off a paying
@@ -106,6 +114,9 @@ class UsageReport:
     # "queue": a simple-queue counter (default). "host": a /ip hotspot host
     # counter for one device — real-time pilot routers are metered from these.
     source: str = "queue"
+    # Native subscriptions can arrive before their HTTP batch is sent. Preserve
+    # the actual observation time so another writer's newer sample wins.
+    sampled_at: Optional[datetime] = None
 
 
 # Device-metered usage rows live under their own key so a queue counter and a
@@ -150,6 +161,8 @@ class IngestResult:
     accepted: int = 0
     rejected: int = 0
     over_cap_customer_ids: list[int] = field(default_factory=list)
+    # Throttled or blocked, but no longer over the cap.
+    release_fup_customer_ids: list[int] = field(default_factory=list)
     # canonical hotspot MAC -> customer id, for customers live on this router.
     live_hotspot_customers: dict[str, int] = field(default_factory=dict)
     # "pppoe:<username>" -> customer id, for PPPoE customers live on this router.
@@ -157,6 +170,8 @@ class IngestResult:
     # "pppoe:<username>" -> customer id for EVERY PPPoE customer on the router,
     # live or not: the audit log must see the session that expiry cuts.
     known_pppoe_customers: dict[str, int] = field(default_factory=dict)
+    # "static:<ip>" -> customer id, for static-IP customers live on this router.
+    live_static_customers: dict[str, int] = field(default_factory=dict)
     # True once the maps above were built from this router's customers.
     # Empty maps on an early return mean "not looked at", not "nobody live".
     customers_resolved: bool = False
@@ -194,6 +209,10 @@ def _canonical_key(raw: str) -> Optional[str]:
         if not username or not _PPPOE_USERNAME_RE.match(username):
             return None
         return f"pppoe:{username}"
+    if key.lower().startswith(STATIC_KEY_PREFIX):
+        # plan_static:<ip> queues, reported by the stock push script.
+        ip = normalize_static_ip(key.split(":", 1)[1])
+        return f"{STATIC_KEY_PREFIX}{ip}" if ip else None
     if not _MAC_RE.match(key):
         return None
     return normalize_mac_address(key).upper()
@@ -222,7 +241,41 @@ def _index_customers(customers: Iterable[Customer], now: Optional[datetime] = No
             normalized = normalize_mac_address(customer.mac_address)
             if normalized:
                 _put(normalized.upper(), customer)
+        # Only static-IP plans: PPPoE customers also use static_ip (as their
+        # remote address) and are metered by their session queue instead.
+        if (
+            getattr(customer, "static_ip", None)
+            and customer.plan is not None
+            and customer.plan.connection_type == ConnectionType.STATIC_IP
+        ):
+            ip = normalize_static_ip(customer.static_ip)
+            if ip:
+                _put(f"{STATIC_KEY_PREFIX}{ip}", customer)
     return index
+
+
+def resolve_pppoe_queue_owner(
+    key: str,
+    target_ip: str,
+    index: dict[str, "Customer"],
+    session_users: Optional[dict[str, str]] = None,
+) -> Optional[str]:
+    """The ``pppoe:<username>`` that owns a PPPoE queue the index does not know.
+
+    Extra sessions of a multi-device login (``<pppoe-alice-1>``); the rules
+    live in ``pppoe_sessions.resolve_extra_session_customer``.
+    """
+    if not key.startswith("pppoe:") or key in index:
+        return None
+    customer = resolve_extra_session_customer(
+        key[len("pppoe:"):],
+        target_ip,
+        lambda username: index.get(f"pppoe:{username}"),
+        session_users,
+    )
+    if customer is None or not customer.pppoe_username:
+        return None
+    return f"pppoe:{customer.pppoe_username}"
 
 
 def _customer_is_live(customer: Customer, now: datetime) -> bool:
@@ -234,7 +287,7 @@ def _customer_is_live(customer: Customer, now: datetime) -> bool:
     """
     if customer.status != CustomerStatus.ACTIVE:
         return False
-    return customer.expiry is not None and customer.expiry > now
+    return has_access_time(customer, now)
 
 
 async def _latest_period_is_closed(db, customer_id: int) -> bool:
@@ -256,13 +309,9 @@ async def _latest_period_is_closed(db, customer_id: int) -> bool:
 
 
 def _cap_bytes_for(period: Optional[CustomerUsagePeriod], plan: Optional[Plan]) -> int:
-    """Cap in bytes, preferring the period's snapshot so a mid-period plan change
-    cannot retroactively move the line (same rule the sampler applies)."""
-    cap_mb = None
-    if period is not None and period.cap_mb_snapshot is not None:
-        cap_mb = period.cap_mb_snapshot
-    elif plan is not None:
-        cap_mb = plan.data_cap_mb
+    """Cap in bytes: the period's snapshot for a plan window, the plan's current
+    cap for a daily one (same rule as FUP enforcement and the sampler)."""
+    cap_mb = fup_cap_mb(period, plan)
     return int(cap_mb) * 1024 * 1024 if cap_mb and int(cap_mb) > 0 else 0
 
 
@@ -348,6 +397,7 @@ async def ingest_usage_reports(
     session_factory=None,
     router_metrics: Optional[RouterMetrics] = None,
     meter_hotspot_by_host: bool = False,
+    pppoe_session_users: Optional[dict[str, str]] = None,
 ) -> IngestResult:
     """Apply one router's batch of usage reports.
 
@@ -359,6 +409,11 @@ async def ingest_usage_reports(
     ``source="host"`` reports — the device's own counters, which no stale or
     duplicate queue can steal — and hotspot queue reports are not credited.
     PPPoE is always metered from its queue.
+
+    ``pppoe_session_users`` maps a session IP to its PPPoE username (from the
+    router's ``/ppp active`` list), so the queue of a second session on the
+    same username is credited to that customer. Each session queue keeps its
+    own usage row and counter baseline; they are summed through the customer.
     """
     now = now or datetime.utcnow()
     factory = session_factory or async_session
@@ -421,6 +476,8 @@ async def ingest_usage_reports(
                 and _customer_is_live(customer, now)
             ):
                 result.live_pppoe_customers[key] = customer.id
+            if key.startswith(STATIC_KEY_PREFIX) and _customer_is_live(customer, now):
+                result.live_static_customers[key] = customer.id
         result.customers_resolved = True
 
         # RouterOS can list one host entry twice (its script walks the bypassed
@@ -428,6 +485,14 @@ async def ingest_usage_reports(
         seen_hosts: set[tuple[str, str]] = set()
         pending = 0
         for report in reports:
+            observed = report.sampled_at
+            if observed is not None:
+                if observed.tzinfo is not None:
+                    observed = observed.astimezone(timezone.utc).replace(tzinfo=None)
+                if observed > now or observed < now - timedelta(seconds=360):
+                    result.rejected += 1
+                    result.errors.append("implausible_sample_time")
+                    continue
             key = _canonical_key(report.queue_key)
             is_host = report.source == "host"
             if is_host and key:
@@ -435,12 +500,16 @@ async def ingest_usage_reports(
                 if host_id in seen_hosts:
                     continue
                 seen_hosts.add(host_id)
-            if not key or (is_host and key.startswith("pppoe:")):
+            if not key or (is_host and (key.startswith("pppoe:") or key.startswith(STATIC_KEY_PREFIX))):
                 result.rejected += 1
                 result.errors.append("bad_queue_key")
                 continue
 
             customer = index.get(key)
+            if customer is None and not is_host:
+                owner_key = resolve_pppoe_queue_owner(key, report.target_ip, index, pppoe_session_users)
+                if owner_key:
+                    customer = index[owner_key]
             if customer is None:
                 if is_host:
                     continue  # any device on the LAN appears here; only customers count
@@ -478,6 +547,7 @@ async def ingest_usage_reports(
             if plan.connection_type not in (
                 ConnectionType.HOTSPOT,
                 ConnectionType.PPPOE,
+                ConnectionType.STATIC_IP,
             ):
                 result.rejected += 1
                 result.errors.append(f"unsupported_connection_type:{key}")
@@ -516,6 +586,7 @@ async def ingest_usage_reports(
                     target_ip=report.target_ip or "",
                     max_limit=report.max_limit or "",
                     now=now,
+                    sampled_at=observed,
                     first_sample_is_total=bool(report.final),
                 )
             except Exception as exc:  # one bad row must not lose the whole batch
@@ -537,12 +608,27 @@ async def ingest_usage_reports(
                 and period.fup_triggered_at is None
                 and customer.id not in result.over_cap_customer_ids
             ):
-                used_bytes = int(period.total_bytes or 0)
-                if used_bytes < cap_bytes:
-                    # A shared plan's cap covers all its devices together.
-                    used_bytes = await pooled_period_usage_bytes(db, customer, period)
+                # The plan's FUP window (period or today), pooled across a
+                # shared plan's devices.
+                used_bytes = await fup_usage_bytes(
+                    db, customer, period, plan=plan, now=now, cap_bytes=cap_bytes
+                )
                 if used_bytes >= cap_bytes:
                     result.over_cap_customer_ids.append(customer.id)
+            elif (
+                period is not None
+                and period.fup_triggered_at is not None
+                and period.fup_reverted_at is None
+                and customer.id not in result.release_fup_customer_ids
+            ):
+                # Cap removed or raised above usage. Real-time routers are not
+                # watched by the cap sampler, so nothing else lifts the throttle
+                # before the next renewal.
+                still_over = cap_bytes > 0 and await fup_usage_bytes(
+                    db, customer, period, plan=plan, now=now, cap_bytes=cap_bytes
+                ) >= cap_bytes
+                if not still_over:
+                    result.release_fup_customer_ids.append(customer.id)
 
             if pending >= PUSH_COMMIT_CHUNK:
                 await db.commit()

@@ -25,6 +25,7 @@ from app.db.models import (
     RouterCommand,
 )
 from app.services.mikrotik_api import normalize_mac_address, parse_speed_to_mikrotik
+from app.services.customer_grace import effective_expiry, has_access_time
 from app.services.pull_provisioning import render_hotspot_provision_rsc
 
 
@@ -101,8 +102,19 @@ def render_pppoe_provision_action(
     password: str,
     bandwidth_limit: str,
     comment: str = "",
+    caller_id: str | None = None,
 ) -> str:
     user = _safe_username(username, "pppoe_username")
+    # PPPoE device lock: None leaves caller-id alone, "" clears it, a MAC locks.
+    caller_arg = ""
+    if caller_id is not None:
+        from app.services.pppoe_device_lock import normalize_mac
+
+        mac = normalize_mac(caller_id) if caller_id else ""
+        if caller_id and not mac:
+            raise ValueError(f"router-agent: unsafe caller_id={caller_id!r}")
+        caller_arg = f' caller-id="{mac}"'
+
     rate = parse_speed_to_mikrotik(bandwidth_limit)
     if not _RATE_RE.fullmatch(rate):
         raise ValueError(f"router-agent: unsafe rate_limit={rate!r}")
@@ -120,9 +132,9 @@ def render_pppoe_provision_action(
     /ppp profile set [find name=\"{profile}\"] rate-limit=\"{rate}\"
 }}
 :if ([:len [/ppp secret find name=\"{user}\"]] = 0) do={{
-    /ppp secret add name=\"{user}\" password=\"{password_q}\" service=pppoe profile=\"{profile}\" comment=\"{comment_q}\"
+    /ppp secret add name=\"{user}\" password=\"{password_q}\" service=pppoe profile=\"{profile}\" comment=\"{comment_q}\"{caller_arg}
 }} else={{
-    /ppp secret set [find name=\"{user}\"] password=\"{password_q}\" service=pppoe profile=\"{profile}\" comment=\"{comment_q}\" disabled=no
+    /ppp secret set [find name=\"{user}\"] password=\"{password_q}\" service=pppoe profile=\"{profile}\" comment=\"{comment_q}\" disabled=no{caller_arg}
 }}
 :do {{ /ppp active remove [find name=\"{user}\"] }} on-error={{}}
 """
@@ -142,6 +154,7 @@ def render_hotspot_remove_action(
 :do {{ /ip hotspot active remove [find user=\"{user}\"] }} on-error={{}}
 :do {{ /ip hotspot ip-binding remove [find mac-address=\"{mac}\"] }} on-error={{}}
 :do {{ /ip hotspot user remove [find name=\"{user}\"] }} on-error={{}}
+:do {{ /ip hotspot user remove [find name=\"{mac}\"] }} on-error={{}}
 :do {{ /ip hotspot host remove [find mac-address=\"{mac}\"] }} on-error={{}}
 :do {{ /ip dhcp-server lease remove [find mac-address=\"{mac}\"] }} on-error={{}}
 :do {{ /queue simple remove [find name=\"plan_{user}\"] }} on-error={{}}
@@ -151,6 +164,7 @@ def render_hotspot_remove_action(
 :if ([:len [/ip hotspot ip-binding find mac-address=\"{mac}\"]] > 0) do={{ :error \"binding remains\" }}
 :if ([:len [/ip hotspot active find mac-address=\"{mac}\"]] > 0) do={{ :error \"session remains\" }}
 :if ([:len [/ip hotspot user find name=\"{user}\"]] > 0) do={{ :error \"user remains\" }}
+:if ([:len [/ip hotspot user find name=\"{mac}\"]] > 0) do={{ :error \"MAC-login user remains\" }}
 :if ([:len [/ip hotspot host find mac-address=\"{mac}\"]] > 0) do={{ :error \"host remains\" }}
 :if ([:len [/queue simple find name=\"plan_{user}\"]] > 0) do={{ :error \"queue remains\" }}
 {f':if ([:len [/ip firewall address-list find list="LB_PAID" comment="PAID:{mac}"]] > 0) do={{ :error "LB_PAID remains" }}' if lb_enabled else ''}
@@ -253,6 +267,18 @@ async def _enqueue_command(
     return command_id
 
 
+def _entitlement_generation(original_expiry, access_until) -> str:
+    """Idempotency generation for a grant: the paid expiry, plus the grace
+    deadline when one applies, so a grace reconnect after removal is not
+    deduplicated against the grant already delivered for that expiry."""
+    if not original_expiry:
+        return "none"
+    generation = original_expiry.isoformat()
+    if access_until and access_until != original_expiry:
+        generation += f"+grace:{access_until.isoformat()}"
+    return generation
+
+
 async def queue_hotspot_provision_command(
     *,
     router_id: int | None,
@@ -269,11 +295,11 @@ async def queue_hotspot_provision_command(
             customer is None
             or customer.status != CustomerStatus.ACTIVE
             or customer.router_id != router_id
-            or customer.expiry is None
-            or customer.expiry <= now
+            or not has_access_time(customer, now)
         ):
             return None
         original_expiry = customer.expiry
+        access_until = effective_expiry(customer)
 
     duration = _duration_seconds(hotspot_payload.get("time_limit"))
     service_start = (
@@ -291,12 +317,12 @@ async def queue_hotspot_provision_command(
         comment=hotspot_payload.get("comment", ""),
         expires_at=None,
         lb_enabled=bool(hotspot_payload.get("lb_enabled")),
-        binding_expiry=original_expiry,
+        binding_expiry=access_until,
     )
     entitlement_key = (
         f"attempt:{attempt_id}"
         if attempt_id is not None
-        else f"hotspot:{router_id}:{customer_id}:{original_expiry.isoformat() if original_expiry else 'none'}"
+        else f"hotspot:{router_id}:{customer_id}:{_entitlement_generation(original_expiry, access_until)}"
     )
     return await _enqueue_command(
         router_id=router_id,
@@ -313,7 +339,7 @@ async def queue_hotspot_provision_command(
             "username": hotspot_payload.get("username"),
             "lb_enabled": bool(hotspot_payload.get("lb_enabled")),
         },
-        expires_at=min(now + COMMAND_MAX_AGE, original_expiry),
+        expires_at=min(now + COMMAND_MAX_AGE, access_until),
     )
 
 
@@ -335,11 +361,11 @@ async def queue_pppoe_provision_command(
             customer is None
             or customer.status != CustomerStatus.ACTIVE
             or customer.router_id != router_id
-            or customer.expiry is None
-            or customer.expiry <= now
+            or not has_access_time(customer, now)
         ):
             return None
         original_expiry = customer.expiry
+        access_until = effective_expiry(customer)
         plan = await db.get(Plan, customer.plan_id) if customer.plan_id else None
     duration = _plan_duration_seconds(plan)
     service_start = (
@@ -352,11 +378,12 @@ async def queue_pppoe_provision_command(
         password=pppoe_payload.get("pppoe_password"),
         bandwidth_limit=pppoe_payload.get("bandwidth_limit"),
         comment=pppoe_payload.get("comment", ""),
+        caller_id=pppoe_payload.get("caller_id"),
     )
     entitlement_key = (
         f"attempt:{attempt_id}"
         if attempt_id is not None
-        else f"pppoe:{router_id}:{customer_id}:{original_expiry.isoformat() if original_expiry else 'none'}"
+        else f"pppoe:{router_id}:{customer_id}:{_entitlement_generation(original_expiry, access_until)}"
     )
     return await _enqueue_command(
         router_id=router_id,
@@ -371,7 +398,7 @@ async def queue_pppoe_provision_command(
             "entitlement_seconds": duration,
             "username": pppoe_payload.get("pppoe_username"),
         },
-        expires_at=min(now + COMMAND_MAX_AGE, original_expiry),
+        expires_at=min(now + COMMAND_MAX_AGE, access_until),
     )
 
 
@@ -396,6 +423,36 @@ async def queue_hotspot_remove_command(
         metadata={
             "expiry_generation": generation,
             "mac_address": normalize_mac_address(mac_address),
+            "username": username,
+            "lb_enabled": lb_enabled,
+        },
+        expires_at=datetime.utcnow() + timedelta(days=7),
+    )
+
+
+async def queue_hotspot_remove_for_deleted_customer(
+    *, router_id: int, deleted_customer_id: int, mac_address: str, lb_enabled: bool = False,
+) -> int | None:
+    """Removal for a customer whose row is already gone.
+
+    ``customer_id`` stays NULL (the FK target no longer exists); delivery
+    cancels the command if another live customer holds the MAC by then.
+    """
+    mac = normalize_mac_address(mac_address)
+    username = mac.replace(":", "")
+    return await _enqueue_command(
+        router_id=router_id,
+        customer_id=None,
+        attempt_id=None,
+        idempotency_key=f"hotspot-remove:{router_id}:deleted-{deleted_customer_id}",
+        command_type="hotspot_remove",
+        action_script=render_hotspot_remove_action(
+            mac_address=mac, username=username, lb_enabled=lb_enabled,
+        ),
+        metadata={
+            "expiry_generation": "deleted",
+            "deleted_customer_id": deleted_customer_id,
+            "mac_address": mac,
             "username": username,
             "lb_enabled": lb_enabled,
         },
@@ -505,11 +562,19 @@ async def next_command_for_router(router_id: int) -> RouterCommand | None:
                 )
                 command.updated_at = now
                 continue
+            if (
+                command.customer_id is None
+                and command.command_type == "hotspot_remove"
+                and await _mac_now_used_on_router(db, command)
+            ):
+                command.state = "cancelled"
+                command.last_error = "MAC is used by a live customer on this router"
+                command.updated_at = now
+                continue
             if customer is not None:
                 customer_is_live = (
                     customer.status == CustomerStatus.ACTIVE
-                    and customer.expiry is not None
-                    and customer.expiry > now
+                    and has_access_time(customer, now)
                 )
                 generation = (command.metadata_json or {}).get("expiry_generation")
                 current_generation = customer.expiry.isoformat() if customer.expiry else "none"
@@ -561,6 +626,16 @@ async def next_command_for_router(router_id: int) -> RouterCommand | None:
     return None
 
 
+async def _mac_now_used_on_router(db, command: RouterCommand) -> bool:
+    """A customer-less removal must not take a MAC someone else now pays for."""
+    mac = (command.metadata_json or {}).get("mac_address")
+    if not mac:
+        return False
+    from app.services.deleted_customer_cleanup import macs_in_use_on_router
+
+    return bool(await macs_in_use_on_router(db, command.router_id, {normalize_mac_address(mac)}))
+
+
 async def expire_active_commands(now: datetime | None = None) -> int:
     """Terminalize expired commands and clean up grants that may have applied."""
 
@@ -599,8 +674,7 @@ async def expire_active_commands(now: datetime | None = None) -> int:
                 customer_is_live_here = bool(
                     customer is not None
                     and customer.status == CustomerStatus.ACTIVE
-                    and customer.expiry is not None
-                    and customer.expiry > now
+                    and has_access_time(customer, now)
                     and customer.router_id == command.router_id
                 )
                 if not customer_is_live_here:
@@ -727,7 +801,8 @@ async def _queue_hotspot_repair_after_stale_remove(
 
     mac = normalize_mac_address(customer.mac_address)
     username = mac.replace(":", "")
-    remaining_seconds = max(60, int((customer.expiry - now).total_seconds()))
+    access_until = effective_expiry(customer)
+    remaining_seconds = max(60, int((access_until - now).total_seconds()))
     rate = parse_speed_to_mikrotik(plan.speed)
     script = render_hotspot_provision_rsc(
         username=username,
@@ -738,7 +813,7 @@ async def _queue_hotspot_repair_after_stale_remove(
         comment=f"CID:{customer.id}|stale-removal-repair",
         expires_at=None,
         lb_enabled=bool(router.lb_enabled),
-        binding_expiry=customer.expiry,
+        binding_expiry=access_until,
     )
     db.add(
         RouterCommand(
@@ -758,7 +833,7 @@ async def _queue_hotspot_repair_after_stale_remove(
             },
             state="pending",
             available_at=now,
-            expires_at=min(now + COMMAND_MAX_AGE, customer.expiry),
+            expires_at=min(now + COMMAND_MAX_AGE, access_until),
         )
     )
     return True
@@ -854,8 +929,7 @@ async def acknowledge_command(
         customer_is_live_here = bool(
             customer is not None
             and customer.status == CustomerStatus.ACTIVE
-            and customer.expiry is not None
-            and customer.expiry > now
+            and has_access_time(customer, now)
             and customer.router_id == command.router_id
         )
 
@@ -902,7 +976,7 @@ async def acknowledge_command(
             attempt.updated_at = now
 
         if customer is not None and is_remove and not customer_is_live_here:
-            if customer.expiry is None or customer.expiry <= now:
+            if not has_access_time(customer, now):
                 customer.status = CustomerStatus.INACTIVE
 
         # Restore paid time lost while a newly-paid customer waited for the

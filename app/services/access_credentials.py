@@ -17,17 +17,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 import string
 import time
 from datetime import datetime
-from typing import Any, Dict, Optional
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import AccessCredential, Router, RouterAuthMethod
-from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
+from app.services.mikrotik_api import MikroTikAPI, _whole_rate, normalize_mac_address
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,109 @@ def generate_password(length: int = 10) -> str:
     return "".join(secrets.choice(_PASSWORD_ALPHABET) for _ in range(length))
 
 
+# ---------------------------------------------------------------------------
+# Rate-limit normalisation
+# ---------------------------------------------------------------------------
+#
+# A credential's ``rate_limit`` is stored in RouterOS order, UPLOAD/DOWNLOAD
+# (rx/tx from the router), and is sent verbatim as the simple-queue
+# ``max-limit`` and the hotspot profile ``rate-limit``. Two shapes broke it in
+# production (2026-10-28):
+#   * "50/10" (cred 319): RouterOS reads unit-less numbers as bits/s, so the
+#     device got 50 bit/s. Resellers mean Mbps, the same as plan speeds
+#     (``parse_speed_to_mikrotik`` turns "5/5" into "5M/5M").
+#   * "5m/2m" (creds 166, 167, 274, 281): RouterOS only knows k, M and G.
+#     Lowercase "m" fails every queue add with "value of upload-max-limit
+#     contains invalid trailing characters".
+
+class InvalidRateLimit(ValueError):
+    """The rate-limit text is not ``upload/download`` in k/M/G (or bare Mbps)."""
+
+
+_RATE_PART_RE = re.compile(r"^(\d+(?:\.\d+)?)([KMG])?(?:BPS)?$")
+# 10 Gbit/s: anything above is a typo (e.g. "5000M" meant as kbps), not a speed.
+_MAX_RATE_BPS = 10_000_000_000
+_UNIT_BPS = {"": 1, "K": 1_000, "M": 1_000_000, "G": 1_000_000_000}
+
+
+def _normalize_rate_part(part: str, *, bare_unit: Optional[str]) -> str:
+    value = part.strip().upper().replace(" ", "")
+    match = _RATE_PART_RE.match(value)
+    if not match:
+        raise InvalidRateLimit(part)
+    number, unit = match.group(1), match.group(2) or ""
+    if not unit and bare_unit:
+        # Same rule as plan speeds (mikrotik_api._normalize_mikrotik_rate_part
+        # in slash context): small bare numbers are Mbps, 1000+ are raw bps as
+        # RouterOS itself prints them ("5000000/2000000").
+        if Decimal(number) < 1000:
+            unit = bare_unit
+    try:
+        bps = Decimal(number) * _UNIT_BPS[unit]
+    except InvalidOperation as exc:  # pragma: no cover - regex guarantees a number
+        raise InvalidRateLimit(part) from exc
+    if bps > _MAX_RATE_BPS:
+        raise InvalidRateLimit(part)
+    whole = _whole_rate(number, unit)
+    # RouterOS spells kilo as lowercase "k"; M and G stay uppercase.
+    return whole[:-1] + "k" if whole.endswith("K") else whole
+
+
+def normalize_rate_limit(value: Optional[str], *, bare_unit: Optional[str] = "M") -> Optional[str]:
+    """Canonical RouterOS ``upload/download`` rate-limit, or None for unlimited.
+
+    "50/10" -> "50M/10M", "5m/2m" -> "5M/2M", "5 Mbps / 2 Mbps" -> "5M/2M",
+    "512K/1.5M" -> "512k/1500k", "5M" -> "5M/5M".
+
+    ``bare_unit=None`` keeps unit-less numbers as they are (bits/s); used when
+    re-sending rows that were stored before this validation existed, so their
+    meaning is not changed behind the reseller's back.
+
+    Raises ``InvalidRateLimit`` for anything else, and for a zero side
+    (RouterOS treats 0 as unlimited; an empty value is the way to say that).
+    """
+    if value is None:
+        return None
+    text_value = str(value).strip()
+    if not text_value:
+        return None
+    parts = text_value.split("/")
+    if len(parts) == 1:
+        parts = parts * 2
+    if len(parts) != 2:
+        raise InvalidRateLimit(value)
+    upload, download = (_normalize_rate_part(p, bare_unit=bare_unit) for p in parts)
+    if _rate_to_bps(upload) == 0 or _rate_to_bps(download) == 0:
+        raise InvalidRateLimit(value)
+    return f"{upload}/{download}"
+
+
+def router_rate_limit(value: Optional[str]) -> Optional[str]:
+    """The stored rate-limit, spelled the way RouterOS accepts it.
+
+    Fixes unit case and spacing on rows saved before input was validated, but
+    never reinterprets them (bare numbers stay bits/s). Anything it cannot
+    parse is passed through unchanged, exactly as before.
+    """
+    if not value or not str(value).strip():
+        return None
+    try:
+        return normalize_rate_limit(value, bare_unit=None)
+    except InvalidRateLimit:
+        return str(value).strip()
+
+
+def rate_limit_has_bare_numbers(value: Optional[str]) -> bool:
+    """True if any side of the rate-limit has no unit (RouterOS: bits/s)."""
+    if not value:
+        return False
+    for part in str(value).split("/"):
+        match = _RATE_PART_RE.match(part.strip().upper().replace(" ", ""))
+        if match and not match.group(2):
+            return True
+    return False
+
+
 def profile_name_for_rate(rate_limit: Optional[str]) -> str:
     """Return the hotspot profile name used to carry a given rate-limit.
 
@@ -58,6 +163,7 @@ def profile_name_for_rate(rate_limit: Optional[str]) -> str:
     don't churn MikroTik state. ``shared-users=1`` is applied to every
     ``cred-*`` profile to enforce single concurrent login at the router level.
     """
+    rate_limit = router_rate_limit(rate_limit)
     if not rate_limit:
         return "cred-unlimited"
     safe = rate_limit.replace("/", "_").replace(" ", "")
@@ -70,6 +176,141 @@ def queue_name_for_credential(cred_id: int) -> str:
 
 def comment_for_credential(cred: AccessCredential) -> str:
     return f"{USER_COMMENT_PREFIX}|cred:{cred.id}|user:{cred.user_id}"
+
+
+def _rate_to_bps(value: str) -> Optional[int]:
+    value = (value or "").strip().upper()
+    if not value:
+        return None
+    scale = {"K": 1_000, "M": 1_000_000, "G": 1_000_000_000}.get(value[-1], 1)
+    number = value[:-1] if value[-1] in "KMG" else value
+    try:
+        return int(float(number) * scale)
+    except ValueError:
+        return None
+
+
+def rate_limits_equal(a: Optional[str], b: Optional[str]) -> bool:
+    """``5M/5M`` == ``5000000/5000000`` (RouterOS prints queue limits in bps)."""
+    def pair(v):
+        up, _, down = str(v or "").strip().partition("/")
+        return _rate_to_bps(up), _rate_to_bps(down or up)
+    pa, pb = pair(a), pair(b)
+    return None not in pa and pa == pb
+
+
+def ensure_credential_queue_sync(
+    api: MikroTikAPI,
+    *,
+    cred_id: int,
+    username: str,
+    rate_limit: Optional[str],
+    client_ip: Union[str, Iterable[str], None],
+    existing_queue: Optional[Dict[str, Any]],
+) -> str:
+    """Make the ``cred_<id>`` simple queue enforce ``rate_limit`` on ``client_ip``.
+
+    ``client_ip`` may be one address or every address seen behind the bound
+    MAC. A repeater/extender that MAC-NATs its clients puts several IPs behind
+    one MAC; the bypass binding lets all of them through, so the queue has to
+    target all of them (one shared limit) or every device but the first runs
+    unlimited.
+
+    A bypassed ip-binding skips the hotspot user profile, so this queue is the
+    ONLY thing that limits a credential's device. Called at login and again by
+    the access-credential reaper on every pass, the same way the customer queue
+    sync re-creates/re-targets ``plan_<MAC>`` queues: a device whose IP was not
+    known at login, or whose DHCP address changed since, gets limited on the
+    next pass instead of running unlimited.
+
+    Returns ``created`` | ``updated`` | ``removed`` | ``unchanged`` |
+    ``no_ip`` | ``error``.
+    """
+    comment = f"{USER_COMMENT_PREFIX}|cred:{cred_id}|user:{username}"
+    queue_id = (existing_queue or {}).get(".id")
+    rate_limit = router_rate_limit(rate_limit)
+
+    if not rate_limit:
+        # Unthrottled credential: a leftover queue would keep the old cap.
+        if not queue_id:
+            return "unchanged"
+        result = api.send_command("/queue/simple/remove", {"numbers": queue_id})
+        return "error" if result.get("error") else "removed"
+
+    wanted_ips = _queue_target_ips(client_ip)
+    if not wanted_ips:
+        return "no_ip"
+
+    target = ",".join(f"{ip}/32" for ip in wanted_ips)
+    if queue_id:
+        current_ips = _queue_target_ips(existing_queue.get("target"))
+        disabled = str(existing_queue.get("disabled", "false")).lower() == "true"
+        if (current_ips == wanted_ips and not disabled
+                and rate_limits_equal(existing_queue.get("max-limit"), rate_limit)):
+            return "unchanged"
+        result = api.send_command("/queue/simple/set", {
+            "numbers": queue_id,
+            "target": target,
+            "max-limit": rate_limit,
+            "disabled": "no",
+            "comment": comment,
+        })
+        outcome = "updated"
+    else:
+        result = api.send_command("/queue/simple/add", {
+            "name": queue_name_for_credential(cred_id),
+            "target": target,
+            "max-limit": rate_limit,
+            "comment": comment,
+        })
+        outcome = "created"
+
+    if result.get("error"):
+        logger.warning(
+            "[ACCESS-CRED QUEUE] %s of %s failed: %s",
+            outcome, queue_name_for_credential(cred_id), result["error"],
+        )
+        return "error"
+    return outcome
+
+
+# More than this many addresses behind one MAC is not a repeater; keep the
+# queue target (and the RouterOS command) bounded.
+MAX_QUEUE_TARGET_IPS = 16
+
+
+def _queue_target_ips(value: Union[str, Iterable[str], None]) -> List[str]:
+    """Sorted, de-duplicated host addresses from an IP, a list of IPs, or a
+    RouterOS queue ``target`` ("192.168.88.5/32,192.168.88.6/32")."""
+    if not value:
+        return []
+    items = value.split(",") if isinstance(value, str) else list(value)
+    ips = set()
+    for item in items:
+        ip = str(item or "").strip().split("/")[0].strip()
+        if ip:
+            ips.add(ip)
+
+    def sort_key(ip: str):
+        try:
+            return (0, tuple(int(octet) for octet in ip.split(".")))
+        except ValueError:
+            return (1, ip)
+
+    return sorted(ips, key=sort_key)[:MAX_QUEUE_TARGET_IPS]
+
+
+def host_ips_for_mac(rows: Optional[Iterable[Dict[str, Any]]], mac_address: str) -> List[str]:
+    """Every address the router's host/ARP table shows behind ``mac_address``."""
+    wanted = normalize_mac_address(mac_address)
+    ips = []
+    for row in rows or []:
+        rm = row.get("mac-address", "")
+        if rm and normalize_mac_address(rm) == wanted:
+            ip = row.get("address") or row.get("to-address")
+            if ip:
+                ips.append(ip)
+    return _queue_target_ips(ips)
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +335,7 @@ def _ensure_cred_profile(api: MikroTikAPI, profile_name: str, rate_limit: Option
         "name": profile_name,
         "shared-users": "1",
     }
+    rate_limit = router_rate_limit(rate_limit)
     if rate_limit:
         args["rate-limit"] = rate_limit
     else:
@@ -301,25 +543,17 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
         #    the IP while the device is still a tracked hotspot guest.
         #    The ARP table is checked as a fallback for devices that
         #    connected without triggering a hotspot redirect.
-        client_ip = None
+        #    Every address behind the MAC is collected, not just the first:
+        #    behind a MAC-NAT repeater several devices share the bound MAC.
         hosts_resp = api.send_command("/ip/hotspot/host/print")
-        if hosts_resp.get("success") and hosts_resp.get("data"):
-            for h in hosts_resp["data"]:
-                hm = h.get("mac-address", "")
-                if hm and normalize_mac_address(hm) == mac_address:
-                    client_ip = h.get("address") or h.get("to-address")
-                    if client_ip:
-                        break
+        client_ips = host_ips_for_mac(
+            hosts_resp.get("data") if hosts_resp.get("success") else None, mac_address)
 
-        if not client_ip:
+        if not client_ips:
             arp_resp = api.send_command("/ip/arp/print")
-            if arp_resp.get("success") and arp_resp.get("data"):
-                for entry in arp_resp["data"]:
-                    am = entry.get("mac-address", "")
-                    if am and normalize_mac_address(am) == mac_address:
-                        client_ip = entry.get("address")
-                        if client_ip:
-                            break
+            client_ips = host_ips_for_mac(
+                arp_resp.get("data") if arp_resp.get("success") else None, mac_address)
+        client_ip = client_ips[0] if client_ips else None
 
         if old_binding_id:
             time.sleep(CMD_DELAY)
@@ -350,33 +584,29 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
         # 4. Per-credential simple queue (only if a rate-limit is set AND we
         #    found a client IP; without an IP there's nothing to attach the
         #    queue to, and MikroTik would reject the call).
+        #    If the IP is unknown here, the access-credential reaper creates
+        #    the queue on its next pass (see ensure_credential_queue_sync).
+        queue_outcome = None
         if rate_limit and client_ip:
             queue_name = queue_name_for_credential(cred_id)
             queues_resp = api.send_command("/queue/simple/print")
-            existing_qid = None
+            existing_queue = None
             if queues_resp.get("success") and queues_resp.get("data"):
                 for q in queues_resp["data"]:
                     if q.get("name", "") == queue_name:
-                        existing_qid = q.get(".id")
+                        existing_queue = q
                         break
-
-            target = f"{client_ip}/32"
-            if existing_qid:
+            if queues_resp.get("success"):
                 time.sleep(CMD_DELAY)
-                api.send_command("/queue/simple/set", {
-                    "numbers": existing_qid,
-                    "target": target,
-                    "max-limit": rate_limit,
-                    "comment": comment,
-                })
-            else:
-                time.sleep(CMD_DELAY)
-                api.send_command("/queue/simple/add", {
-                    "name": queue_name,
-                    "target": target,
-                    "max-limit": rate_limit,
-                    "comment": comment,
-                })
+                queue_outcome = ensure_credential_queue_sync(
+                    api, cred_id=cred_id, username=username, rate_limit=rate_limit,
+                    client_ip=client_ips, existing_queue=existing_queue,
+                )
+        elif rate_limit:
+            logger.warning(
+                "[ACCESS-CRED BIND] no client IP for mac=%s cred=%s; queue left to the reaper",
+                mac_address, cred_id,
+            )
 
         # NOTE: the "kick" step (removing /ip/hotspot/active + /ip/hotspot/host
         # entries to force MikroTik to re-evaluate against the bypass binding)
@@ -389,10 +619,10 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
         # *after* the response has been delivered.
         elapsed_ms = int((time.monotonic() - bind_started) * 1000)
         logger.info(
-            "[ACCESS-CRED BIND] ok router=%s mac=%s client_ip=%s elapsed_ms=%d",
-            router_info.get("ip"), mac_address, client_ip, elapsed_ms,
+            "[ACCESS-CRED BIND] ok router=%s mac=%s client_ip=%s queue=%s elapsed_ms=%d",
+            router_info.get("ip"), mac_address, client_ip, queue_outcome, elapsed_ms,
         )
-        return {"success": True, "client_ip": client_ip}
+        return {"success": True, "client_ip": client_ip, "queue": queue_outcome}
     finally:
         api.disconnect()
 
@@ -596,7 +826,8 @@ async def _provision_radius(db: AsyncSession, cred: AccessCredential) -> dict:
             "INSERT INTO radius_reply (username, attribute, op, value, expiry, customer_id) "
             "VALUES (:u, :attr, :op, :val, NULL, NULL)"
         ), {
-            "u": username, "attr": "Mikrotik-Rate-Limit", "op": ":=", "val": cred.rate_limit,
+            "u": username, "attr": "Mikrotik-Rate-Limit", "op": ":=",
+            "val": router_rate_limit(cred.rate_limit),
         })
 
     await db.commit()

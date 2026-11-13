@@ -516,6 +516,30 @@ def test_ports_card_is_served_from_the_push_with_the_live_read_shape(monkeypatch
     assert ro._port_analytics_from_push({"id": 55, "name": "R", "identity": "", "ip": ""}, {}, {}) is None
 
 
+def test_usage_only_reports_preserve_topology_and_its_observation_time():
+    now = datetime.utcnow()
+    common = dict(router_id=55, interval_seconds=60, hosts=[], queues=[], live_customers={})
+    first = realtime_state.record_push(
+        **common, now=now,
+        bridge_hosts=[{"mac": MAC, "port": "ether2"}],
+        bindings=[{"mac": MAC, "type": "bypassed", "disabled": False}],
+        leases=[{"mac": MAC, "ip": "192.168.88.2"}],
+        neighbors=[{"mac": MAC, "interface": "ether2"}],
+        bridge_ports=[{"interface": "ether2", "bridge": "bridge"}],
+    )
+    second = realtime_state.record_push(**common, now=now + timedelta(minutes=1))
+    for field in ("bridge_hosts", "bindings", "leases", "neighbors", "bridge_ports",
+                  "bridge_hosts_at", "bindings_at"):
+        assert getattr(second, field) == getattr(first, field)
+    cleared = realtime_state.record_push(
+        **common, now=now + timedelta(minutes=2), bridge_hosts=[], bindings=[],
+        leases=[], neighbors=[], bridge_ports=[],
+    )
+    assert cleared.bridge_hosts == {} and cleared.bindings == [] and cleared.leases == []
+    assert cleared.neighbors == [] and cleared.bridge_ports == []
+    assert cleared.bridge_hosts_at == now + timedelta(minutes=2)
+
+
 def test_every_numeric_port_counter_is_guarded_against_an_empty_value():
     # RB4011 on ROS 7 returns no value for rx-error/tx-error; unguarded, the
     # report carried "rx_errors":, and was rejected (Wangige/OPIC, 2026-09-26).

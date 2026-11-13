@@ -35,6 +35,7 @@ there are no VPN pins to add there.
 
 import ipaddress
 import logging
+import math
 import re
 import time
 from datetime import datetime, timedelta
@@ -60,6 +61,24 @@ LB_BYPASS_BASE = ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "100.64.0.0/1
 LB_SRC_LIST = "LB_SRC"
 LB_BYPASS_LIST = "LB_BYPASS_DST"
 LB_PAID_LIST = "LB_PAID"
+# Entries apply adds carry these comments; rollback removes only those (plus
+# untagged built-ins left by older versions) and keeps hand-added entries.
+LB_SRC_COMMENT = "ISP_BILLING_LB_SRC"
+LB_BYPASS_COMMENT = "ISP_BILLING_LB_BYPASS"
+
+# A LAN subnet the router itself serves is derived from /ip address on every
+# interface that is not a WAN, a DHCP client, or a tunnel. Router 606's
+# customers sit on 172.172.10.0/24 (outside every built-in), so its LB_SRC had
+# to be patched by hand and a disable silently lost it (2026-11-12).
+_TUNNEL_IFACE_RE = re.compile(
+    r"^(<|wg|wireguard|sstp|l2tp|pptp|ovpn|pppoe-out|lte|gre|ipip|eoip|6to4)", re.I)
+_TUNNEL_IFACE_TYPES = {
+    "wg", "wireguard", "sstp-out", "l2tp-out", "pptp-out", "ovpn-out", "pppoe-out",
+    "lte", "gre", "ipip", "eoip", "6to4", "sstp-in", "l2tp-in", "pptp-in",
+    "ovpn-in", "pppoe-in",
+}
+LB_DERIVED_MIN_PREFIX = 16
+LB_DERIVED_MAX_PREFIX = 30
 
 LB_PAID_MAX_TIMEOUT_SECONDS = 21_000_000
 LB_PAID_MIN_TIMEOUT_SECONDS = 60
@@ -116,6 +135,77 @@ def _checked_comment(index: int) -> str:
 
 def _wan_dhcp_comment(index: int) -> str:
     return f"ISP_BILLING_WAN{index + 1}"
+
+
+_MARK_COMMENT_RE = re.compile(r"ISP_BILLING_PCC_MARK_WAN(\d+)")
+_ROUTE_COMMENT_RE = re.compile(r"ISP_BILLING_PCC_ROUTE_WAN(\d+)")
+
+
+def _is_body_rule(comment: Optional[str]) -> bool:
+    """A managed PCC MARK or ROUTE mangle rule."""
+    c = comment or ""
+    return bool(_MARK_COMMENT_RE.fullmatch(c) or _ROUTE_COMMENT_RE.fullmatch(c))
+
+
+def _is_managed_mangle(comment: Optional[str]) -> bool:
+    return (comment or "") in (GUARD_COMMENT, BYPASS_COMMENT) or _is_body_rule(comment)
+
+
+def _norm(value: Any) -> str:
+    """RouterOS prints booleans as true/false; we write yes/no."""
+    s = str(value if value is not None else "").strip().lower()
+    return {"yes": "true", "no": "false"}.get(s, s)
+
+
+def _row_matches(row: dict, args: Dict[str, str]) -> bool:
+    if row.get("disabled") == "true":
+        return False
+    return all(_norm(row.get(k)) == _norm(v) for k, v in args.items())
+
+
+def lb_lan_subnets(api, wan_ports: List[str]) -> List[dict]:
+    """LAN/hotspot/PPPoE subnets this router serves, read from the router itself.
+
+    Sources: static /ip address rows on non-WAN, non-tunnel interfaces, plus the
+    DHCP server networks. Skips DHCP-client interfaces (uplinks), dynamic rows
+    (leases, PPP sessions), and anything outside /16../30 (a /32 tunnel address
+    or a whole /8 is never a customer LAN). Returns [{"network", "source"}].
+    """
+    dhcp_ifaces = {d.get("interface") for d in _rd(api, "/ip/dhcp-client/print")}
+    types = {i.get("name"): (i.get("type") or "")
+             for i in _rd(api, "/interface/print", ["name", "type"])}
+    out: List[dict] = []
+    seen: set = set()
+
+    def _take(raw: str, source: str, host_form: bool) -> None:
+        try:
+            net = (ipaddress.ip_interface(raw).network if host_form
+                   else ipaddress.ip_network(raw, strict=False))
+        except ValueError:
+            return
+        if net.version != 4:
+            return
+        if not (LB_DERIVED_MIN_PREFIX <= net.prefixlen <= LB_DERIVED_MAX_PREFIX):
+            return
+        key = str(net)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({"network": key, "source": source})
+
+    for a in _rd(api, "/ip/address/print",
+                 ["address", "interface", "disabled", "dynamic", "invalid"]):
+        iface = a.get("interface") or ""
+        if (not iface or iface in wan_ports or iface in dhcp_ifaces
+                or a.get("disabled") == "true" or a.get("dynamic") == "true"
+                or a.get("invalid") == "true"
+                or _TUNNEL_IFACE_RE.match(iface)
+                or types.get(iface, "").lower() in _TUNNEL_IFACE_TYPES):
+            continue
+        _take(a.get("address") or "", iface, host_form=True)
+    for n in _rd(api, "/ip/dhcp-server/network/print", ["address"]):
+        _take(n.get("address") or "", "dhcp-server", host_form=False)
+    return out
 
 
 def lb_paid_timeout_seconds(expiry: Any, now: Optional[datetime] = None) -> Optional[int]:
@@ -573,6 +663,305 @@ def _route_proplist(major: Optional[int]) -> List[str]:
     return base + ["immediate-gw", "routing-table"]
 
 
+_V7_TABLE_ROUTE_RE = re.compile(r"ISP_BILLING_PCC_WAN(\d+)(_FALLBACK\d*)?")
+_V7_CHECKED_RE = re.compile(r"ISP_BILLING_DUAL_WAN_(PRIMARY|BACKUP|WAN\d+)_CHECKED")
+_V7_PROBE_RE = re.compile(r"ISP_BILLING_DUAL_WAN_(.+)_PROBE")
+_V7_ROUTE_COMPARE = ("dst-address", "gateway", "routing-table", "distance", "scope",
+                     "target-scope", "check-gateway")
+
+
+def _checked_index(comment: str) -> Optional[int]:
+    m = _V7_CHECKED_RE.fullmatch(comment or "")
+    if not m:
+        return None
+    tag = m.group(1)
+    if tag == "PRIMARY":
+        return 0
+    if tag == "BACKUP":
+        return 1
+    return int(tag[3:]) - 1
+
+
+def _v7_route_stale(comment: str, row: dict, wan_ports: List[str],
+                    probes: List[str], planned: set) -> bool:
+    """Is a managed v7 route that the current plan does NOT contain left over
+    from a different WAN set? Only provably-stale shapes are removed: a dormant
+    WAN's probe/checked routes (added later by convert) survive as long as they
+    still describe that WAN's slot. VPN pins are never removed here (a failed
+    WireGuard read must not strip the management path)."""
+    if comment in planned:
+        return False
+    n = len(wan_ports)
+    m = _V7_TABLE_ROUTE_RE.fullmatch(comment)
+    if m:
+        return True  # every table route for the current set is in the plan
+    idx = _checked_index(comment)
+    if idx is not None:
+        return idx >= n or (row.get("gateway") or "") != probes[idx]
+    m = _V7_PROBE_RE.fullmatch(comment)
+    if m:
+        ports = {p.upper(): i for i, p in enumerate(wan_ports)}
+        i = ports.get(m.group(1))
+        if i is None:
+            return True
+        return (row.get("dst-address") or "") != probes[i] + "/32"
+    return False
+
+
+def _v7_reconcile_routes(api, report: dict, wan_ports: List[str],
+                         plan: List[tuple]) -> List[dict]:
+    """Make the managed v7 routes match *plan* ([(args, comment)]).
+
+    Matching routes are left alone (an unchanged re-apply writes nothing).
+    A route whose args changed — e.g. to_wan2's fallback moves from WAN1 to WAN3
+    when a third line is added — is replaced make-before-break: the new route
+    goes in first, then the old one is removed, so the table is never empty.
+
+    Returns the routes left over from a different WAN set WITHOUT removing
+    them: the caller removes those only after the mangle block has moved off
+    them (a live ROUTE rule must never point at a table we just emptied).
+    """
+    probes = list(PROBE_IPS[:len(wan_ports)])
+    existing = [r for r in _rd(api, "/ip/route/print", [".id", "comment"] + list(_V7_ROUTE_COMPARE))
+                if (r.get("comment") or "").startswith(COMMENT_PREFIX)]
+    by_comment: Dict[str, List[dict]] = {}
+    for r in existing:
+        by_comment.setdefault(r["comment"], []).append(r)
+    planned = {c for _, c in plan}
+    retire: List[dict] = []
+    for args, comment in plan:
+        rows = by_comment.get(comment, [])
+        good = [r for r in rows if _row_matches(r, args)]
+        if good:
+            retire.extend(r for r in rows if r is not good[0])  # stray duplicates
+            continue
+        _wr(api, report, f"route.add.{comment}", "/ip/route/add", {**args, "comment": comment})
+        retire.extend(rows)
+    for r in retire:
+        _wr(api, report, f"route.remove.{r['comment']}", "/ip/route/remove", {".id": r[".id"]})
+    return [r for r in existing
+            if _v7_route_stale(r["comment"], r, wan_ports, probes, planned)]
+
+
+def _mangle_plan(lan_bridge: str, n: int) -> List[tuple]:
+    """[(comment, args)] in the ONLY safe order: GUARD -> BYPASS -> MARK x N -> ROUTE x N."""
+    plan: List[tuple] = [
+        (GUARD_COMMENT,
+         {"chain": "prerouting", "action": "accept",
+          "in-interface": lan_bridge, "hotspot": "!auth",
+          "src-address-list": "!" + LB_PAID_LIST}),
+        (BYPASS_COMMENT,
+         {"chain": "prerouting", "action": "accept",
+          "src-address-list": LB_SRC_LIST, "dst-address-list": LB_BYPASS_LIST}),
+    ]
+    for i in range(n):
+        plan.append((
+            _mark_comment(i),
+            {"chain": "prerouting", "action": "mark-connection",
+             "new-connection-mark": f"WAN{i + 1}_conn", "passthrough": "yes",
+             "src-address-list": LB_SRC_LIST, "connection-mark": "no-mark",
+             "connection-state": "new", "dst-address-type": "!local",
+             "per-connection-classifier": f"both-addresses:{n}/{i}"},
+        ))
+    for i in range(n):
+        plan.append((
+            _route_comment(i),
+            {"chain": "prerouting", "action": "mark-routing",
+             "new-routing-mark": _table_name(i), "passthrough": "no",
+             "src-address-list": LB_SRC_LIST, "connection-mark": f"WAN{i + 1}_conn",
+             "dst-address-type": "!local"},
+        ))
+    return plan
+
+
+def _body_index(row: dict) -> tuple:
+    c = row.get("comment") or ""
+    m = _MARK_COMMENT_RE.fullmatch(c)
+    if m:
+        return (0, int(m.group(1)))
+    m = _ROUTE_COMMENT_RE.fullmatch(c)
+    return (1, int(m.group(1)) if m else 0)
+
+
+def _retire_body_rules(api, report: dict, rows: List[dict], tag: str) -> bool:
+    """Disable MARK rules, then ROUTE rules, then remove them in that order
+    (rollback's safe order). True when every write succeeded."""
+    ok = True
+    ordered = sorted(rows, key=_body_index)
+    for row in ordered:
+        if row.get("disabled") != "true":
+            ok &= _wr(api, report, f"mangle.{tag}.disable.{row.get('comment')}",
+                      "/ip/firewall/mangle/set", {".id": row[".id"], "disabled": "yes"})
+    for row in ordered:
+        ok &= _wr(api, report, f"mangle.{tag}.remove.{row.get('comment')}",
+                  "/ip/firewall/mangle/remove", {".id": row[".id"]})
+    return ok
+
+
+def _add_mangle(api, report: dict, comment: str, args: dict,
+                before: Optional[str] = None) -> bool:
+    args = {**args, "comment": comment}
+    if before:
+        args["place-before"] = before
+    return _wr(api, report, f"mangle.add.{comment}", "/ip/firewall/mangle/add", args)
+
+
+def _reconcile_mangle(api, report: dict, plan: List[tuple]) -> str:
+    """Bring the managed mangle block to *plan*. Returns the mode taken:
+
+    * ``installed``  — nothing managed existed; the block is appended.
+    * ``unchanged``  — the block already matches, in order: no writes at all.
+    * ``rebuilt``    — the WAN set (or a rule) changed. When the guard and
+      bypass are intact and lead the block, the new MARK/ROUTE rules are
+      inserted directly in front of the old ones and only then are the old
+      ones retired — new connections are balanced over the new set the moment
+      the new rules land, and the guard stays in front throughout. Otherwise
+      the old block is torn down (marks first, guard last) and re-added.
+
+    Sets ``report["aborted"]`` when the guard cannot be written (marks without
+    the guard is the portal-killer state; none are added then).
+    """
+    rows = _rd(api, "/ip/firewall/mangle/print")
+    managed = [r for r in rows if _is_managed_mangle(r.get("comment"))]
+    want = [c for c, _ in plan]
+
+    def _append_all() -> None:
+        for comment, args in plan:
+            ok = _add_mangle(api, report, comment, args)
+            if comment == GUARD_COMMENT and not ok:
+                report["aborted"] = "unauth guard rule could not be added — no mark rules added"
+                return
+
+    if not managed:
+        _append_all()
+        return "installed"
+    if ([r.get("comment") for r in managed] == want
+            and all(_row_matches(r, args) for r, (_, args) in zip(managed, plan))):
+        return "unchanged"
+
+    pos = {id(r): i for i, r in enumerate(rows)}
+    guards = [r for r in managed if r.get("comment") == GUARD_COMMENT]
+    bypasses = [r for r in managed if r.get("comment") == BYPASS_COMMENT]
+    old_body = [r for r in managed if _is_body_rule(r.get("comment"))]
+    head_ok = (
+        len(guards) == 1 and len(bypasses) == 1
+        and _row_matches(guards[0], plan[0][1]) and _row_matches(bypasses[0], plan[1][1])
+        and pos[id(guards[0])] < pos[id(bypasses[0])]
+        and all(pos[id(bypasses[0])] < pos[id(r)] for r in old_body)
+    )
+    report["mangle_previous"] = [r.get("comment") for r in managed]
+
+    if head_ok:
+        if old_body:
+            anchor = old_body[0].get(".id")
+        else:
+            after = [r for r in rows[pos[id(bypasses[0])] + 1:] if r.get("dynamic") != "true"]
+            anchor = after[0].get(".id") if after else None
+        old_ids = {r.get(".id") for r in old_body}
+        for comment, args in plan[2:]:
+            if not _add_mangle(api, report, comment, args, before=anchor):
+                # Never leave a half-built block in front of the old one:
+                # take back what we added; the old rules keep working.
+                added = [r for r in _rd(api, "/ip/firewall/mangle/print")
+                         if _is_body_rule(r.get("comment")) and r.get(".id") not in old_ids]
+                _retire_body_rules(api, report, added, "undo")
+                report["aborted"] = (f"could not add {comment}; the previous "
+                                     "load-balancing rules were left in place")
+                return "failed"
+        _retire_body_rules(api, report, old_body, "retire")
+        return "rebuilt"
+
+    # Guard/bypass missing, wrong or out of order: break-before-make.
+    if not _retire_body_rules(api, report, old_body, "retire"):
+        report["aborted"] = "could not remove the previous mark/route rules"
+        return "failed"
+    for r in guards + bypasses:
+        _wr(api, report, f"mangle.retire.remove.{r.get('comment')}",
+            "/ip/firewall/mangle/remove", {".id": r[".id"]})
+    _append_all()
+    return "rebuilt"
+
+
+def lb_pcc_order_check(mangle_rows: List[dict], n: Optional[int] = None) -> dict:
+    """Walk the prerouting mangle rules the way RouterOS does for the first
+    packet of a new connection, once per PCC hash bucket, and report which WANs
+    can actually receive connections.
+
+    Catches the router-606 state (2026-11-12): MARK 2/0 and 2/1 claim every
+    connection, so a MARK 3/2 rule further down never sees an unmarked one and
+    WAN3 gets nothing. Also catches a WAN whose first packet is marked but not
+    routed (its mark-routing rule is missing or sits before the mark rule), so
+    the connection is NATed out WAN1 and then breaks.
+
+    *n* is the number of configured WANs; inferred from the rules when None.
+    """
+    rules = []
+    denoms: List[int] = []
+    seen_wans: set = set()
+    for r in mangle_rows:
+        if (r.get("chain") != "prerouting" or r.get("disabled") == "true"
+                or r.get("dynamic") == "true"):
+            continue
+        action = r.get("action")
+        passthrough = _norm(r.get("passthrough") or "yes") == "true"
+        if action == "mark-connection":
+            ncm = r.get("new-connection-mark") or ""
+            m = re.fullmatch(r"WAN(\d+)_conn", ncm)
+            if not m:
+                continue
+            seen_wans.add(int(m.group(1)))
+            pm = re.search(r":(\d+)/(\d+)$", r.get("per-connection-classifier") or "")
+            pcc = (int(pm.group(1)), int(pm.group(2))) if pm else None
+            if pcc and pcc[0] > 0:
+                denoms.append(pcc[0])
+            rules.append(("mark", r.get("connection-mark") or "", ncm, pcc, passthrough))
+        elif action == "mark-routing":
+            cm = r.get("connection-mark") or ""
+            if not re.fullmatch(r"WAN\d+_conn", cm):
+                continue
+            rules.append(("route", cm, r.get("new-routing-mark") or "", None, passthrough))
+    if n is None:
+        n = max(seen_wans) if seen_wans else 0
+    out: dict = {"wans": n, "ok": True, "unreachable": [], "unrouted": [],
+                 "share": {}, "unbalanced_share": 0.0}
+    if n <= 0:
+        return out
+    space = math.lcm(*denoms) if denoms else 1
+    hits: Dict[str, int] = {}
+    unbalanced = 0
+    unrouted: set = set()
+    for h in range(space):
+        conn, rmark = "no-mark", None
+        for kind, need, value, pcc, passthrough in rules:
+            if kind == "mark":
+                if need and need != conn:
+                    continue
+                if pcc and h % pcc[0] != pcc[1]:
+                    continue
+                conn = value
+            else:
+                if need != conn:
+                    continue
+                rmark = value
+            if not passthrough:
+                break
+        if conn == "no-mark":
+            unbalanced += 1
+        elif not rmark:
+            unrouted.add(conn)
+        else:
+            hits[conn] = hits.get(conn, 0) + 1
+    for k in range(1, n + 1):
+        mark = f"WAN{k}_conn"
+        out["share"][f"WAN{k}"] = round(hits.get(mark, 0) / space, 3)
+        if not hits.get(mark):
+            out["unreachable"].append(f"WAN{k}")
+    out["unrouted"] = sorted(c.replace("_conn", "") for c in unrouted)
+    out["unbalanced_share"] = round(unbalanced / space, 3)
+    out["ok"] = not out["unreachable"] and not out["unrouted"]
+    return out
+
+
 # --- apply -------------------------------------------------------------------
 
 def lb_apply(api, wan_ports: List[str]) -> dict:
@@ -623,10 +1012,9 @@ def lb_apply(api, wan_ports: List[str]) -> dict:
                 _wr(api, report, f"routing_table.add.{name}", "/routing/table/add",
                     {"name": name, "fib": ""})
 
-    # 2. routes (idempotent by comment). v6 reconciles its own route set (see
-    #    _v6_reconcile_routes) after the VPN-pin step, which is v7-only.
-    have = {r.get("comment") for r in _rd(api, "/ip/route/print", ["comment"])
-            if r.get("comment")}
+    # 2. routes, reconciled against the plan for THIS WAN set (a changed set —
+    #    2 -> 3 lines — moves every table's fallbacks). v6 reconciles its own
+    #    route set (see _v6_reconcile_routes) after the VPN-pin step (v7-only).
     route_plan: List[tuple] = []
     if major == 7:
         route_plan.extend(_v7_wan_routes(wan_ports, gateways, probes))
@@ -665,26 +1053,37 @@ def lb_apply(api, wan_ports: List[str]) -> dict:
             "ISP_BILLING_VPN_PIN_" + tag + "_FALLBACK",
         ))
 
-    for args, comment in route_plan:
-        if comment in have:
-            continue
-        args = dict(args)
-        args["comment"] = comment
-        _wr(api, report, f"route.add.{comment}", "/ip/route/add", args)
+    stale_routes: List[dict] = []
+    if major == 7:
+        stale_routes = _v7_reconcile_routes(api, report, wan_ports, route_plan)
     if major == 6:
         _v6_reconcile_routes(api, report, wan_ports)
 
-    # 4. address lists (LB_SRC + LB_BYPASS_DST incl. backends + live wg endpoints)
+    # 4. address lists: LB_SRC = built-ins + the subnets this router serves
+    #    (so a LAN like 172.172.10.0/24 balances without hand edits);
+    #    LB_BYPASS_DST = private ranges, backends, live wg endpoints and those
+    #    same LAN subnets (LAN-to-LAN traffic is never balanced). Only adds:
+    #    entries already there, hand-added ones included, are kept.
+    lan_nets = lb_lan_subnets(api, wan_ports)
+    report["lan_subnets"] = lan_nets
     al = _rd(api, "/ip/firewall/address-list/print", ["list", "address"])
     have_al = {(a.get("list"), a.get("address")) for a in al}
-    for addr in LB_SRC_NETWORKS:
-        if (LB_SRC_LIST, addr) not in have_al:
-            _wr(api, report, f"address_list.add.{LB_SRC_LIST}.{addr}",
-                "/ip/firewall/address-list/add", {"list": LB_SRC_LIST, "address": addr})
-    for addr in LB_BYPASS_BASE + BACKEND_IPS + sorted(seen_eps):
-        if (LB_BYPASS_LIST, addr) not in have_al:
-            _wr(api, report, f"address_list.add.{LB_BYPASS_LIST}.{addr}",
-                "/ip/firewall/address-list/add", {"list": LB_BYPASS_LIST, "address": addr})
+    bypass_base = [ipaddress.ip_network(b) for b in LB_BYPASS_BASE]
+    src_want = [(a, LB_SRC_COMMENT) for a in LB_SRC_NETWORKS] + [
+        (x["network"], f"{LB_SRC_COMMENT} {x['source']}") for x in lan_nets
+        if x["network"] not in LB_SRC_NETWORKS]
+    bypass_want = [(a, LB_BYPASS_COMMENT)
+                   for a in LB_BYPASS_BASE + BACKEND_IPS + sorted(seen_eps)] + [
+        (x["network"], f"{LB_BYPASS_COMMENT} {x['source']}") for x in lan_nets
+        if not any(ipaddress.ip_network(x["network"]).subnet_of(b) for b in bypass_base)]
+    for lst, wanted in ((LB_SRC_LIST, src_want), (LB_BYPASS_LIST, bypass_want)):
+        for addr, comment in wanted:
+            if (lst, addr) in have_al:
+                continue
+            have_al.add((lst, addr))
+            _wr(api, report, f"address_list.add.{lst}.{addr}",
+                "/ip/firewall/address-list/add",
+                {"list": lst, "address": addr, "comment": comment})
 
     # 5. fasttrack restricted to connection-mark=no-mark (record prior state)
     ft = _rd(api, "/ip/firewall/filter/print", [".id", "connection-mark"],
@@ -696,43 +1095,23 @@ def lb_apply(api, wan_ports: List[str]) -> dict:
                 {".id": rule[".id"], "connection-mark": "no-mark"})
 
     # 6. mangle: GUARD -> BYPASS -> MARK x N -> ROUTE x N. DO NOT reorder.
-    have_m = {m.get("comment") for m in _rd(api, "/ip/firewall/mangle/print", ["comment"])}
-    mangle_plan: List[tuple] = [
-        (GUARD_COMMENT,
-         {"chain": "prerouting", "action": "accept",
-          "in-interface": lan_bridge, "hotspot": "!auth",
-          "src-address-list": "!" + LB_PAID_LIST}),
-        (BYPASS_COMMENT,
-         {"chain": "prerouting", "action": "accept",
-          "src-address-list": LB_SRC_LIST, "dst-address-list": LB_BYPASS_LIST}),
-    ]
-    for i in range(n):
-        mangle_plan.append((
-            _mark_comment(i),
-            {"chain": "prerouting", "action": "mark-connection",
-             "new-connection-mark": f"WAN{i + 1}_conn", "passthrough": "yes",
-             "src-address-list": LB_SRC_LIST, "connection-mark": "no-mark",
-             "connection-state": "new", "dst-address-type": "!local",
-             "per-connection-classifier": f"both-addresses:{n}/{i}"},
-        ))
-    for i in range(n):
-        mangle_plan.append((
-            _route_comment(i),
-            {"chain": "prerouting", "action": "mark-routing",
-             "new-routing-mark": _table_name(i), "passthrough": "no",
-             "src-address-list": LB_SRC_LIST, "connection-mark": f"WAN{i + 1}_conn",
-             "dst-address-type": "!local"},
-        ))
-    for comment, args in mangle_plan:
-        if comment in have_m:
-            continue
-        args = dict(args)
-        args["comment"] = comment
-        ok = _wr(api, report, f"mangle.add.{comment}", "/ip/firewall/mangle/add", args)
-        if comment == GUARD_COMMENT and not ok:
-            # MARK/ROUTE rules without the guard is the portal-killer state.
-            report["aborted"] = "unauth guard rule could not be added — no mark rules added"
-            return report
+    #    Reconciled, not skip-if-present: re-applying with a different WAN
+    #    count must rebuild the PCC split (router 606 kept 2/0 + 2/1 and got a
+    #    3/2 rule appended after the ROUTE rules, so WAN3 never got traffic).
+    report["mangle_mode"] = _reconcile_mangle(api, report, _mangle_plan(lan_bridge, n))
+    if report.get("aborted"):
+        return report
+
+    # 7. now that no rule routes into them, drop routes/tables of WANs that
+    #    are no longer in the set (v7; v6 reconciled them in step 2).
+    for r in stale_routes:
+        _wr(api, report, f"route.remove.{r['comment']}", "/ip/route/remove", {".id": r[".id"]})
+    if major == 7:
+        for t in _rd(api, "/routing/table/print", [".id", "name"]):
+            m = re.fullmatch(r"to_wan(\d+)", t.get("name") or "")
+            if m and int(m.group(1)) > n:
+                _wr(api, report, f"routing_table.remove.{t.get('name')}",
+                    "/routing/table/remove", {".id": t[".id"]})
 
     if LB_APPLY_SETTLE_SECONDS:
         time.sleep(LB_APPLY_SETTLE_SECONDS)
@@ -1056,8 +1435,13 @@ def lb_internet_ok(api, targets=("8.8.8.8", "1.1.1.1")) -> bool:
 
 # --- verify ------------------------------------------------------------------
 
-def lb_verify(api) -> dict:
-    """Counters, live conntrack flow attribution, LB_PAID safety cross-check."""
+def lb_verify(api, wan_ports: Optional[List[str]] = None) -> dict:
+    """Counters, live conntrack flow attribution, LB_PAID safety cross-check,
+    and a rule-order check that every configured WAN can receive connections.
+
+    *wan_ports* is the configured WAN set (WAN1 first); when omitted the WAN
+    count is inferred from the mark rules on the router.
+    """
     report: dict = {"steps": [], "success": True, "warnings": []}
 
     dhcp = _rd(api, "/ip/dhcp-client/print")
@@ -1090,7 +1474,8 @@ def lb_verify(api) -> dict:
         if m and iface:
             index_iface.setdefault(int(m.group(1)) - 1, iface)
 
-    mangle = _rd(api, "/ip/firewall/mangle/print", ["comment", "packets", "disabled"])
+    # Full print, in rule order: the order check needs every matcher.
+    mangle = _rd(api, "/ip/firewall/mangle/print")
     counters = {x.get("comment"): {"packets": x.get("packets"), "disabled": x.get("disabled")}
                 for x in mangle if (x.get("comment") or "").startswith(COMMENT_PREFIX)}
     report["counters"] = counters
@@ -1105,6 +1490,27 @@ def lb_verify(api) -> dict:
             "portal-killer state; re-enable the guard NOW"
         )
         report["success"] = False
+
+    order = lb_pcc_order_check(mangle, len(wan_ports) if wan_ports else None)
+    report["pcc_order"] = order
+    _step(report, "check.pcc_order", order["ok"], order)
+    if order["unreachable"]:
+        report["warnings"].append(
+            f"PCC rule order: {', '.join(order['unreachable'])} never receive(s) new "
+            "connections — the mark rules ahead of them already claim every "
+            "connection. Re-apply load balancing to rebuild the split."
+        )
+    if order["unrouted"]:
+        report["warnings"].append(
+            f"PCC rule order: connections marked for {', '.join(order['unrouted'])} "
+            "are not routed on their first packet (mark-routing rule missing or "
+            "ahead of the mark rule) — those connections break. Re-apply."
+        )
+    if order["wans"] and order["unbalanced_share"] and order["ok"]:
+        report["warnings"].append(
+            f"{round(order['unbalanced_share'] * 100)}% of new connections match no "
+            "PCC mark rule and stay on the main route"
+        )
 
     conns = _rd(api, "/ip/firewall/connection/print")
     attribution: Dict[str, dict] = {}
@@ -1171,6 +1577,7 @@ def lb_rollback(api) -> dict:
          the guard is only removed after the marks are gone)
       4. restore fasttrack connection-mark=""
       5. remove ISP_BILLING routes, LB address lists, to_wanX routing tables
+         (hand-added LB_SRC / LB_BYPASS_DST entries are kept)
 
     Leaves the router on plain WAN1 (its original dynamic DHCP default route).
     Secondary-WAN DHCP clients and interface-list memberships are left in place;
@@ -1179,22 +1586,25 @@ def lb_rollback(api) -> dict:
     report: dict = {"steps": [], "success": True}
 
     mangle = _rd(api, "/ip/firewall/mangle/print", [".id", "comment", "disabled"])
-    by_comment = {x.get("comment"): x for x in mangle if x.get("comment")}
 
-    def _indexed(pattern: str) -> List[str]:
+    # Every row, not one per comment: an interrupted rebuild can leave two
+    # rules with the same comment, and both must go.
+    def _indexed(pattern) -> List[dict]:
         found = []
-        for comment in by_comment:
-            m = re.fullmatch(pattern, comment or "")
+        for pos, row in enumerate(mangle):
+            m = pattern.fullmatch(row.get("comment") or "")
             if m:
-                found.append((int(m.group(1)), comment))
-        return [c for _, c in sorted(found)]
+                found.append((int(m.group(1)), pos, row))
+        return [row for _, _, row in sorted(found, key=lambda t: (t[0], t[1]))]
 
-    mark_comments = _indexed(r"ISP_BILLING_PCC_MARK_WAN(\d+)")
-    route_comments = _indexed(r"ISP_BILLING_PCC_ROUTE_WAN(\d+)")
+    mark_rows = _indexed(_MARK_COMMENT_RE)
+    route_rows = _indexed(_ROUTE_COMMENT_RE)
+    head_rows = ([r for r in mangle if r.get("comment") == GUARD_COMMENT]
+                 + [r for r in mangle if r.get("comment") == BYPASS_COMMENT])
 
     # 1 + 2: disable marks FIRST, then route rules.
-    for comment in mark_comments + route_comments:
-        row = by_comment[comment]
+    for row in mark_rows + route_rows:
+        comment = row.get("comment")
         if row.get("disabled") == "true":
             _step(report, f"mangle.disable.{comment}", True, "already disabled")
             continue
@@ -1202,11 +1612,8 @@ def lb_rollback(api) -> dict:
             {".id": row[".id"], "disabled": "yes"})
 
     # 3: remove managed mangle rules — marks, routes, then guard/bypass last.
-    for comment in mark_comments + route_comments + [GUARD_COMMENT, BYPASS_COMMENT]:
-        row = by_comment.get(comment)
-        if not row:
-            continue
-        _wr(api, report, f"mangle.remove.{comment}", "/ip/firewall/mangle/remove",
+    for row in mark_rows + route_rows + head_rows:
+        _wr(api, report, f"mangle.remove.{row.get('comment')}", "/ip/firewall/mangle/remove",
             {".id": row[".id"]})
 
     # 4: restore fasttrack.
@@ -1217,13 +1624,28 @@ def lb_rollback(api) -> dict:
             _wr(api, report, "fasttrack.restore", "/ip/firewall/filter/set",
                 {".id": rule[".id"], "connection-mark": ""})
 
-    # 5a: remove LB address-list entries (LB_SRC, LB_BYPASS_DST, LB_PAID).
-    al = _rd(api, "/ip/firewall/address-list/print", [".id", "list", "address"])
+    # 5a: remove LB address-list entries: all of LB_PAID, and the LB_SRC /
+    #     LB_BYPASS_DST entries apply added (comment-tagged, or untagged
+    #     built-ins from before tagging). Hand-added entries — a LAN subnet
+    #     someone patched in — are kept, so a re-enable still balances them.
+    legacy = {LB_SRC_LIST: set(LB_SRC_NETWORKS),
+              LB_BYPASS_LIST: set(LB_BYPASS_BASE + BACKEND_IPS)}
+    al = _rd(api, "/ip/firewall/address-list/print", [".id", "list", "address", "comment"])
+    kept = []
     for entry in al:
-        if entry.get("list") in (LB_SRC_LIST, LB_BYPASS_LIST, LB_PAID_LIST):
-            _wr(api, report,
-                f"address_list.remove.{entry.get('list')}.{entry.get('address')}",
-                "/ip/firewall/address-list/remove", {".id": entry[".id"]})
+        lst = entry.get("list")
+        if lst not in (LB_SRC_LIST, LB_BYPASS_LIST, LB_PAID_LIST):
+            continue
+        comment = entry.get("comment") or ""
+        ours = (lst == LB_PAID_LIST or comment.startswith(COMMENT_PREFIX)
+                or (not comment and entry.get("address") in legacy[lst]))
+        if not ours:
+            kept.append({"list": lst, "address": entry.get("address"), "comment": comment})
+            continue
+        _wr(api, report,
+            f"address_list.remove.{lst}.{entry.get('address')}",
+            "/ip/firewall/address-list/remove", {".id": entry[".id"]})
+    report["address_list_kept"] = kept
 
     # 5b: remove managed routes (probes, checked defaults, to_wan, vpn pins).
     routes = _rd(api, "/ip/route/print", [".id", "comment"])
@@ -1292,6 +1714,94 @@ def lb_seed_paid(api, active_customers: List[dict]) -> dict:
               None if ok else r.get("error"))
         if ok:
             have.add(ip)
+    return report
+
+
+def lb_seed_static_paid(api, active_customers: List[dict]) -> dict:
+    """Restore static subscribers after reboot, using owned bypass bindings.
+
+    Static customers need neither a hotspot MAC nor a currently-online host.
+    Their exact IP/customer binding is the authority; an unbypassed host at that
+    IP blocks seeding. Entries always expire and renewals update their timeout.
+    """
+    from app.services.static_ip import normalize_static_ip
+
+    prefix = "ISP_BILLING_STATIC_PAID:"
+    report = {"steps": [], "success": True, "added": [], "updated": [],
+              "removed": [], "skipped": []}
+    snapshots = []
+    for path, props in [
+        ("/ip/hotspot/ip-binding/print", ["address", "type", "disabled", "comment"]),
+        ("/ip/hotspot/host/print", ["address", "bypassed"]),
+        ("/ip/firewall/address-list/print", [".id", "list", "address", "comment", "timeout"]),
+    ]:
+        result = api.send_command_optimized(path, proplist=props)
+        if not result.get("success"):
+            _step(report, path, False, result.get("error"))
+            return report  # A failed read is not an empty authoritative table.
+        snapshots.append(result.get("data") or [])
+    bindings, hosts, address_lists = snapshots
+    entries = [a for a in address_lists if a.get("list") == LB_PAID_LIST]
+    now = datetime.utcnow()
+    eligible = {}
+    for customer in active_customers:
+        ip = normalize_static_ip(customer.get("static_ip"))
+        cid = customer.get("id")
+        expiry = customer.get("expiry")
+        remaining = int((expiry - now).total_seconds()) if isinstance(expiry, datetime) else 0
+        if not ip or not cid or remaining <= 0:
+            report["skipped"].append({"id": cid, "why": "no usable IP or expiry"})
+            continue
+        secs = min(LB_PAID_MAX_TIMEOUT_SECONDS, remaining)
+        matching = [b for b in bindings if b.get("address") == ip]
+        if (len(matching) != 1 or matching[0].get("type") != "bypassed"
+                or matching[0].get("disabled") == "true"
+                or not matching[0].get("comment", "").startswith("STATIC:")
+                or not matching[0].get("comment", "").endswith(f"(cust {cid})")):
+            report["skipped"].append({"id": cid, "why": "no unique owned enabled bypass binding"})
+            continue
+        if any(h.get("address") == ip and h.get("bypassed") != "true" for h in hosts):
+            report["skipped"].append({"id": cid, "why": "host not bypassed"})
+            continue
+        eligible[ip] = (customer, secs)
+
+    # Only this helper's entries are removed by reconciliation; hotspot entries
+    # remain owned by their existing lifecycle. Disabling/deleting a static
+    # binding also removes its LB entry synchronously in static_ip.py.
+    for entry in entries:
+        if entry.get("comment", "").startswith(prefix) and entry.get("address") not in eligible:
+            result = api.send_command("/ip/firewall/address-list/remove", {".id": entry[".id"]})
+            ok = bool(result.get("success"))
+            _step(report, f"lb_static.remove.{entry.get('address')}", ok, result.get("error"))
+            if ok:
+                report["removed"].append(entry["address"])
+
+    for ip, (customer, secs) in eligible.items():
+        # Router calls can be slow: never extend access by the time spent
+        # processing the preceding customers in this batch.
+        secs = min(LB_PAID_MAX_TIMEOUT_SECONDS,
+                   int((customer["expiry"] - datetime.utcnow()).total_seconds()))
+        if secs <= 0:
+            continue
+        comment = f"{prefix}{customer['id']}:{customer['expiry'].isoformat()}"
+        existing = [e for e in entries if e.get("address") == ip]
+        if existing and all(e.get("comment") == comment and e.get("timeout") for e in existing):
+            continue
+        args = {"timeout": f"{secs}s", "comment": comment}
+        if existing:
+            for entry in existing:
+                result = api.send_command("/ip/firewall/address-list/set", {".id": entry[".id"], **args})
+                ok = bool(result.get("success"))
+                _step(report, f"lb_static.update.{ip}", ok, result.get("error"))
+                if ok:
+                    report["updated"].append(ip)
+        else:
+            result = api.send_command("/ip/firewall/address-list/add",
+                                      {"list": LB_PAID_LIST, "address": ip, **args})
+            ok = bool(result.get("success"))
+            _step(report, f"lb_static.add.{ip}", ok, result.get("error"))
+            if ok:
+                report["added"].append(ip)
     return report
 
 

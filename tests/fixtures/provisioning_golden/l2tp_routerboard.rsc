@@ -17,7 +17,38 @@
     $bwHsProbe
     :log info "Provisioning: hotspot feature available"
 } on-error={
-    :log error "PROVISION ABORTED: the hotspot feature is not available on this router -- on RouterOS v6 this usually means the hotspot package is missing or disabled. Check: /system package print  -- enable the hotspot package, reboot, then re-run this provisioning command."
+    :local bwRemedy "on RouterOS v6 this usually means the hotspot package is missing or disabled. Check: /system package print  -- enable the hotspot package, reboot, then re-run this provisioning command"
+    # smips (hAP lite / hAP mini / cAP lite) on RouterOS 7.20+: hotspot is a
+    # separate extra package, so device-mode cannot fix it. Message only.
+    :do {
+        :local bwArch [/system resource get architecture-name]
+        :local bwVer [/system resource get version]
+        :local bwSp [:find $bwVer " "]
+        :if ([:typeof $bwSp] = "num") do={ :set bwVer [:pick $bwVer 0 $bwSp] }
+        :local bwDot [:find $bwVer "."]
+        :if (($bwArch = "smips") && ([:typeof $bwDot] = "num")) do={
+            :local bwMajor [:tonum [:pick $bwVer 0 $bwDot]]
+            :local bwMinor ""
+            :local bwI ($bwDot + 1)
+            :local bwMore true
+            :while ($bwMore && ($bwI < [:len $bwVer])) do={
+                :local bwCh [:pick $bwVer $bwI]
+                :if ([:typeof [:find "0123456789" $bwCh]] = "num") do={
+                    :set bwMinor ($bwMinor . $bwCh)
+                    :set bwI ($bwI + 1)
+                } else={
+                    :set bwMore false
+                }
+            }
+            :if (([:typeof $bwMajor] = "num") && ([:len $bwMinor] > 0)) do={
+                :if (($bwMajor > 7) || (($bwMajor = 7) && ([:tonum $bwMinor] >= 20))) do={
+                    :set bwRemedy ("this is a smips router (hAP lite / hAP mini / cAP lite) on RouterOS " . $bwVer . ", and since RouterOS 7.20 smips builds do not include hotspot. Fix: downgrade to RouterOS 6.49.x (recommended for these models), or upload hotspot-" . $bwVer . "-smips.npk from the extra-packages zip for " . $bwVer . " (mikrotik.com/download) to Files, reboot, then re-run this provisioning command")
+                }
+            }
+        }
+    } on-error={}
+    :log error ("PROVISION ABORTED: the hotspot feature is not available on this router -- " . $bwRemedy . ".")
+    :put ("PROVISION ABORTED: the hotspot feature is not available on this router -- " . $bwRemedy . ".")
     :error "hotspot feature unavailable -- aborting before any config is applied (see /log print)"
 }
 
@@ -247,10 +278,10 @@
 :do {
     :set hsCount [:len [/ip hotspot find where name=hotspot1]]
 } on-error={
-    :log error "PROVISION WARNING: could not query hotspot -- the hotspot feature may not be available. Ensure device-mode hotspot is enabled: /system/device-mode/update hotspot=yes then press the physical reset button."
+    :log error "PROVISION WARNING: could not query hotspot -- the hotspot feature may not be available. Ensure device-mode allows it: /system/device-mode/update fetch=yes scheduler=yes hotspot=yes then press the physical reset or mode button within 5 minutes."
 }
 :if ($hsCount = 0) do={
-    :log error "PROVISION WARNING: hotspot1 was not found -- hotspot feature may not be enabled. Run: /system/device-mode/update hotspot=yes then press the physical reset button."
+    :log error "PROVISION WARNING: hotspot1 was not found -- hotspot feature may not be enabled. Run: /system/device-mode/update fetch=yes scheduler=yes hotspot=yes then press the physical reset or mode button within 5 minutes."
 } else={
     :log info "Provisioning: hotspot1 confirmed running"
 }
@@ -258,6 +289,12 @@
 :do { /interface bridge port remove [find where interface=ether1] } on-error={}
 
 :log info "Provisioning: Hotspot step complete" 
+
+# ---- STEP 4b: LIFT ANY EXISTING PROXY-RELAY BLOCK UNTIL STEP 9b ----
+# The block also rejects this script's own plain-HTTP fetches (login page,
+# /complete). STEP 9b re-applies it right after the server is notified.
+
+:foreach i in=[/ip firewall filter find comment="ISP_BILLING_PROXY_RELAY_BLOCK"] do={ :do { /ip firewall filter remove $i } on-error={} }
 
 # ---- STEP 5: DOWNLOAD CUSTOM LOGIN PAGE ----
 
@@ -319,15 +356,58 @@
 # ---- STEP 8: CREATE API SERVICE ACCOUNT & SET IDENTITY ----
 
 /system identity set name=Router-0001
-:do { /user add name=bitwave-api password="ApiPassword123" group=full comment="Bitwave backend API account" } on-error={}
+# add-or-set: a router set up before already has bitwave-api with an older
+# password; it must get this setup's password or the server cannot log in.
+:do {
+    :if ([:len [/user find where name=bitwave-api]] = 0) do={
+        /user add name=bitwave-api password="ApiPassword123" group=full comment="Bitwave backend API account"
+        :log info "Provisioning: API user bitwave-api created"
+    } else={
+        /user set [find where name=bitwave-api] password="ApiPassword123" group=full comment="Bitwave backend API account" disabled=no
+        :log info "Provisioning: API user bitwave-api already existed -- password reset for this setup"
+    }
+} on-error={
+    :log error "PROVISION WARNING: could not create or update API user bitwave-api -- the server will not be able to log in"
+}
 
-:log info "Provisioning: Identity set to Router-0001, API user created" 
+:log info "Provisioning: Identity set to Router-0001, API user ready" 
 
 # ---- STEP 9: REMOVE LEGACY OUTBOUND COMMAND AGENT ----
 
 :do { /system scheduler remove [find name="bitwave-command-agent"] } on-error={}
 :do { /system script remove [find name="bitwave-command-agent"] } on-error={}
 
+
+# ---- STEP 8b: ANTI-TETHERING (on by default) ----
+# Blocks customers sharing their plan via phone hotspot or their own router.
+# The reseller can turn it off per router in the dashboard.
+
+:foreach i in=[/ip firewall raw find where comment="ISP_BILLING_ANTI_TETHERING"] do={ :do { /ip firewall raw remove $i } on-error={} }
+:foreach i in=[/ip firewall mangle find where comment="ISP_BILLING_ANTI_TETHERING"] do={ :do { /ip firewall mangle remove $i } on-error={} }
+:foreach i in=[/ip firewall filter find where comment="ISP_BILLING_ANTI_TETHERING"] do={ :do { /ip firewall filter remove $i } on-error={} }
+:do {
+    :local bwAnchor ""
+    :local bwStatic [/ip firewall raw find where chain=prerouting disabled=no dynamic=no]
+    :if ([:len $bwStatic] > 0) do={ :set bwAnchor [:pick $bwStatic 0] }
+    :foreach hs in=[/ip hotspot find where disabled=no] do={
+        :local bwIf [/ip hotspot get $hs interface]
+        :foreach bwTtl in={"equal:63";"equal:127";"equal:254"} do={
+            :local bwPlaced false
+            :if ([:len $bwStatic] > 0) do={
+                :do {
+                    /ip firewall raw add chain=prerouting action=drop in-interface=$bwIf src-address-list=!bitwave-static ttl=$bwTtl comment="ISP_BILLING_ANTI_TETHERING" place-before=$bwAnchor
+                    :set bwPlaced true
+                } on-error={}
+            }
+            :if ($bwPlaced = false) do={
+                /ip firewall raw add chain=prerouting action=drop in-interface=$bwIf src-address-list=!bitwave-static ttl=$bwTtl comment="ISP_BILLING_ANTI_TETHERING"
+            }
+        }
+    }
+    :log info "Provisioning: anti-tethering rules applied"
+} on-error={
+    :log error "Provisioning: could not add ISP_BILLING_ANTI_TETHERING rules"
+}
 
 # ---- STEP 9: NOTIFY SERVER ----
 
@@ -339,8 +419,33 @@
     :log warning "Provisioning: Could not notify server (register manually via admin panel)"
 }
 
+# ---- STEP 9b: ANTI-TUNNEL (HTTP Injector / open transparent proxy) ----
+# Only portal + backend may be reached through the hotspot's transparent
+# proxy. See the hotspot-bypass-fix skill before changing these rules.
+
+:foreach i in=[/ip firewall address-list find where list=isp_portal_allow and comment="portal/api/backend allow (anti-tunnel)"] do={ :do { /ip firewall address-list remove $i } on-error={} }
+:do { /ip firewall address-list add list=isp_portal_allow address=203.0.113.10 comment="portal/api/backend allow (anti-tunnel)" } on-error={}
+:do { /ip firewall address-list add list=isp_portal_allow address=91.98.238.12 comment="portal/api/backend allow (anti-tunnel)" } on-error={}
+:do { /ip firewall address-list add list=isp_portal_allow address=216.198.79.0/24 comment="portal/api/backend allow (anti-tunnel)" } on-error={}
+:do { /ip firewall address-list add list=isp_portal_allow address=64.29.17.0/24 comment="portal/api/backend allow (anti-tunnel)" } on-error={}
+:do { /ip firewall address-list add list=isp_portal_allow address=76.76.21.0/24 comment="portal/api/backend allow (anti-tunnel)" } on-error={}
+
+:foreach i in=[/ip firewall filter find comment="ISP_BILLING_PROXY_RELAY_BLOCK"] do={ :do { /ip firewall filter remove $i } on-error={} }
+:foreach i in=[/ip firewall filter find comment="ISP_BILLING_ANTI_TUNNEL"] do={ :do { /ip firewall filter remove $i } on-error={} }
+:foreach i in=[/ip firewall filter find comment="ISP_BILLING_ANTI_TUNNEL_OTHER"] do={ :do { /ip firewall filter remove $i } on-error={} }
+:foreach i in=[/ip firewall filter find comment="ISP_BILLING_ANTI_TUNNEL_DNS"] do={ :do { /ip firewall filter remove $i } on-error={} }
+:do { /ip firewall filter add chain=output protocol=tcp dst-port=80,3128,8080 dst-address-list=!isp_portal_allow dst-address=!192.168.88.0/24 action=reject reject-with=tcp-reset comment="ISP_BILLING_PROXY_RELAY_BLOCK" } on-error={ :log error "Provisioning: could not add ISP_BILLING_PROXY_RELAY_BLOCK" }
+:do { /ip firewall filter add chain=hs-unauth protocol=tcp dst-port=80,443 dst-address=!192.168.88.1 dst-address-list=!isp_portal_allow connection-state=new action=reject reject-with=tcp-reset comment="ISP_BILLING_ANTI_TUNNEL" } on-error={ :log error "Provisioning: could not add ISP_BILLING_ANTI_TUNNEL" }
+:do { /ip firewall filter add chain=hs-unauth protocol=tcp dst-port=!53,80,443 dst-address=!192.168.88.1 action=reject reject-with=tcp-reset comment="ISP_BILLING_ANTI_TUNNEL_OTHER" } on-error={ :log error "Provisioning: could not add ISP_BILLING_ANTI_TUNNEL_OTHER" }
+:do { /ip firewall filter add chain=hs-unauth protocol=udp dst-port=53 dst-address=!192.168.88.1 action=reject reject-with=icmp-net-prohibited comment="ISP_BILLING_ANTI_TUNNEL_DNS" } on-error={ :log error "Provisioning: could not add ISP_BILLING_ANTI_TUNNEL_DNS" }
+
+:log info "Provisioning: anti-tunnel proxy-relay rules applied"
+
 # ---- STEP 10: REBOOT ----
 
 :log info "Provisioning complete! Rebooting in 5 seconds..."
-:delay 5s
-/system reboot
+:do {
+    :execute script=":delay 5s; /system reboot"
+} on-error={
+    :log warning "Provisioning: could not schedule the reboot -- reboot the router manually"
+}

@@ -4,6 +4,7 @@ from sqlalchemy import select, func, update, case, or_
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timedelta
+import asyncio
 import json
 
 from app.db.database import get_db
@@ -21,6 +22,9 @@ from app.services.plan_cache import (
     plan_allows_router,
 )
 from app.services.subscription import enforce_active_subscription
+from app.services.payment_plan import payment_plan_id
+from app.services.mikrotik_api import plan_speed_error
+from app.services.usage_tracking import FUP_PERIOD_PLAN, FUP_PERIODS, plan_fup_period
 import logging
 
 logger = logging.getLogger(__name__)
@@ -32,6 +36,16 @@ VALID_FUP_ACTIONS = [a.value for a in FupAction]
 MAX_SHARED_USERS_LIMIT = 50
 
 
+def _validate_plan_speed(speed: Optional[str]) -> None:
+    """Reject a speed the router code cannot read.
+
+    Unreadable speeds used to be saved and then silently provisioned as
+    10M/10M ("5mbs" gave a 5 Mbps plan a 10 Mbps profile, 8 Nov 2026)."""
+    error = plan_speed_error(speed)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+
+
 def _parse_fup_action(value: Optional[str]) -> Optional[FupAction]:
     if value is None or value == "":
         return None
@@ -41,6 +55,19 @@ def _parse_fup_action(value: Optional[str]) -> Optional[FupAction]:
             detail=f"Invalid fup_action. Must be one of: {', '.join(VALID_FUP_ACTIONS)}",
         )
     return FupAction(value.lower())
+
+
+def _parse_fup_period(value: Optional[str]) -> str:
+    """``"plan"`` (default, cap per paid period) or ``"daily"`` (cap per day)."""
+    if value is None or str(value).strip() == "":
+        return FUP_PERIOD_PLAN
+    normalized = str(value).strip().lower()
+    if normalized not in FUP_PERIODS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid fup_period. Must be one of: {', '.join(FUP_PERIODS)}",
+        )
+    return normalized
 
 
 async def _loosen_open_period_caps(db: AsyncSession, plan_id: int, new_cap_mb: Optional[int]) -> int:
@@ -73,6 +100,7 @@ def _serialize_plan_fup(plan: Plan) -> dict:
         "data_cap_mb": plan.data_cap_mb,
         "fup_action": plan.fup_action.value if plan.fup_action else None,
         "fup_throttle_profile": plan.fup_throttle_profile,
+        "fup_period": plan_fup_period(plan),
     }
 
 
@@ -116,17 +144,28 @@ def _serialize_plan_trial(plan: Plan) -> dict:
     return {"trial_once_per_customer": bool(plan.trial_once_per_customer)}
 
 
+# Connection types a free trial can be on. Hotspot trials are claimed by the
+# customer from the captive portal; PPPoE trials are given by the reseller,
+# who registers the customer on the plan and activates them (no portal, no
+# payment). Static IP has no trial flow.
+FREE_TRIAL_CONNECTION_TYPES = (ConnectionType.HOTSPOT, ConnectionType.PPPOE)
+
+
 def _validate_free_trial_plan(plan: Plan) -> None:
-    """Free trials are claimed from the captive portal at no charge, so the
-    plan must be free and must be a hotspot plan (PPPoE customers have no
-    portal to claim from). Like any hotspot plan, ``max_shared_users`` sets how
-    many devices the claimed trial covers."""
+    """A free trial must cost 0 and be a hotspot or PPPoE plan.
+
+    Hotspot: claimed from the captive portal; ``max_shared_users`` sets how
+    many devices the claimed trial covers. PPPoE: the reseller activates the
+    customer on it, ``max_shared_users`` is the usual PPPoE device limit, and
+    the activation is recorded as a zero, non-revenue payment."""
     if plan.plan_type != PlanType.FREE_TRIAL:
         return
     if plan.price:
         raise HTTPException(status_code=400, detail="A free trial plan must have a price of 0")
-    if plan.connection_type != ConnectionType.HOTSPOT:
-        raise HTTPException(status_code=400, detail="Free trial plans are only available for hotspot")
+    if plan.connection_type not in FREE_TRIAL_CONNECTION_TYPES:
+        raise HTTPException(
+            status_code=400, detail="Free trial plans are only available for hotspot and PPPoE"
+        )
 
 
 async def _validate_router_scope(
@@ -176,6 +215,9 @@ class PlanCreateRequest(BaseModel):
     data_cap_mb: Optional[int] = None
     fup_action: Optional[str] = None
     fup_throttle_profile: Optional[str] = None
+    # "plan" (default): the cap covers the whole paid period. "daily": the cap
+    # covers each day and throttled customers get full speed back at the reset.
+    fup_period: Optional[str] = None
     max_shared_users: Optional[int] = 1
     # Omit or send null/[] to offer the plan on every router the reseller owns.
     router_ids: Optional[List[int]] = None
@@ -200,6 +242,7 @@ class PlanUpdateRequest(BaseModel):
     data_cap_mb: Optional[int] = None
     fup_action: Optional[str] = None
     fup_throttle_profile: Optional[str] = None
+    fup_period: Optional[str] = None
     max_shared_users: Optional[int] = None
     # Send null/[] to revert the plan to "all routers". Only applied when the
     # field is actually present in the request body.
@@ -223,7 +266,8 @@ async def create_plan_api(
             raise HTTPException(status_code=400, detail="Price cannot be negative")
         if request.duration_value < 1:
             raise HTTPException(status_code=400, detail="Duration value must be at least 1")
-        
+        _validate_plan_speed(request.speed)
+
         # Validate connection type
         try:
             connection_type_enum = ConnectionType(request.connection_type.lower())
@@ -271,6 +315,7 @@ async def create_plan_api(
             raise HTTPException(status_code=409, detail="Plan with this name already exists")
         
         fup_action_enum = _parse_fup_action(request.fup_action)
+        fup_period = _parse_fup_period(request.fup_period)
         if request.data_cap_mb is not None and request.data_cap_mb < 0:
             raise HTTPException(status_code=400, detail="data_cap_mb cannot be negative")
         max_shared_users = _validate_max_shared_users(request.max_shared_users)
@@ -293,6 +338,7 @@ async def create_plan_api(
             data_cap_mb=request.data_cap_mb,
             fup_action=fup_action_enum,
             fup_throttle_profile=request.fup_throttle_profile,
+            fup_period=fup_period,
             max_shared_users=max_shared_users,
             router_ids=scoped_router_ids,
             trial_once_per_customer=(
@@ -420,7 +466,9 @@ async def update_plan_api(
         
         if request.name is not None:
             plan.name = request.name
+        previous_speed = plan.speed
         if request.speed is not None:
+            _validate_plan_speed(request.speed)
             plan.speed = request.speed
         if request.price is not None:
             plan.price = request.price
@@ -475,8 +523,14 @@ async def update_plan_api(
             plan.fup_action = _parse_fup_action(request.fup_action)
         if "fup_throttle_profile" in fields_set:
             plan.fup_throttle_profile = request.fup_throttle_profile if request.fup_throttle_profile else None
+        if "fup_period" in fields_set:
+            plan.fup_period = _parse_fup_period(request.fup_period)
+        previous_max_devices = int(plan.max_shared_users or 1)
         if request.max_shared_users is not None:
             plan.max_shared_users = _validate_max_shared_users(request.max_shared_users)
+        is_pppoe = plan.connection_type == ConnectionType.PPPOE
+        pppoe_speed_changed = is_pppoe and (plan.speed or "") != (previous_speed or "")
+        pppoe_devices_changed = is_pppoe and int(plan.max_shared_users or 1) != previous_max_devices
         if "router_ids" in fields_set:
             plan.router_ids = await _validate_router_scope(db, user.id, request.router_ids)
         if request.trial_once_per_customer is not None:
@@ -486,7 +540,17 @@ async def update_plan_api(
         await db.commit()
         await db.refresh(plan)
         await invalidate_plan_cache()
-        
+
+        if pppoe_speed_changed or pppoe_devices_changed:
+            # A PPPoE customer's speed and device count live on their router
+            # (the PPP profile); push them in the background, never on this
+            # request, or customers keep the old ones until they pay again.
+            from app.services.pppoe_provisioning import reprovision_plan_pppoe_customers
+
+            asyncio.create_task(
+                reprovision_plan_pppoe_customers(plan.id, speed_changed=pppoe_speed_changed)
+            )
+
         logger.info(f"Plan {plan_id} updated: type={plan.plan_type.value}, hidden={plan.is_hidden}")
         
         return {
@@ -673,7 +737,7 @@ async def get_plan_performance(
     Get performance metrics for each plan
     
     Shows:
-    - Total sales per plan
+    - Total sales per plan, and how many customers made them
     - Revenue per plan
     - Average revenue per sale
     - Current active customers per plan
@@ -681,43 +745,55 @@ async def get_plan_performance(
     try:
         user = await get_current_user(token, db)
         
-        # Base query for plan performance
+        # The period's payments, each tagged with the plan it bought (not the
+        # customer's current plan). Filtering here rather than on the outer
+        # query keeps plans with no sales in the period in the result.
+        payments = select(
+            CustomerPayment.id,
+            CustomerPayment.customer_id,
+            CustomerPayment.amount,
+            CustomerPayment.counts_as_revenue,
+            payment_plan_id().label('plan_id'),
+        ).outerjoin(
+            Customer, CustomerPayment.customer_id == Customer.id
+        ).where(
+            CustomerPayment.reseller_id == user.id
+        )
+
+        # Apply date filters if provided
+        if start_date:
+            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+            payments = payments.where(CustomerPayment.created_at >= start_dt)
+
+        if end_date:
+            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+            if 'T' not in end_date:
+                end_dt = end_dt.replace(hour=23, minute=59, second=59)
+            payments = payments.where(CustomerPayment.created_at <= end_dt)
+
+        payments = payments.subquery()
+
         stmt = select(
             Plan.id,
             Plan.name,
             Plan.price,
             Plan.duration_value,
             Plan.duration_unit,
-            func.count(Customer.id.distinct()).label('total_customers'),
-            func.count(CustomerPayment.id).label('total_sales'),
+            func.count(payments.c.customer_id.distinct()).label('total_customers'),
+            func.count(payments.c.id).label('total_sales'),
             # Count every sale, but exclude compensation vouchers
             # (counts_as_revenue=False) from the revenue amount.
             func.sum(
                 case(
-                    (CustomerPayment.counts_as_revenue == True, CustomerPayment.amount),
+                    (payments.c.counts_as_revenue == True, payments.c.amount),
                     else_=0,
                 )
             ).label('total_revenue')
         ).outerjoin(
-            Customer, Customer.plan_id == Plan.id
-        ).outerjoin(
-            CustomerPayment, CustomerPayment.customer_id == Customer.id
+            payments, payments.c.plan_id == Plan.id
         ).where(
             Plan.user_id == user.id
-        )
-        
-        # Apply date filters if provided
-        if start_date:
-            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-            stmt = stmt.where(CustomerPayment.created_at >= start_dt)
-        
-        if end_date:
-            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-            if 'T' not in end_date:
-                end_dt = end_dt.replace(hour=23, minute=59, second=59)
-            stmt = stmt.where(CustomerPayment.created_at <= end_dt)
-        
-        stmt = stmt.group_by(Plan.id, Plan.name, Plan.price, Plan.duration_value, Plan.duration_unit)
+        ).group_by(Plan.id, Plan.name, Plan.price, Plan.duration_value, Plan.duration_unit)
         
         result = await db.execute(stmt)
         

@@ -38,6 +38,7 @@ from app.db.models import (
 )
 from app.services.mikrotik_api import (
     LANE_BACKGROUND,
+    QUEUE_FASTTRACK_BYPASS_LIST,
     MikroTikAPI,
     customer_queue_mac,
     find_conflicting_customer_queues,
@@ -50,9 +51,17 @@ from app.services.router_availability import (
     prune_router_availability_history,
 )
 from app.services.usage_tracking import record_usage
+from app.services.pppoe_sessions import resolve_extra_session_customer
+from app.services.pppoe_device_lock import desired_caller_id
 from app.services.usage_counters import clamp_to_line_rate, record_queue_usage_sample
-from app.services.fup import hotspot_throttle_rate_for_plan
+from app.services.fup import hotspot_throttle_speed_for_plan
 from app.services import customer_expiry_notifications
+from app.services.customer_grace import (
+    access_floor,
+    effective_expiry,
+    effective_expiry_of,
+    has_access_time,
+)
 from app.core.protected_devices import is_protected_device
 from app.config import settings
 from app.services.realtime_state import host_metering_active, is_pilot_router, pushed_bindings, reports_metrics
@@ -63,6 +72,7 @@ from app.services.hotspot_mac_login import (
     reconcile_router as reconcile_mac_login_router,
 )
 import asyncio
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import functools
@@ -101,6 +111,7 @@ EXPIRY_NOTIFICATION_MAX_OVERDUE = timedelta(days=7)
 EXPIRY_REAPER_GRACE = timedelta(minutes=3)
 SAFETY_NET_CLEANUP_MIN_INTERVAL = timedelta(minutes=10)
 ACCESS_CREDENTIAL_REAPER_MIN_INTERVAL = timedelta(minutes=5)
+DELETED_CUSTOMER_CLEANUP_MIN_INTERVAL = timedelta(minutes=10)
 BANDWIDTH_MAX_ROUTERS_PER_RUN = 8
 BANDWIDTH_RUN_TIME_BUDGET_SECONDS = 90
 BANDWIDTH_HISTORY_RETENTION_DAYS = 30
@@ -174,6 +185,7 @@ queue_sync_running = False
 inactive_pppoe_reconcile_running = False
 _last_safety_net_cleanup_at: datetime | None = None
 _last_access_credential_reaper_at: datetime | None = None
+_last_deleted_customer_cleanup_at: datetime | None = None
 _bandwidth_router_cursor = 0
 _queue_sync_router_cursor = 0
 _mac_login_reconcile_cursor = 0
@@ -678,9 +690,9 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
     """Cleanup expired hotspot users on ONE router.
 
     Reads each table once, removes every expired customer's entries from that
-    snapshot, then re-reads the bindings once to verify. A customer counts as
-    removed only when its ip-binding (what grants access) is gone or was never
-    there, exactly as before.
+    snapshot, then verifies that bindings, users and active sessions are gone.
+    A physical device can immediately reappear as an unauthorized hotspot host;
+    only an authorized or bypassed host still represents access.
     """
     results = {"removed": [], "failed": [], "connected": False}
     if not customers_data:
@@ -706,13 +718,13 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
 
     try:
         snapshot: dict[str, list] = {}
-        binding_fetch_failed = False
+        critical_read_failed = False
         for name, command in _EXPIRY_SNAPSHOT_COMMANDS.items():
             reply = api.send_command(command)
             if not reply.get("success"):
-                if name == "bindings":
-                    binding_fetch_failed = True
-                    logger.error(f"[CRON] Failed to fetch IP bindings on {router_info['name']}: {reply.get('error', 'unknown')}")
+                if name in ("bindings", "users", "active", "hosts"):
+                    critical_read_failed = True
+                    logger.error(f"[CRON] Failed to fetch {name} on {router_info['name']}: {reply.get('error', 'unknown')}")
                 snapshot[name] = []
                 continue
             snapshot[name] = reply.get("data") or []
@@ -752,25 +764,6 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
                             f"(ignored): {lb_exc}"
                         )
 
-                binding_found = False
-                binding_remove_failed = False
-                mac_login_user_remove_failed = False
-                for b in snapshot["bindings"]:
-                    mac_match = _mac_of(b) == normalized_mac
-                    username_match = f"USER:{username}" in b.get("comment", "").upper()
-                    if mac_match or username_match:
-                        binding_found = True
-                        if remove("bindings", "/ip/hotspot/ip-binding/remove", b.get(".id")):
-                            removed["binding_removed"] = True
-                        else:
-                            binding_remove_failed = True
-                            logger.error(f"[CRON] Failed to remove IP binding {b.get('.id')} for {normalized_mac}")
-
-                for host in snapshot["hosts"]:
-                    if _mac_of(host) == normalized_mac or (client_ip and host.get("address") == client_ip):
-                        if remove("hosts", "/ip/hotspot/host/remove", host[".id"]):
-                            removed["hosts"] += 1
-
                 # Every matching user goes: a MAC-login user left behind logs
                 # the device straight back in, so its removal must succeed.
                 for u in snapshot["users"]:
@@ -781,7 +774,6 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
                         if remove("users", "/ip/hotspot/user/remove", u.get(".id")):
                             removed["user"] = True
                         elif is_mac_login_user(u):
-                            mac_login_user_remove_failed = True
                             logger.error(f"[CRON] Failed to remove MAC-login user {u.get('name')} for {normalized_mac}")
 
                 for session in snapshot["active"]:
@@ -789,6 +781,20 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
                             or session.get("user", "").upper() == username.upper()):
                         if remove("active", "/ip/hotspot/active/remove", session.get(".id")):
                             removed["active_sessions"] += 1
+
+                for host in snapshot["hosts"]:
+                    if _mac_of(host) == normalized_mac or (client_ip and host.get("address") == client_ip):
+                        if remove("hosts", "/ip/hotspot/host/remove", host[".id"]):
+                            removed["hosts"] += 1
+
+                for b in snapshot["bindings"]:
+                    mac_match = _mac_of(b) == normalized_mac
+                    username_match = f"USER:{username}" in b.get("comment", "").upper()
+                    if mac_match or username_match:
+                        if remove("bindings", "/ip/hotspot/ip-binding/remove", b.get(".id")):
+                            removed["binding_removed"] = True
+                        else:
+                            logger.error(f"[CRON] Failed to remove IP binding {b.get('.id')} for {normalized_mac}")
 
                 for q in snapshot["queues"]:
                     queue_name = q.get("name", "")
@@ -806,43 +812,44 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
 
                 outcomes[cust["id"]] = {
                     "cust": cust, "mac": normalized_mac, "removed": removed,
-                    "binding_found": binding_found or mac_login_user_remove_failed,
-                    "remove_failed": binding_remove_failed or mac_login_user_remove_failed,
                 }
             except Exception as e:
                 results["failed"].append({"id": cust["id"], "error": str(e)})
                 logger.error(f"[CRON] Failed to remove customer {cust['id']}: {e}")
 
-        # One verification read for the whole batch: a binding still carrying
-        # an expired customer's MAC gets one more removal attempt.
-        still_bound: dict[str, str] = {}
-        if not binding_fetch_failed and any(o["binding_found"] for o in outcomes.values()):
-            verify = api.send_command("/ip/hotspot/ip-binding/print")
-            if verify.get("success"):
-                wanted = {o["mac"] for o in outcomes.values()}
-                for b in verify.get("data") or []:
-                    mac = _mac_of(b)
-                    if mac in wanted:
-                        still_bound[mac] = b.get(".id")
+        # Verify all three access paths for the whole batch. A command can
+        # return success while RouterOS leaves a session behind.
+        verified: dict[str, list] = {}
+        for name in ("bindings", "users", "active", "hosts"):
+            reply = api.send_command(_EXPIRY_SNAPSHOT_COMMANDS[name])
+            if reply.get("success"):
+                verified[name] = reply.get("data") or []
+            else:
+                critical_read_failed = True
+                verified[name] = []
+                logger.error("[CRON] Could not verify %s on %s: %s",
+                             name, router_info["name"], reply.get("error", "unknown"))
 
         for customer_id, o in outcomes.items():
             cust, removed = o["cust"], o["removed"]
-            if o["mac"] in still_bound:
-                logger.error(f"[CRON] VERIFICATION FAILED: IP binding STILL EXISTS for {o['mac']}!")
-                retry = api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": still_bound[o["mac"]]})
-                if _removed_ok(retry):
-                    removed["binding_removed"] = True
-                    o["remove_failed"] = False
-                else:
-                    o["remove_failed"] = True
-                    logger.error(f"[CRON] Retry removal FAILED: {retry.get('error', 'unknown')}")
-
-            if binding_fetch_failed:
-                results["failed"].append({"id": customer_id, "error": "Could not fetch IP bindings - user status unknown"})
-                logger.error(f"[CRON] FAILED to check bindings for {cust['name']} - keeping ACTIVE for retry")
-            elif o["binding_found"] and o["remove_failed"]:
-                results["failed"].append({"id": customer_id, "error": "IP binding removal failed - user may still have access"})
-                logger.error(f"[CRON] FAILED to remove binding for {cust['name']} - keeping ACTIVE for retry")
+            mac = o["mac"]
+            compact = mac.replace(":", "")
+            bound = any(_mac_of(b) == mac or f"USER:{compact}" in b.get("comment", "").upper()
+                        for b in verified["bindings"])
+            user = any(hotspot_user_is_for_mac(u, mac) for u in verified["users"])
+            active = any(_mac_of(s) == mac or s.get("user", "").upper() in (mac, compact)
+                         for s in verified["active"])
+            host = any(
+                _mac_of(h) == mac
+                and (str(h.get("authorized", "false")).lower() == "true"
+                     or str(h.get("bypassed", "false")).lower() == "true")
+                for h in verified["hosts"]
+            )
+            if critical_read_failed or bound or user or active or host:
+                reason = (f"Router access still present or unverified "
+                          f"(binding={bound}, user={user}, active={active}, host={host})")
+                results["failed"].append({"id": customer_id, "error": reason})
+                logger.error("[CRON] %s for %s - keeping ACTIVE for retry", reason, cust["name"])
             else:
                 results["removed"].append({"id": customer_id, "details": removed})
                 logger.info(f"[CRON] Expired customer {cust['name']} removed: {removed}")
@@ -1168,6 +1175,8 @@ def _cleanup_single_router_pppoe_sync(router_info: dict, customers_data: list) -
     results["connected"] = True
 
     try:
+        if router_info.get("pppoe_expired_redirect"):
+            customers_data = _wall_expired_pppoe_customers(api, router_info, customers_data, results)
         for cust in customers_data:
             try:
                 pppoe_user = cust["pppoe_username"]
@@ -1223,6 +1232,106 @@ def _cleanup_single_router_pppoe_sync(router_info: dict, customers_data: list) -
         api.disconnect()
 
     return results
+
+
+def _expired_redirect_router_fields(router, *, create_missing: bool = True) -> dict:
+    """router_info keys the PPPoE cleanup needs for the expired redirect."""
+    if not getattr(router, "pppoe_expired_redirect", False):
+        return {}
+    return {
+        "pppoe_expired_redirect": True,
+        "pppoe_expired_redirect_config": dict(router.pppoe_expired_redirect_config or {}),
+        "create_missing_walled": create_missing,
+    }
+
+
+async def _persist_redirect_configs(items) -> None:
+    """Store a changed walled-state config reported by a PPPoE cleanup run."""
+    from app.services.pppoe_expired_redirect import config_changed, persist_router_config
+
+    for router_info, outcome in items:
+        if not isinstance(outcome, dict) or not router_info.get("pppoe_expired_redirect"):
+            continue
+        new = outcome.get("redirect_config")
+        err = outcome.get("redirect_error")
+        if new and config_changed(router_info.get("pppoe_expired_redirect_config"), new):
+            await persist_router_config(router_info["id"], new)
+        elif err:
+            await persist_router_config(router_info["id"], {}, error=err)
+
+
+def _wall_expired_pppoe_customers(api, router_info: dict, customers_data: list, results: dict) -> list:
+    """Routers with the PPPoE expired redirect: keep the secret, move it to the
+    walled profile, kick the session (app/services/pppoe_expired_redirect.py).
+
+    Walled customers go into results["removed"] with details.walled, which the
+    caller treats exactly like a removal (they have no internet any more).
+    Returns the customers still to be removed the old way: paused customers
+    (a pause is not an expiry), and everyone when the walled state could not
+    be ensured on this router, so a failure never leaves expired customers
+    with access. ``create_missing_walled`` False (the inactive safety net)
+    walls only secrets that still exist.
+    """
+    from app.services.pppoe_expired_redirect import ensure_expired_infra, wall_pppoe_users
+
+    to_wall = [c for c in customers_data if not c.get("paused")]
+    rest = [c for c in customers_data if c.get("paused")]
+    if not to_wall:
+        return rest
+
+    ensured = ensure_expired_infra(
+        api,
+        router_id=router_info.get("id"),
+        config=router_info.get("pppoe_expired_redirect_config") or {},
+    )
+    if ensured.get("error"):
+        logger.error(
+            "[CRON-PPPoE] Expired redirect unavailable on router %s (%s); removing "
+            "expired customers the old way",
+            router_info.get("name"), ensured["error"],
+        )
+        results["redirect_error"] = ensured["error"]
+        return customers_data
+    results["redirect_config"] = ensured["config"]
+
+    try:
+        outcome = wall_pppoe_users(
+            api,
+            [
+                {
+                    "id": c["id"],
+                    "pppoe_username": c["pppoe_username"],
+                    "pppoe_password": c.get("pppoe_password"),
+                    "comment": f"CID:{c['id']}|{c.get('name') or ''}|expired"[:120],
+                    "caller_id": c.get("pppoe_caller_id"),
+                }
+                for c in to_wall
+            ],
+            create_missing=router_info.get("create_missing_walled", True),
+        )
+    except Exception as exc:
+        logger.error("[CRON-PPPoE] Walling failed on router %s: %s", router_info.get("name"), exc)
+        return customers_data
+
+    for cust in to_wall:
+        res = outcome.get(cust["id"]) or {"ok": False, "error": "not processed"}
+        if res.get("ok"):
+            results["removed"].append({
+                "id": cust["id"],
+                "details": {
+                    "walled": res.get("action") != "absent",
+                    "action": res.get("action"),
+                    "disconnected": res.get("disconnected", 0),
+                },
+            })
+            logger.info(
+                "[CRON-PPPoE] Expired PPPoE user %s (customer %s): %s",
+                cust["pppoe_username"], cust["id"], res.get("action"),
+            )
+        else:
+            # Same retry contract as a failed removal: row stays ACTIVE.
+            results["failed"].append({"id": cust["id"], "error": res.get("error")})
+    return rest
 
 
 def _cleanup_pppoe_customers_sync(router_pppoe_map: dict) -> dict:
@@ -1330,6 +1439,7 @@ async def _load_inactive_pppoe_reconcile_batch() -> list[dict]:
                 "pppoe_username": customer.pppoe_username,
                 "expiry": customer.expiry,
                 "router_id": router.id,
+                "paused": customer.paused_at is not None,
                 "router": {
                     "id": router.id,
                     "ip": router.ip_address,
@@ -1337,6 +1447,9 @@ async def _load_inactive_pppoe_reconcile_batch() -> list[dict]:
                     "password": router.password,
                     "port": router.port,
                     "name": router.name,
+                    # The safety net walls a leftover secret but never
+                    # re-creates one that is already gone.
+                    **_expired_redirect_router_fields(router, create_missing=False),
                 },
             })
         await db.commit()
@@ -1401,7 +1514,7 @@ async def reconcile_inactive_pppoe_access_background() -> dict:
             )
             group["customers"].append({
                 key: candidate[key]
-                for key in ("id", "name", "pppoe_username", "expiry", "router_id")
+                for key in ("id", "name", "pppoe_username", "expiry", "router_id", "paused")
             })
 
         async def _cleanup_group(router_key: str, group: dict):
@@ -1418,7 +1531,11 @@ async def reconcile_inactive_pppoe_access_background() -> dict:
             return_exceptions=True,
         )
 
+        await _persist_redirect_configs(
+            (group["router"], outcome) for (_rk, group), outcome in zip(group_items, outcomes)
+        )
         removed_ids: set[int] = set()
+        walled_ids: set[int] = set()
         failed = 0
         for (router_key, group), outcome in zip(group_items, outcomes):
             if isinstance(outcome, Exception):
@@ -1430,6 +1547,10 @@ async def reconcile_inactive_pppoe_access_background() -> dict:
                 )
                 continue
             removed_ids.update(row["id"] for row in outcome.get("removed", []))
+            walled_ids.update(
+                row["id"] for row in outcome.get("removed", [])
+                if (row.get("details") or {}).get("walled")
+            )
             failed += len(outcome.get("failed", []))
 
         restore_payloads = []
@@ -1452,7 +1573,11 @@ async def reconcile_inactive_pppoe_access_background() -> dict:
                             router_id=customer.router_id,
                             action="pppoe_deactivation",
                             status="success",
-                            details="Inactive PPPoE safety net confirmed session and secret absent",
+                            details=(
+                                "Inactive PPPoE safety net moved the secret to the walled expired profile"
+                                if customer.id in walled_ids
+                                else "Inactive PPPoE safety net confirmed session and secret absent"
+                            ),
                         ))
                         durable_removed += 1
                     elif (
@@ -1464,8 +1589,7 @@ async def reconcile_inactive_pppoe_access_background() -> dict:
                             customer.status == CustomerStatus.ACTIVE
                             or (
                                 customer.status == CustomerStatus.PENDING
-                                and customer.expiry
-                                and customer.expiry > datetime.utcnow()
+                                and has_access_time(customer, datetime.utcnow())
                             )
                         )
                     ):
@@ -1522,17 +1646,25 @@ async def _deactivate_expired_identityless_customers(db: AsyncSession, now: date
     binding follows the MAC, and the safety net drops unowned bindings), so the
     status change is DB-only.
     """
-    ids = (
+    rows = (
         await db.execute(
-            select(Customer.id).where(
+            select(Customer.id, Customer.expiry, Customer.grace_period_minutes).where(
                 Customer.status == CustomerStatus.ACTIVE,
                 Customer.expiry.isnot(None),
                 Customer.expiry <= now,
                 Customer.mac_address.is_(None),
                 Customer.pppoe_username.is_(None),
+                # Static-IP customers have neither identity either, but they DO
+                # have router access to remove: static_ip.enforce job owns them
+                # and flips status only after the router confirms suspension.
+                Customer.static_ip.is_(None),
             )
         )
-    ).scalars().all()
+    ).all()
+    ids = [
+        customer_id for customer_id, expiry, grace in rows
+        if effective_expiry_of(expiry, grace) <= now
+    ]
     if ids:
         await db.execute(
             update(Customer)
@@ -1577,7 +1709,12 @@ async def cleanup_expired_users_background():
                 )
             )
             result = await db.execute(stmt)
-            expired_customers = result.scalars().all()
+            # The SQL filter is on the paid expiry; customers still inside
+            # their reseller-set grace window keep access until it closes.
+            expired_customers = [
+                c for c in result.scalars().all()
+                if effective_expiry(c) <= now
+            ]
             if not expired_customers:
                 return
             logger.info(f"[CRON] Found {len(expired_customers)} expired ACTIVE customers to cleanup")
@@ -1590,15 +1727,21 @@ async def cleanup_expired_users_background():
 
             candidate_ids = [customer.id for customer in expired_customers]
             current_state = await db.execute(
-                select(Customer.id, Customer.status, Customer.expiry).where(
+                select(
+                    Customer.id, Customer.status, Customer.expiry, Customer.grace_period_minutes
+                ).where(
                     Customer.id.in_(candidate_ids)
                 )
             )
             now_before_router_cleanup = datetime.utcnow()
             still_expired_ids: set[int] = set()
             renewed_ids: list[int] = []
-            for customer_id, status, expiry in current_state.all():
-                if status == CustomerStatus.ACTIVE and expiry and expiry <= now_before_router_cleanup:
+            for customer_id, status, expiry, grace in current_state.all():
+                if (
+                    status == CustomerStatus.ACTIVE
+                    and expiry
+                    and effective_expiry_of(expiry, grace) <= now_before_router_cleanup
+                ):
                     still_expired_ids.add(customer_id)
                 else:
                     renewed_ids.append(customer_id)
@@ -1614,7 +1757,7 @@ async def cleanup_expired_users_background():
                 customer for customer in expired_customers
                 if customer.id in still_expired_ids
             ]
-            expiry_by_id = {c.id: c.expiry for c in expired_customers}
+            expiry_by_id = {c.id: effective_expiry(c) for c in expired_customers}
 
             await db.commit()
 
@@ -1691,13 +1834,17 @@ async def cleanup_expired_users_background():
                             "router": {
                                 "id": c.router.id,
                                 "ip": c.router.ip_address, "username": c.router.username,
-                                "password": c.router.password, "port": c.router.port, "name": c.router.name
+                                "password": c.router.password, "port": c.router.port, "name": c.router.name,
+                                **_expired_redirect_router_fields(c.router),
                             },
                             "customers": []
                         }
                     router_pppoe_map[router_key]["customers"].append({
                         "id": c.id, "name": c.name, "pppoe_username": c.pppoe_username,
-                        "expiry": c.expiry, "router_id": c.router_id
+                        "expiry": c.expiry, "router_id": c.router_id,
+                        "pppoe_password": c.pppoe_password,
+                        "paused": c.paused_at is not None,
+                        "pppoe_caller_id": desired_caller_id(c),
                     })
                     continue
 
@@ -1711,7 +1858,7 @@ async def cleanup_expired_users_background():
                     long_offline_quarantined.append(c.id)
                     continue
                 if (c.router and getattr(c.router, "expiry_reaper_enabled", False)
-                        and c.expiry and now - c.expiry < EXPIRY_REAPER_GRACE
+                        and c.expiry and now - effective_expiry(c) < EXPIRY_REAPER_GRACE
                         and _reaper_sees_customer(c.router)):
                     reaper_deferred.append(c.id)
                     continue
@@ -1838,6 +1985,9 @@ async def cleanup_expired_users_background():
                     *[_pppoe_task(rk, rd) for rk, rd in pppoe_items],
                     return_exceptions=True,
                 )
+                await _persist_redirect_configs(
+                    (rd["router"], outcome) for (_rk, rd), outcome in zip(pppoe_items, pppoe_outcomes)
+                )
                 for (_rk, rd), outcome in zip(pppoe_items, pppoe_outcomes):
                     if isinstance(outcome, Exception):
                         logger.error("[CRON] PPPoE cleanup task error: %s", outcome)
@@ -1869,6 +2019,10 @@ async def cleanup_expired_users_background():
             )
             pppoe_successful_ids = {
                 r["id"] for r in pppoe_results["removed"]
+            }
+            pppoe_walled_ids = {
+                r["id"] for r in pppoe_results["removed"]
+                if (r.get("details") or {}).get("walled")
             }
             all_failed_ids = set(
                 [r["id"] for r in mikrotik_results["failed"]] +
@@ -1924,6 +2078,7 @@ async def cleanup_expired_users_background():
             post_cleanup_deactivated_count = 0
             skipped_repaid_count = 0
             hotspot_renewal_repairs: list[tuple[int, int, dict]] = []
+            pppoe_renewal_repairs: list[dict] = []
             newly_deactivated_ids = set(directly_deactivated_ids)
             for router_id in offline_router_ids:
                 try:
@@ -1943,12 +2098,22 @@ async def cleanup_expired_users_background():
             for customer in expired_customers:
                 if customer.id in all_successful_ids:
                     await db.refresh(customer)
-                    if customer.expiry and customer.expiry > now_after_cleanup:
+                    if customer.expiry and effective_expiry(customer) > now_after_cleanup:
                         logger.warning(
                             "[CRON] Customer %s received new payment during cleanup "
                             "(expiry=%s > now=%s), skipping deactivation",
                             customer.id, customer.expiry, now_after_cleanup,
                         )
+                        if (
+                            customer.id in pppoe_walled_ids
+                            and customer.router
+                            and customer.pppoe_username
+                        ):
+                            # Walled while the payment landed: put the plan
+                            # profile back now instead of waiting for a sweep.
+                            from app.services.pppoe_provisioning import build_pppoe_payload
+
+                            pppoe_renewal_repairs.append(build_pppoe_payload(customer, customer.router))
                         if (
                             customer.id not in pppoe_successful_ids
                             and customer.router
@@ -1980,7 +2145,12 @@ async def cleanup_expired_users_background():
                                 router_id=customer.router_id,
                                 action="pppoe_deactivation",
                                 status="success",
-                                details="Expiry cleanup confirmed session and secret absent",
+                                details=(
+                                    "Expiry cleanup moved the secret to the walled expired profile "
+                                    "(payment page) and kicked the session"
+                                    if customer.id in pppoe_walled_ids
+                                    else "Expiry cleanup confirmed session and secret absent"
+                                ),
                             ))
                         else:
                             # Confirmed RouterOS removal only (all_successful_ids);
@@ -2030,6 +2200,18 @@ async def cleanup_expired_users_background():
                         failed_repairs,
                         len(hotspot_renewal_repairs),
                     )
+
+            if pppoe_renewal_repairs:
+                from app.services.pppoe_provisioning import call_pppoe_provision
+
+                for payload in pppoe_renewal_repairs:
+                    repaired = await call_pppoe_provision(payload)
+                    if not (isinstance(repaired, dict) and repaired.get("success")):
+                        logger.error(
+                            "[CRON] Could not restore walled PPPoE user %s who renewed during "
+                            "cleanup: %s", payload.get("pppoe_username"),
+                            (repaired or {}).get("error"),
+                        )
 
             # Expiry SMS is deliberately downstream of successful enforcement
             # and the INACTIVE commit. It uses its own short DB sessions and
@@ -2111,6 +2293,7 @@ async def expiry_housekeeping_background():
     interval guards below) without delaying removals.
     """
     global housekeeping_running, _last_safety_net_cleanup_at, _last_access_credential_reaper_at
+    global _last_deleted_customer_cleanup_at
     if housekeeping_running:
         return
     if _background_db_pool_is_busy("CRON-SAFETY-NET"):
@@ -2138,6 +2321,15 @@ async def expiry_housekeeping_background():
                     logger.info(f"[CRON] Released {released} idle access credential(s)")
         except Exception as reap_err:
             logger.error(f"[CRON] Access credential reaper failed: {reap_err}")
+
+        try:
+            if _interval_due(_last_deleted_customer_cleanup_at, now, DELETED_CUSTOMER_CLEANUP_MIN_INTERVAL):
+                _last_deleted_customer_cleanup_at = now
+                from app.services.deleted_customer_cleanup import retry_pending_cleanups
+
+                await retry_pending_cleanups(now)
+        except Exception as deleted_err:
+            logger.error(f"[CRON] Deleted-customer router cleanup retry failed: {deleted_err}")
     finally:
         housekeeping_running = False
 
@@ -2157,12 +2349,21 @@ def _scan_router_idle_credentials_sync(
       * absent from /ip/hotspot/host entirely, or
       * present with an idle-time exceeding ``idle_threshold_seconds``.
 
+    Every credential that stays bound also gets its ``cred_<id>`` rate-limit
+    queue created or re-targeted to the device's current IP. A bypassed
+    binding skips the hotspot profile's rate-limit, so without this a device
+    whose IP was unknown at login (or changed since) runs unlimited.
+
     Returns ``{"to_release": [{"id": int, "mac": str, "bytes_in": int, "bytes_out": int}, ...],
               "to_update": [{"id": int, "bytes_in": int, "bytes_out": int, "ip": str}, ...]}``.
 
     No DB writes happen here; the async caller applies the changes.
     """
-    from app.services.access_credentials import queue_name_for_credential
+    from app.services.access_credentials import (
+        _queue_target_ips,
+        ensure_credential_queue_sync,
+        queue_name_for_credential,
+    )
 
     out = {"to_release": [], "to_update": []}
     api = MikroTikAPI(
@@ -2177,34 +2378,52 @@ def _scan_router_idle_credentials_sync(
 
     try:
         hosts_resp = api.send_command("/ip/hotspot/host/print")
+        if not hosts_resp.get("success"):
+            logger.warning("[REAPER] Could not read hosts on %s; keeping credential bindings",
+                           router_info.get("name"))
+            return out
         hosts_by_mac = {}
+        # Every address behind each MAC: a MAC-NAT repeater puts several
+        # devices behind one bound MAC, and the queue must cover all of them.
+        host_ips_by_mac: dict[str, list[str]] = defaultdict(list)
         if hosts_resp.get("success") and hosts_resp.get("data"):
             for h in hosts_resp["data"]:
                 hm = h.get("mac-address", "")
                 if hm:
                     hosts_by_mac[normalize_mac_address(hm)] = h
+                    h_ip = h.get("address") or h.get("to-address")
+                    if h_ip:
+                        host_ips_by_mac[normalize_mac_address(hm)].append(h_ip)
 
         # Pull bindings + queues once so per-cred release is just a lookup + remove.
         bindings_resp = api.send_command("/ip/hotspot/ip-binding/print")
-        bindings_by_mac: dict[str, str] = {}
+        if not bindings_resp.get("success"):
+            logger.warning("[REAPER] Could not read bindings on %s; keeping credential bindings",
+                           router_info.get("name"))
+            return out
+        bindings_by_credential: dict[tuple[int, str], list[str]] = defaultdict(list)
         if bindings_resp.get("success") and bindings_resp.get("data"):
             for b in bindings_resp["data"]:
                 bm = b.get("mac-address", "")
                 bid = b.get(".id")
-                if bm and bid:
-                    bindings_by_mac[normalize_mac_address(bm)] = bid
+                match = re.search(r"ACCESS_CRED\|cred:(\d+)", b.get("comment", ""))
+                if bm and bid and match:
+                    bindings_by_credential[(int(match.group(1)),
+                                            normalize_mac_address(bm))].append(bid)
 
         queues_resp = api.send_command("/queue/simple/print")
-        queues_by_name: dict[str, str] = {}
+        queues_read = bool(queues_resp.get("success"))
+        queues_by_name: dict[str, dict] = {}
         if queues_resp.get("success") and queues_resp.get("data"):
             for q in queues_resp["data"]:
                 qn = q.get("name", "")
-                qid = q.get(".id")
-                if qn and qid:
-                    queues_by_name[qn] = qid
+                if qn and q.get(".id"):
+                    queues_by_name[qn] = q
+        limited_ips: list[str] = []
 
         now_utc = datetime.utcnow()
 
+        pending_releases = []
         for cred in creds:
             mac = cred.get("bound_mac_address")
             if not mac:
@@ -2242,29 +2461,113 @@ def _scan_router_idle_credentials_sync(
                     should_release = True
 
             if should_release:
-                binding_id = bindings_by_mac.get(wanted)
-                if binding_id:
-                    api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": binding_id})
-                queue_id = queues_by_name.get(queue_name_for_credential(cred["id"]))
-                if queue_id:
-                    api.send_command("/queue/simple/remove", {"numbers": queue_id})
-                out["to_release"].append({
+                remove_failed = False
+                for binding_id in bindings_by_credential.get((cred["id"], wanted), []):
+                    result = api.send_command("/ip/hotspot/ip-binding/remove",
+                                              {"numbers": binding_id})
+                    if not result.get("success"):
+                        remove_failed = True
+                if remove_failed:
+                    logger.warning("[REAPER] Credential %s binding removal failed; keeping bound MAC",
+                                   cred["id"])
+                    continue
+                if host and str(host.get("bypassed", "false")).lower() == "true":
+                    host_id = host.get(".id")
+                    if host_id:
+                        api.send_command("/ip/hotspot/host/remove", {"numbers": host_id})
+                pending_releases.append({
                     "id": cred["id"],
                     "mac": mac,
+                    "normalized_mac": wanted,
                     "bytes_in": int(host.get("bytes-in", 0) or 0) if host else 0,
                     "bytes_out": int(host.get("bytes-out", 0) or 0) if host else 0,
                     "ip": (host.get("address") or host.get("to-address")) if host else None,
                 })
             else:
+                host_ip = host.get("address") or host.get("to-address")
                 out["to_update"].append({
                     "id": cred["id"],
                     "bytes_in": int(host.get("bytes-in", 0) or 0),
                     "bytes_out": int(host.get("bytes-out", 0) or 0),
-                    "ip": host.get("address") or host.get("to-address"),
+                    "ip": host_ip,
                 })
+                # Unread queue table: adding blind would collide on the name.
+                if queues_read and "rate_limit" in cred:
+                    cred_ips = _queue_target_ips(host_ips_by_mac.get(wanted) or host_ip)
+                    outcome = ensure_credential_queue_sync(
+                        api,
+                        cred_id=cred["id"],
+                        username=cred.get("username") or "",
+                        rate_limit=cred.get("rate_limit"),
+                        client_ip=cred_ips,
+                        existing_queue=queues_by_name.get(queue_name_for_credential(cred["id"])),
+                    )
+                    if outcome in ("created", "updated", "removed"):
+                        logger.warning("[REAPER] %s: %s queue %s (%s -> %s)",
+                                       router_info.get("name"), outcome,
+                                       queue_name_for_credential(cred["id"]),
+                                       ",".join(cred_ips), cred.get("rate_limit"))
+                    if outcome in ("created", "updated", "unchanged") and cred.get("rate_limit"):
+                        limited_ips.extend(cred_ips)
+        if limited_ips:
+            _ensure_credential_queue_fasttrack_bypass(api, router_info.get("name"), limited_ips)
+        if pending_releases:
+            verified_bindings = api.send_command("/ip/hotspot/ip-binding/print")
+            verified_hosts = api.send_command("/ip/hotspot/host/print")
+            if not verified_bindings.get("success") or not verified_hosts.get("success"):
+                logger.warning("[REAPER] Could not verify credential release on %s; keeping bound MACs",
+                               router_info.get("name"))
+                return out
+            remaining = {
+                (int(match.group(1)), normalize_mac_address(b.get("mac-address")))
+                for b in verified_bindings.get("data") or []
+                if b.get("mac-address")
+                if (match := re.search(r"ACCESS_CRED\|cred:(\d+)", b.get("comment", "")))
+            }
+            bypassed_macs = {
+                normalize_mac_address(h.get("mac-address"))
+                for h in verified_hosts.get("data") or []
+                if h.get("mac-address")
+                and str(h.get("bypassed", "false")).lower() == "true"
+            }
+            for entry in pending_releases:
+                key = (entry["id"], entry["normalized_mac"])
+                if key in remaining or entry["normalized_mac"] in bypassed_macs:
+                    logger.warning("[REAPER] Credential %s still bypassed; keeping bound MAC",
+                                   entry["id"])
+                    continue
+                queue_id = (queues_by_name.get(queue_name_for_credential(entry["id"])) or {}).get(".id")
+                if queue_id:
+                    api.send_command("/queue/simple/remove", {"numbers": queue_id})
+                entry.pop("normalized_mac")
+                out["to_release"].append(entry)
         return out
     finally:
         api.disconnect()
+
+
+def _ensure_credential_queue_fasttrack_bypass(api, router_name, ips: list) -> None:
+    """Keep credential-queue IPs out of FastTrack, like customer queue IPs.
+
+    FastTracked connections skip simple queues entirely. Reads only our own
+    address list and calls the shared helper (which rewrites the two accept
+    rules) only when an IP is actually missing, so a steady state costs one
+    filtered print per pass.
+    """
+    listed = api.send_command_optimized(
+        "/ip/firewall/address-list/print",
+        proplist=["address"],
+        query=f"?list={QUEUE_FASTTRACK_BYPASS_LIST}",
+    )
+    if not listed.get("success"):
+        return
+    present = {str(e.get("address", "")).split("/")[0] for e in listed.get("data") or []}
+    if set(ips) <= present:
+        return
+    result = api.ensure_queue_fasttrack_bypass(ips)
+    if result.get("error"):
+        logger.warning("[REAPER] FastTrack bypass for credential queues failed on %s: %s",
+                       router_name, result.get("error"))
 
 
 def _parse_mikrotik_duration(s: str) -> int:
@@ -2338,6 +2641,8 @@ async def _reap_idle_access_credentials(db: AsyncSession) -> int:
             "id": c.id,
             "bound_mac_address": c.bound_mac_address,
             "bound_at": c.bound_at.isoformat() if c.bound_at else None,
+            "username": c.username,
+            "rate_limit": c.rate_limit,
         })
 
     if not by_router:
@@ -2373,8 +2678,15 @@ async def _reap_idle_access_credentials(db: AsyncSession) -> int:
             continue
         _rid, scan = outcome
         for entry in scan.get("to_release", []):
-            cred = cred_by_id.get(entry["id"])
+            # A login may have rebound this credential while RouterOS was
+            # being checked. Refresh before clearing the bound MAC.
+            cred = await db.get(AccessCredential, entry["id"], populate_existing=True)
             if not cred:
+                continue
+            if (cred.status != AccessCredStatus.ACTIVE
+                    or not cred.bound_mac_address
+                    or normalize_mac_address(cred.bound_mac_address)
+                       != normalize_mac_address(entry["mac"])):
                 continue
             if entry.get("bytes_in"):
                 cred.total_bytes_in = (cred.total_bytes_in or 0) + entry["bytes_in"]
@@ -2419,7 +2731,8 @@ def _queue_sync_customer_item(c, fup_period) -> dict:
         else None
     )
     if fup_action == FupAction.THROTTLE:
-        plan_speed = hotspot_throttle_rate_for_plan(c.plan)
+        # Plan format, like c.plan.speed above: every consumer converts it.
+        plan_speed = hotspot_throttle_speed_for_plan(c.plan)
     return {
         "id": c.id,
         "mac_address": c.mac_address,
@@ -2427,8 +2740,10 @@ def _queue_sync_customer_item(c, fup_period) -> dict:
         "fup_active": bool(fup_period),
         "fup_action": fup_action.value if fup_action else None,
         # MAC-login users carry EXP:<second>; the reconcile writes it from here
-        # so the router expiry reaper can enforce users it (re)creates.
-        "expiry": c.expiry,
+        # so the router expiry reaper can enforce users it (re)creates. The
+        # tag carries the effective expiry so grace survives a router that
+        # cannot reach the server.
+        "expiry": effective_expiry(c),
     }
 
 
@@ -2464,12 +2779,13 @@ async def repair_router_queues_now(router_id: int) -> dict:
                     Customer.router_id == router_id,
                     Customer.status == CustomerStatus.ACTIVE,
                     Customer.mac_address.isnot(None),
-                    Customer.expiry > now,
+                    Customer.expiry > access_floor(now),
                     Plan.connection_type == ConnectionType.HOTSPOT,
                 )
                 .options(selectinload(Customer.plan))
             )
         ).scalars().all()
+        customers = [c for c in customers if has_access_time(c, now)]
         fup_periods = {
             p.customer_id: p
             for p in (
@@ -3131,14 +3447,14 @@ async def sync_active_user_queues():
                 .where(
                     Customer.status == CustomerStatus.ACTIVE,
                     Customer.mac_address.isnot(None),
-                    Customer.expiry > now,
+                    Customer.expiry > access_floor(now),
                     Plan.connection_type == ConnectionType.HOTSPOT,
                     Router.auth_method == RouterAuthMethod.DIRECT_API,
                 )
                 .options(selectinload(Customer.plan), selectinload(Customer.router))
             )
             result = await db.execute(stmt)
-            active_customers = result.scalars().all()
+            active_customers = [c for c in result.scalars().all() if has_access_time(c, now)]
             if not active_customers:
                 logger.info("[SYNC] No active customers to sync")
                 return
@@ -3241,8 +3557,29 @@ async def sync_active_user_queues():
         async def _sync_router_task(rk, rd):
             try:
                 async with router_locks.acquire(rk):
+                    # The fleet snapshot can wait behind another router job.
+                    # Re-read entitlement while holding this router's lock, so
+                    # a completed expiry cleanup cannot be undone by a stale
+                    # MAC-login reconcile. Close the DB session before I/O.
+                    ids = [item["id"] for item in rd["customers"]]
+                    async with async_session() as fresh_db:
+                        states = (await fresh_db.execute(
+                            select(Customer.id, Customer.status, Customer.expiry,
+                                   Customer.grace_period_minutes).where(Customer.id.in_(ids))
+                        )).all()
+                        await fresh_db.commit()
+                    checked_at = datetime.utcnow()
+                    paid_ids = {
+                        cid for cid, status, expiry, grace in states
+                        if status == CustomerStatus.ACTIVE and expiry is not None
+                        and effective_expiry_of(expiry, grace) > checked_at
+                    }
+                    current_customers = [item for item in rd["customers"] if item["id"] in paid_ids]
+                    if not current_customers:
+                        return {"synced": 0, "errors": 0, "skipped": len(ids),
+                                "routers_connected": 0}
                     return await asyncio.to_thread(
-                        _sync_single_router_queues_sync, rd["router"], rd["customers"],
+                        _sync_single_router_queues_sync, rd["router"], current_customers,
                         *((True,) if is_pilot_router(rd["router"].get("id")) else ()),
                     )
             except Exception as exc:
@@ -3577,12 +3914,6 @@ async def collect_bandwidth_snapshot():
             start_index = _bandwidth_router_cursor % len(eligible_routers)
             ordered_routers = eligible_routers[start_index:] + eligible_routers[:start_index]
             routers_to_process = ordered_routers[:BANDWIDTH_MAX_ROUTERS_PER_RUN]
-            # Advance the rotation cursor BEFORE processing. When it was advanced
-            # after the loop, any exception escaping the per-router handler froze
-            # the cursor and the job re-processed the same window forever while
-            # every other router's dashboard flatlined (2026-07-29). Advancing
-            # first costs at most one repeat visit after a crash; never a freeze.
-            _bandwidth_router_cursor = (start_index + len(routers_to_process)) % len(eligible_routers)
             processed_count = 0
             logger.info(
                 "[BANDWIDTH] Processing %d/%d eligible router(s) this run "
@@ -3596,7 +3927,7 @@ async def collect_bandwidth_snapshot():
                 start_index,
             )
 
-            for router in routers_to_process:
+            for offset, router in enumerate(routers_to_process):
                 if time.monotonic() - run_started >= BANDWIDTH_RUN_TIME_BUDGET_SECONDS:
                     logger.warning(
                         "[BANDWIDTH] Stopping run after %.1fs budget; processed %d router(s)",
@@ -3610,6 +3941,11 @@ async def collect_bandwidth_snapshot():
                         processed_count,
                     )
                     break
+                # Advance before this attempt, not before the whole batch. A
+                # slow first router can consume the budget; the other seven
+                # must remain next in the rotation. Advancing before I/O also
+                # preserves progress if this attempt raises or is cancelled.
+                _bandwidth_router_cursor = (start_index + offset + 1) % len(eligible_routers)
                 processed_count += 1
                 try:
                     router_info = {
@@ -3981,12 +4317,30 @@ async def collect_bandwidth_snapshot():
                                     if len(fallback_matches) == 1:
                                         customer = fallback_matches[0]
 
+                                # A username logged in on several devices gets one
+                                # queue per session; RouterOS names the extras
+                                # <pppoe-alice-1>, <pppoe-alice-2>. Credit them to
+                                # alice, each on its own usage row so every session
+                                # keeps its own counter baseline.
+                                extra_session = None
+                                if customer is None:
+                                    customer = resolve_extra_session_customer(
+                                        pppoe_user,
+                                        q.get("target", ""),
+                                        lambda username: _find_pppoe_customer(router_customers, username),
+                                    )
+                                    if customer is not None:
+                                        extra_session = pppoe_user
+
                                 # Canonical usage-row key comes from the DB username
                                 # when the customer is known so the cap sampler and
                                 # the snapshot job share one row even when the
                                 # router-side secret drifted in case.
                                 if customer and customer.pppoe_username:
                                     pppoe_key = f"pppoe:{customer.pppoe_username}"
+                                    if extra_session:
+                                        # Its own row: every session keeps its own baseline.
+                                        pppoe_key = f"pppoe:{extra_session}"
                                 else:
                                     pppoe_key = f"pppoe:{pppoe_user}"
                                 lookup_keys = list({pppoe_key, f"pppoe:{pppoe_user}"})

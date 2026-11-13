@@ -471,7 +471,8 @@ async def test_port_analytics_endpoint_uses_recorded_port_attribution(db, monkey
     router_operations._port_analytics_cache.clear()
     router_operations._port_analytics_locks.clear()
     reseller = await make_reseller(db)
-    router = await make_router(db, reseller, name="Router A")
+    router = await make_router(db, reseller, name="Router A", lb_enabled=True,
+                               lb_config={"wan_ports": ["ether1", "ether2"]})
     plan = await make_plan(db, reseller)
     customer = await make_customer(
         db,
@@ -521,6 +522,8 @@ async def test_port_analytics_endpoint_uses_recorded_port_attribution(db, monkey
 
     def fake_sync(router_info, customer_by_mac, revenue_by_port=None):
         seen["revenue_by_port"] = revenue_by_port
+        assert router_info["lb_enabled"] is True
+        assert router_info["lb_config"]["wan_ports"] == ["ether1", "ether2"]
         entry = customer_by_mac["AA:BB:CC:DD:EE:01"]
         assert entry["revenue_total"] == 1100.0
         return {

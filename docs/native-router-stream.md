@@ -1,0 +1,142 @@
+# Opt-in native router counter streams
+
+This collector replaces the work done by the periodic usage-report script on a
+small, explicitly selected set of RB951s. RouterOS streams selected counters over
+one persistent API connection; the backend formats the existing v3 report. It
+does not replace authentication, customer speed limits, check-in, expiry, or the
+management watchdog. RADIUS is not involved.
+
+Enrollment is off by default. Set `NATIVE_STREAM_ROUTER_IDS` and a matching
+`NATIVE_STREAM_REPORTER_HASHES` list of `id:sha256` entries only after reviewing
+each router's current reporter. The initial limit is eight routers. The collector
+requires an RB951Ui-2HnD on RouterOS 7.19.6 or later; RouterOS 6 remains excluded
+pending fallback certification. Shadow and scheduler-standby instances never
+start it. Observation-time support from PR #232 is required.
+
+Counter subscriptions use direct native IDs in chunks of 32. Host statistics are
+requested only for authorized or bypassed entries, and interface statistics only
+for physical ports and the WAN. Membership discovery runs every 30 seconds;
+stable chunks stay subscribed when other clients join. A billing feed that ends
+is rebuilt from current IDs. Host counters
+retain the existing MAC plus original-IP key; queue order and limits are retained.
+Per-row observation times protect the billing baseline from delayed delivery.
+
+DHCP leases, learned bridge hosts, bindings, neighbours and bridge membership use
+native `find` for IDs, followed by selected-ID pages of at most four rows. Pages
+are at least one second apart and never create interval subscriptions. A scan
+returns control to the worker after each request, keeping usage posts and lease
+refreshes running. These optional lists do not contain the billing counters.
+Each completed list replaces its cache atomically, including a valid empty list.
+Partial, invalid, failed or ten-minute-old scans preserve the last complete cache.
+
+Optional scans and interface membership refreshes start one at a time, at least
+50 seconds apart. A large scan can extend the round beyond five minutes; it does
+not overlap the next optional scan. Startup establishes billing
+streams first. A delayed cycle does not catch up by reading all lists together.
+An optional read failure is deferred to the next round without restarting healthy
+billing feeds. Connection loss and billing-stream failures retain normal fallback.
+
+A collected list accompanies the next usage report and stays pending until that
+report is accepted. Subsequent usage-only reports omit the list, preserving its
+cached contents and observation age at ingest. Retrying a rejected HTTP upload
+does not lose the pending inventory.
+
+Before pausing the usage timer, the collector verifies its exact source hash,
+identity and token, creates its own fallback timer, and seeds a RAM-only lease.
+The source verification requests only the named usage reporter. It does not
+download the source of unrelated or stored backup scripts.
+The previous reporter job is allowed to drain. Other timers and script sources
+are preserved. A unique guard and owner marker prevent overlapping collectors;
+fresh claims cannot be mistaken for stale guards during startup.
+
+The lease is refreshed by adding a new timed address-list entry before removing
+the previous entry. This reserved list is not referenced by a forwarding rule.
+Heartbeats therefore do not rewrite a scheduler deadline or source to flash.
+After three minutes without a heartbeat, the guard restores the old reporter on
+its next 30-second check. A router reboot also loses the RAM lease and restores
+the reporter. A reporter already enabled by an operator keeps its current
+interval. Normal shutdown restores reporting and removes only the collector's
+own guard and lease entries. Removing enrollment restores the original path at
+the next normal deployment; no router reset is needed.
+
+`NATIVE_STREAM_GRACEFUL_HANDOFF=true` changes clean application shutdown for the
+explicitly enrolled routers. An owner with an ingestion acknowledgement less
+than two minutes old refreshes its RAM lease and marks its guard for handover.
+The reporter stays paused while the API connection closes. For two minutes, a
+successor can adopt the guard after validating the reporter source and token,
+timer identity, exact guard source and predecessor lease.
+
+A uniquely named empty script serializes competing successors; it is never
+executed. The successor seeds its own RAM lease before updating the guard owner
+and retiring predecessor entries. A manually paused reporter without a valid
+handover marker is refused. Unknown claims are preserved; recognized empty
+claims can be retired after four minutes. This option is off by default.
+
+Counter, ingestion and transport failures retain the existing release and
+fallback path. If a successor never appears, the router guard restores reporting
+after lease expiry. Removing enrollment under this option also allows the guard
+to restore reporting after lease expiry.
+
+The first upgrade from a version without handover support still has the old
+shutdown behavior. Before that deployment, a reviewed temporary scheduler
+wrapper can skip the reporter while a short-lived RAM upgrade marker exists.
+Restore the original scheduler event once the new native owner is confirmed.
+Marker expiry permits the original reporter to run if an upgrade fails. This
+initial transition must be performed explicitly; the option alone cannot change
+an old process. The reporter script source is preserved.
+
+The client bounds reply sizes, table sizes and cached data. It does not log
+RouterOS error bodies, HTTP bodies, tokens, script sources or customer identifiers.
+Database reads commit and close before router or HTTP I/O.
+
+## Hardware evidence and limits
+
+On spare 563, 200 authenticated virtual clients at 200 aggregate UDP packets per
+second retained their sessions and traffic during native counter streaming. The
+direct-ID run peaked at 85% during startup and 65% afterward, against a 67% control
+peak. An unpaid client was blocked and a paid 1 Mbps profile delivered about
+0.97 Mbps when offered more traffic. This certifies that workload, not the maximum
+capacity for 200 people streaming video or using Wi-Fi.
+
+Controlled replacement of a host entry and cancellation of a subscription both
+recovered on the spare. Nineteen untouched sessions kept their uptimes, and all
+twenty clients kept echo access. The test peaked at 19%.
+
+Nine-minute live canaries on CJ 597 and APPOLO 585 recovered real table changes,
+updated billing and health, and restored their original timers. Both peaked at
+54%. APPOLO's original control peaked at 70%; WAN receive traffic increased from
+1.33 to 1.93 Mbps. CJ's mean increased from 5.45% to 6.26% while WAN traffic rose
+from 0.086 to 0.518 Mbps, so no mean-CPU reduction is claimed for that comparison.
+Those windows were below peak customer traffic.
+
+The production session's guard and RAM lease were also exercised on the empty
+spare: a second owner was refused, loss of the test heartbeat restored reporting,
+an operator's changed interval was preserved, and cleanup succeeded. That test
+peaked at 14% total CPU. The permanent worker was subsequently deployed through
+PR #236; enrollment remains explicit and source-hash guarded.
+
+Expiry remains a separate optimization. The scan-only candidate still saturated
+at 200 clients and is not part of this change. No universal CPU ceiling is claimed
+when forwarding traffic itself exhausts the board.
+
+On October 20, a controlled attribution test on spare 563 kept sixteen real
+MAC-authenticated sessions at 250 aggregate UDP packets per second. Reading all
+1,000 log rows produced peaks of 81% and 83%, against control peaks of 45–47%.
+Rebuilding DHCP and bridge inventory subscriptions separately produced peaks of
+67% and 74%, against controls of 44–48%. Session-list reads stayed near controls.
+Diagnostic collection can therefore distort a live peak measurement.
+
+The paced inventory candidate was then compared with the deployed collector in
+six equal 90-second windows: control, old, paced, paced, old, control. The fixture
+had 200 configured accounts, 200 disabled DHCP leases and sixteen active clients
+at the same packet rate. The old collector peaked at 76% and 72%; paced reads
+peaked at 59% and 57%; controls peaked at 58% and 55%. The paced means were 44.61%
+and 44.97%, against control means of 44.87% and 46.37%. Both versions returned all
+200 leases and all sixteen unique client MACs in bridge inventory. Every client
+kept its session ID and uptime. No sampled CPU value reached 100%.
+
+The tradeoff is completion time: the two paced tables took about 69 seconds,
+compared with about six seconds for the burst. Billing counters use separate
+feeds, and the worker keeps posting and refreshing its lease between pages.
+This is evidence for the tested workload, not a universal 1–2% overhead ceiling
+or a certification of maximum simultaneous customer capacity.

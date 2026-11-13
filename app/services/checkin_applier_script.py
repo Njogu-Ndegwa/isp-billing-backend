@@ -69,6 +69,7 @@ from __future__ import annotations
 import re
 
 from app.services.router_script_gate import with_gate
+from app.services.checkin_tunnel_transport import prefer_tunnel_transport
 from app.services.usage_push_auth import derive_checkin_token
 
 SCRIPT_NAME = "bitwave-checkin"
@@ -434,6 +435,7 @@ def render_checkin_applier_source(
     identity: str,
     endpoint_url: str,
     check_certificate: str = "no",
+    tunnel_endpoint_url: str | None = None,
 ) -> str:
     """Return the ``source`` of the ``bitwave-checkin`` system script.
 
@@ -447,7 +449,7 @@ def render_checkin_applier_source(
     if check_certificate not in CHECK_CERTIFICATE_VALUES:
         raise ValueError(f"checkin applier: check_certificate must be one of {CHECK_CERTIFICATE_VALUES}")
     token = derive_checkin_token(identity)
-    return with_gate(SCRIPT_NAME, (
+    source = with_gate(SCRIPT_NAME, (
         _TEMPLATE
         .replace("__URL__", endpoint_url)
         .replace("__TOKEN__", token)
@@ -457,6 +459,7 @@ def render_checkin_applier_source(
         .replace("__CHECKCERT__", check_certificate)
         .replace("__OCAP__", str(int(MAX_OTHER_MACS)))
     ))
+    return prefer_tunnel_transport(source, tunnel_endpoint_url) if tunnel_endpoint_url else source
 
 
 def scheduler_on_event() -> str:
@@ -486,6 +489,7 @@ def install_checkin_applier(
     identity: str,
     endpoint_url: str,
     check_certificate: str = "no",
+    tunnel_endpoint_url: str | None = None,
 ) -> dict:
     """Install or update the applier script + scheduler. Idempotent.
 
@@ -498,6 +502,7 @@ def install_checkin_applier(
     """
     source = render_checkin_applier_source(
         identity=identity, endpoint_url=endpoint_url, check_certificate=check_certificate,
+        tunnel_endpoint_url=tunnel_endpoint_url,
     )
     changed = False
     res: dict = {}

@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     # /complete), once their encrypted management tunnel answers. hAP lite/mini
     # are skipped. False = switch off (existing routers are unaffected).
     REALTIME_PUSH_INSTALL_AT_SETUP: bool = True
+    # When a router comes back online, re-add the missing PPPoE secrets of its
+    # active customers and remove secrets left by deleted/moved customers
+    # (app/services/pppoe_resync.py). False = switch the sweep off.
+    PPPOE_RECOVERY_SWEEP_ENABLED: bool = True
+    # Opt-in only: selected RB951s whose exact reporter source was reviewed.
+    NATIVE_STREAM_ROUTER_IDS: str = ""
+    NATIVE_STREAM_REPORTER_HASHES: str = ""
+    NATIVE_STREAM_GRACEFUL_HANDOFF: bool = False
     # Router expiry reaper (app/services/expiry_reaper_script.py): tried in this
     # order. The tunnel one is plain HTTP inside the management tunnel (Caddy's
     # 10.251.0.1:8088 site); public HTTPS costs a hAP lite ~5-7 s of full CPU.
@@ -103,6 +111,9 @@ class Settings(BaseSettings):
     # Where the applier posts. Public HTTPS (through Cloudflare): it keeps
     # working when the management tunnel is down, which is the point.
     CHECKIN_ENDPOINT_URL: str = "https://isp.bitwavetechnologies.net/api/router/checkin"
+    # Explicit transport pilot; this does not enroll routers for check-in.
+    CHECKIN_TUNNEL_ROUTER_IDS: str = ""
+    CHECKIN_TUNNEL_ENDPOINT_URL: str = "http://10.251.0.1:8088/api/router/checkin"
     CHECKIN_MODE: str = "shadow"
     CHECKIN_KILL_SWITCH: bool = False
     CHECKIN_MAX_LINES_PER_REPLY: int = 10
@@ -156,6 +167,12 @@ class Settings(BaseSettings):
     STANDARD_RUNTIME_BATCH: int = 5
     STANDARD_RUNTIME_INSTALL_CHECKIN: bool = True
     STANDARD_RUNTIME_INSTALL_WATCHDOG: bool = True
+    # Who may use remote access-point control (app/services/ap_control.py):
+    #   "admins" (default) -> Bitwave platform admins only, so the feature can
+    #     ship and be tested in the live dashboard without exposing it to
+    #     resellers before the Tenda protocol is bench-confirmed;
+    #   "all" -> every owner/staff who already has routers.view / routers.manage.
+    AP_CONTROL_ENABLED_FOR: str = "admins"
     DB_POOL_SIZE: int = 15
     DB_MAX_OVERFLOW: int = 15
     DB_POOL_TIMEOUT: int = 10
@@ -174,6 +191,9 @@ class Settings(BaseSettings):
     # "today" on a dashboard means the local calendar day (00:00 EAT -> now),
     # not a rolling 24h window. Kenya/EAT = UTC+3 and has no DST.
     LOCAL_UTC_OFFSET_HOURS: int = 3
+    # Local hour (0-23, in LOCAL_UTC_OFFSET_HOURS time) at which plans with
+    # fup_period='daily' start a fresh daily allowance. 0 = local midnight.
+    FUP_DAILY_RESET_HOUR: int = 0
     SECRET_KEY: str = "your-secret-key-change-in-production"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
@@ -190,6 +210,11 @@ class Settings(BaseSettings):
     # default: it is router I/O across the fleet. The per-customer "pull router
     # logs" button works either way.
     CUSTOMER_LOG_COLLECTOR_ENABLED: bool = False
+    # When a new device enters a full shared plan's code, free one slot held by a
+    # randomized MAC unseen for this many days (minimum 7) and not on the Wi-Fi now.
+    # See app/services/shared_slot_release.py.
+    SHARED_SLOT_IDLE_RELEASE_ENABLED: bool = False
+    SHARED_SLOT_IDLE_RELEASE_DAYS: int = 7
     CUSTOMER_LOG_COLLECTOR_ROUTERS_PER_TICK: int = 4
     # A router is read at most this often by the collector.
     CUSTOMER_LOG_COLLECTOR_MIN_REVISIT_SECONDS: int = 900
@@ -239,11 +264,38 @@ class Settings(BaseSettings):
     # for v6 bootstrap only.
     PROVISION_LEGACY_BASE_URL: str = ""
     L2TP_IPSEC_PSK: str = "BitwaveL2TP2026!Secure"
+    # Vercel anycast ranges the hotspot portal is served from. Provisioning puts
+    # them in the router's isp_portal_allow address list (with the backend IPs),
+    # the only destinations the hotspot's transparent proxy may still relay to
+    # once ISP_BILLING_PROXY_RELAY_BLOCK is in place (HTTP Injector fix).
+    # Comma-separated CIDRs.
+    HOTSPOT_PORTAL_ALLOW_CIDRS: str = "216.198.79.0/24,64.29.17.0/24,76.76.21.0/24"
 
     # Access credential idle reaper: minutes a bound MAC can be unseen on the
     # router's hotspot host table before the credential is auto-released so
     # another device can use it.
     ACCESS_CRED_IDLE_RELEASE_MINUTES: int = 15
+
+    # PPPoE expired redirect (app/services/pppoe_expired_redirect.py), per-router
+    # opt-in. Expired customers reconnect into a walled profile; plain HTTP is
+    # redirected to this page and everything else outside the allow-list is
+    # rejected. The page must be HTTPS (port 80 is what gets redirected).
+    PPPOE_EXPIRED_PORTAL_URL: str = "https://isp-frontend-two.vercel.app/expired.html"
+    # Hosts the walled customer may still reach: the portal and the API hosts it
+    # calls. RouterOS resolves FQDN address-list entries itself.
+    PPPOE_EXPIRED_ALLOW_HOSTS: str = (
+        "isp-frontend-two.vercel.app,isp.bitwavetechnologies.com,"
+        "isp.bitwavetechnologies.net,ispp.bitwavetechnologies.com"
+    )
+    # Vercel edge ranges (same list the hotspot anti-tunnel allow-list uses), so
+    # the portal still loads when a phone resolves it to another edge IP.
+    PPPOE_EXPIRED_ALLOW_CIDRS: str = "216.198.79.0/24,64.29.17.0/24,76.76.21.0/24"
+    PPPOE_EXPIRED_RATE_LIMIT: str = "512k/1M"
+    # Port the router's web proxy listens on when we enable it (an already
+    # enabled proxy keeps its own port). One ISP's routers used 3346 too.
+    PPPOE_EXPIRED_PROXY_PORT: int = 3346
+    # DNS handed to walled CPEs when the router's PPPoE profile names none.
+    PPPOE_EXPIRED_DNS: str = "8.8.8.8,1.1.1.1"
 
     # Secondary/insurance WireGuard endpoint. The old app can use these values
     # to add a backup tunnel to an existing router while normal operations keep
@@ -326,6 +378,16 @@ class Settings(BaseSettings):
     FEEDBACK_REPLY_MODEL: str = "claude-opus-4-8"
     FEEDBACK_DAILY_POST_CAP: int = 15
 
+    # --- Support desk snapshot (platform admin only) ----------------------
+    # Dennis's laptop builds the WhatsApp support dashboard JSON and POSTs it
+    # to /api/admin/support-desk/snapshot with this bearer token. Empty (the
+    # default) or shorter than SUPPORT_DESK_INGEST_TOKEN_MIN_LENGTH means the
+    # ingest endpoint is disabled and answers 503. Server env only, never
+    # committed. Generate with: openssl rand -hex 32
+    SUPPORT_DESK_INGEST_TOKEN: str = ""
+    SUPPORT_DESK_INGEST_TOKEN_MIN_LENGTH: int = 32
+    SUPPORT_DESK_SNAPSHOT_MAX_BYTES: int = 2 * 1024 * 1024
+
     # --- Transactional email (password reset) ----------------------------
     # Credentials live in the server .env only — never committed.
     # SMTP is preferred when SMTP_HOST is set (e.g. smtp.gmail.com + app
@@ -396,6 +458,22 @@ class Settings(BaseSettings):
         "mongo0 (10.0.1.129)=i-0dd1b03899e0bb058"
     )
     OVES_HEALTH_PROBE_TIMEOUT_SECONDS: float = 10.0
+    # Apollo GraphOS insights (errors + error rate per operation, like Studio):
+    # comma-separated "Graph-Id=service:Graph-Id:..." -- each subgraph's own
+    # key, as in its deployment-charts APOLLO_KEY. Empty = GraphQL tab off.
+    OVES_APOLLO_GRAPH_KEYS: str = ""
+
+    # Ad media (hero ad photos and videos) on Cloudflare R2, uploaded straight
+    # from the browser with a presigned PUT so the bytes never pass through
+    # this box (its container filesystem is read-only anyway). Served to
+    # portals from AD_MEDIA_PUBLIC_BASE, which must be a host already in every
+    # router's walled garden, e.g. https://isp.bitwavetechnologies.com/media
+    # routed to the bucket by Cloudflare. Any value empty = uploads disabled.
+    R2_ACCOUNT_ID: str = ""
+    R2_ACCESS_KEY_ID: str = ""
+    R2_SECRET_ACCESS_KEY: str = ""
+    R2_BUCKET: str = ""
+    AD_MEDIA_PUBLIC_BASE: str = ""
 
     class Config:
         env_file = ".env"

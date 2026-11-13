@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 MODE_ROUTER = "router"
 MODE_SERVER = "server"
+OPERATOR_PAUSE_PREFIX = "operator pause:"
 
 # Board names / RouterBOARD models that stay on server-side removal.
 SMALL_BOARD_MARKERS = ("hap lite", "rb941", "hap mini", "rb931")
@@ -169,6 +170,10 @@ async def load_candidates(now: datetime, limit: int, only_id: Optional[int] = No
         )).all()
         picked = []
         for r in rows:
+            # A deliberate support pause lasts until an operator clears it;
+            # neither the periodic job nor the setup callback may undo it.
+            if (r.expiry_reaper_reason or "").startswith(OPERATOR_PAUSE_PREFIX):
+                continue
             if r.auth_method == RouterAuthMethod.RADIUS:
                 continue
             owner = getattr(r.subscription_status, "value", r.subscription_status)
@@ -286,6 +291,15 @@ def probe_and_install_sync(c: Candidate) -> Outcome:
         ident = _first(api, "/system/identity/print").get("name")
         if ident != c.identity:
             return Outcome(c.id, None, f"identity mismatch: router says {ident}")
+        schedulers = api.send_command("/system/scheduler/print", {
+            ".proplist": "name,disabled",
+        })
+        if schedulers.get("error"):
+            return Outcome(c.id, None, "scheduler read failed")
+        if any(s.get("name") == SCHEDULER_NAME and s.get("disabled") == "true"
+               for s in schedulers.get("data") or []):
+            return Outcome(c.id, MODE_SERVER,
+                           OPERATOR_PAUSE_PREFIX + " expiry scheduler disabled")
         res = _first(api, "/system/resource/print")
         board = res.get("board-name") or ""
         version = res.get("version") or ""

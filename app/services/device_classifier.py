@@ -26,20 +26,39 @@ DEVICE_CLASS_CUSTOMER = "customer"
 # extend freely as new vendor hardware shows up in the field.
 # ---------------------------------------------------------------------------
 INFRASTRUCTURE_OUI_VENDORS: Dict[str, str] = {
-    # Tenda
+    # Tenda — every MA-L block the IEEE registry assigns to Tenda (both
+    # "SHEN ZHEN TENDA TECHNOLOGY" and "Tenda Technology ... Dongguan branch"),
+    # audited against standards-oui.ieee.org/oui/oui.txt on 2026-10-26.
+    # 50:0F:F5 and 8C:44:BB were previously mislabelled "TP-Link", which made
+    # the Ports panel call a reseller's Tenda AP a "TP-Link AP" (Fastnet,
+    # router 647). FC:AA:B6 was removed: IEEE assigns it to Samsung, so it
+    # mislabelled Samsung phones as Tenda equipment (the Major1 AP it was added
+    # for still matches through its "Tenda" lease hostname).
     "B40F3B": "Tenda",
     "C83A35": "Tenda",
     "58D9D5": "Tenda",
     "D83214": "Tenda",
     "0495E6": "Tenda",
     "502B73": "Tenda",
-    "FCAAB6": "Tenda",
+    "500FF5": "Tenda",
+    "8C44BB": "Tenda",
+    "0840F3": "Tenda",
+    "0C8509": "Tenda",
+    "186FA7": "Tenda",
+    "50DA9E": "Tenda",
+    "74DDF0": "Tenda",
+    "809FE4": "Tenda",
+    "8C0528": "Tenda",
+    "AC4E74": "Tenda",
+    "B0DFC1": "Tenda",
+    "B83A08": "Tenda",
+    "BC6C96": "Tenda",
+    "CC2D21": "Tenda",
+    "E865D4": "Tenda",
     # TP-Link
-    "8C44BB": "TP-Link",
     "50C7BF": "TP-Link",
     "D807B6": "TP-Link",
     "F4EC38": "TP-Link",
-    "500FF5": "TP-Link",
     "EC086B": "TP-Link",
     "14CC20": "TP-Link",
     "60E327": "TP-Link",
@@ -49,10 +68,17 @@ INFRASTRUCTURE_OUI_VENDORS: Dict[str, str] = {
     "C03A55": "TP-Link",  # EAP110-Outdoor
     "306893": "TP-Link",  # EAP110-Outdoor
     "B04E26": "TP-Link",  # TL-WR840N
-    # Mercusys (TP-Link sub-brand)
-    "B83A34": "Mercusys",
-    # Cudy (Shenzhen Cudy Technology)
+    # Mercusys (TP-Link sub-brand) — all IEEE blocks for MERCUSYS TECHNOLOGIES.
+    # The old B8:3A:34 entry is not assigned to anyone in the IEEE registry.
+    "00EBD8": "Mercusys",
+    "088AF1": "Mercusys",
+    "0C1C31": "Mercusys",
+    "30169D": "Mercusys",
+    "94742E": "Mercusys",
+    "FCCA10": "Mercusys",
+    # Cudy (Shenzhen Cudy Technology) — both IEEE blocks
     "80AFCA": "Cudy",
+    "D40DAB": "Cudy",
     # TOTOLINK (manufactured by Zioncom Electronics)
     "784476": "TOTOLINK",
     # Ubiquiti

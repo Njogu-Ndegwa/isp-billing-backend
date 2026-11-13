@@ -134,6 +134,7 @@ class UsageReportIn(BaseModel):
     target_ip: str = Field(default="", max_length=64)
     max_limit: str = Field(default="", max_length=64)
     disabled: bool = False
+    sampled_at: Optional[datetime] = None
 
 
 class HostReportIn(BaseModel):
@@ -147,6 +148,7 @@ class HostReportIn(BaseModel):
     authorized: bool = False
     idle_time: str = Field(default="", max_length=32)
     uptime: str = Field(default="", max_length=32)
+    sampled_at: Optional[datetime] = None
 
 
 class PppActiveIn(BaseModel):
@@ -365,6 +367,7 @@ async def receive_usage_push(
                     queue_name=item.queue_name,
                     target_ip=item.target_ip,
                     max_limit=item.max_limit,
+                    sampled_at=item.sampled_at,
                 )
                 for item in payload.reports
             ] + ([
@@ -374,11 +377,15 @@ async def receive_usage_push(
                     download_bytes=host.bytes_out,
                     target_ip=host.ip,
                     source="host",
+                    sampled_at=host.sampled_at,
                 )
                 for host in payload.hosts
             ] if pilot else []),
             router_metrics=metrics,
             meter_hotspot_by_host=pilot and "hosts" in payload.model_fields_set,
+            pppoe_session_users={
+                p.address.split("/", 1)[0]: p.name for p in payload.ppp if p.address and p.name
+            },
         )
 
     if result.customers_resolved:
@@ -404,7 +411,7 @@ async def receive_usage_push(
                     payload.router is not None
                     and payload.router.pppoe_active > len(payload.ppp)
                 ),
-                hosts=([h.model_dump() for h in payload.hosts]
+                hosts=([h.model_dump(exclude={"sampled_at"}) for h in payload.hosts]
                        if "hosts" in payload.model_fields_set else None),
                 live_hotspot_customers=result.live_hotspot_customers,
             )
@@ -437,7 +444,7 @@ async def receive_usage_push(
 
     if pilot:
         _record_live_state(router_row.id, payload, result, via_tunnel)
-        _spawn(_enforce_caps(result.over_cap_customer_ids))
+        _spawn(_enforce_caps(result.over_cap_customer_ids + result.release_fup_customer_ids))
 
     if result.over_cap_customer_ids:
         # Enforcement does RouterOS I/O, so it must not run inside this request
@@ -504,6 +511,7 @@ def _record_live_state(router_id: int, payload: UsagePushIn, result, via_tunnel:
             for p in payload.ppp
         ],
         live_pppoe_customers=result.live_pppoe_customers,
+        live_static_customers=result.live_static_customers,
         has_hosts="hosts" in payload.model_fields_set,
         ports=[p.model_dump() for p in payload.ports] if payload.ports is not None else None,
         bridge_hosts=[b.model_dump() for b in payload.bridge_hosts] if payload.bridge_hosts is not None else None,
@@ -511,7 +519,7 @@ def _record_live_state(router_id: int, payload: UsagePushIn, result, via_tunnel:
         leases=[x.model_dump() for x in payload.leases] if payload.leases is not None else None,
         neighbors=[x.model_dump() for x in payload.neighbors] if payload.neighbors is not None else None,
         bridge_ports=[x.model_dump() for x in payload.bridge_ports] if payload.bridge_ports is not None else None,
-        hosts_raw=[h.model_dump() for h in payload.hosts],
+        hosts_raw=[h.model_dump(exclude={"sampled_at"}) for h in payload.hosts],
         ppp_raw=[p.model_dump() for p in payload.ppp],
     )
     running = (

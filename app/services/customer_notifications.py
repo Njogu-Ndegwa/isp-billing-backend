@@ -45,6 +45,7 @@ from app.services import customer_sms_templates as templates
 from app.services.customer_expiry_notifications import (
     can_pay_for_sms_clause,
     create_customer_campaign,
+    is_hotspot_customer,
     is_textable_phone,
     reseller_support_phone,
     resolve_paybills,
@@ -75,10 +76,7 @@ def _pool_is_busy() -> bool:
     return level in {"warning", "critical"}
 
 
-def _is_hotspot(connection_type, pppoe_username: str | None) -> bool:
-    if connection_type is not None:
-        return connection_type == ConnectionType.HOTSPOT
-    return not pppoe_username
+_is_hotspot = is_hotspot_customer
 
 
 # ---------------------------------------------------------------------------

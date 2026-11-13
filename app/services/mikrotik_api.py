@@ -5,7 +5,7 @@ import hashlib
 import logging
 import time
 import ipaddress
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 from decimal import Decimal
 import json  # Ensure you import json for serializing logs
@@ -21,6 +21,11 @@ logger.setLevel(logging.WARNING)  # Reduce noise, only warnings/errors
 QUEUE_FASTTRACK_BYPASS_LIST = "isp_queue_limited_clients"
 QUEUE_FASTTRACK_BYPASS_SRC_COMMENT = "ISP_BILLING_QUEUE_BYPASS_SRC"
 QUEUE_FASTTRACK_BYPASS_DST_COMMENT = "ISP_BILLING_QUEUE_BYPASS_DST"
+
+# Plain (no-auth) ports: bridge-plain must be trusted for DHCP/DNS on input,
+# or the defconf "drop all not coming from LAN" rule starves its clients.
+PLAIN_TRUST_COMMENT = "ISP_BILLING_PLAIN_TRUST"
+PLAIN_TRUST_INPUT_RULES = (("udp", "67-68"), ("udp", "53"), ("tcp", "53"))
 
 DUAL_BRIDGE_NAME = "bridge-dual"
 DUAL_BRIDGE_IP = "192.168.91.1/24"
@@ -43,6 +48,53 @@ PPPOE_SUBNET_CANDIDATES = ("192.168.89", "192.168.189", "192.168.199", "172.16.8
 DEFAULT_PPPOE_KEEPALIVE_TIMEOUT = "10"
 DEFAULT_PPPOE_ONE_SESSION_PER_HOST = "yes"
 DEFAULT_PPPOE_PROFILE_ONLY_ONE = "yes"
+
+# Profiles for customers allowed several devices on one PPPoE login end in
+# "_d<N>" (pppoe_10M_10M_d3, fup-2M_2M_d3): only-one=no plus an on-up script
+# that drops any session beyond N. The access-defaults re-stamp of only-one=yes
+# must leave them alone.
+MULTI_DEVICE_PROFILE_RE = re.compile(r"_d(?P<n>\d{1,2})$")
+
+
+def multi_device_profile_suffix(max_devices: int) -> str:
+    """Profile-name suffix for a device limit; empty for a single device."""
+    return f"_d{int(max_devices)}" if int(max_devices or 1) > 1 else ""
+
+
+def multi_device_profile_kwargs(max_devices: int) -> dict:
+    """Extra ``ensure_pppoe_profile`` arguments for a device limit; none for one device."""
+    n = int(max_devices or 1)
+    if n <= 1:
+        return {}
+    return {"only_one": "no", "on_up": multi_device_on_up_script(n)}
+
+
+def is_multi_device_profile(profile_name: str) -> bool:
+    return bool(MULTI_DEVICE_PROFILE_RE.search(profile_name or ""))
+
+
+def multi_device_on_up_script(max_devices: int) -> str:
+    """RouterOS on-up script that keeps a username to ``max_devices`` sessions.
+
+    Runs when a session comes up. If the username now has more sessions than
+    allowed, the newest one (lowest uptime) is removed, so devices already
+    online keep working. Picking the newest rather than "my own session"
+    means two devices finishing login in the same second both choose the
+    same session to drop, instead of both kicking themselves. The refused
+    device sees its dial fail and retries.
+    """
+    n = int(max_devices)
+    return (
+        ':local ids [/ppp active find where name=$user]; '
+        f':if ([:len $ids] > {n}) do={{ '
+        ':local newest; :local best; '
+        ':foreach i in=$ids do={ :local up [/ppp active get $i uptime]; '
+        ':if (([:typeof $best] = "nothing") || ($up < $best)) do={ :set best $up; :set newest $i } }; '
+        f':log info ("bitwave: " . $user . " is at its {n}-device limit, dropping its newest session"); '
+        ':do { /ppp active remove $newest } on-error={} }'
+    )
+
+
 DEFAULT_HOTSPOT_KEEPALIVE_TIMEOUT = "2m"
 
 
@@ -76,12 +128,31 @@ def _whole_rate(number: str, unit: str) -> str:
     return f"{int(value.to_integral_value())}{unit}"
 
 
+# One side of a plan speed as resellers type it: a number, an optional unit
+# prefix, then any of the "per second" spellings seen in real plans:
+# 5M, 5MB, 5MBS, 5MBPS, 5MBIT, 5MBITS, 5MPS, 512K, 512KBPS, .5M. Matched on the
+# upper-cased, space-free text, after "/s" has been folded into "PS" by
+# ``_fold_per_second``. A unit-less number is Mbps (or raw bps in slash form).
+_PLAN_RATE_PART_RE = re.compile(
+    r'^(\d+(?:\.\d+)?|\.\d+)(?:(K|M|G)(?:B|BIT|BITS)?(?:PS|S)?|BPS)?$'
+)
+# "5mb/s", "5 Mbit/s", "2M/S": the "/s" means per second, not upload/download.
+_PER_SECOND_RE = re.compile(r'(?<=[KMGBT])\s*/\s*S(?![A-Z0-9])', re.IGNORECASE)
+# Fleet sanity cap: anything above 10 Gbit/s is a typo, not a plan speed.
+_MAX_PLAN_RATE_BPS = Decimal(10_000_000_000)
+_PLAN_UNIT_BPS = {"": 1, "K": 1_000, "M": 1_000_000, "G": 1_000_000_000}
+
+
+def _fold_per_second(text: str) -> str:
+    return _PER_SECOND_RE.sub("PS", text)
+
+
 def _normalize_mikrotik_rate_part(part: str, *, slash_context: bool = False) -> Optional[str]:
     value = str(part or "").strip().upper().replace(" ", "")
     if not value:
         return None
 
-    match = re.match(r'^(\d+(?:\.\d+)?)(K|M|G)?(?:BPS)?$', value)
+    match = _PLAN_RATE_PART_RE.match(value)
     if not match:
         return None
 
@@ -117,22 +188,84 @@ def parse_speed_to_mikrotik(speed: str) -> str:
     if not speed:
         return ""
 
-    speed_text = str(speed).strip()
+    parsed = try_parse_speed_to_mikrotik(speed)
+    if parsed:
+        return parsed
+
+    # Plan create/edit now rejects speeds this cannot read (see
+    # ``plan_speed_error``); only plans saved before that can still get here.
+    logger.warning(
+        f"[PLAN-SPEED] Could not parse speed '{speed}', using default 10M/10M; "
+        "edit the plan to a speed like 5M or 5M/2M"
+    )
+    return "10M/10M"
+
+
+def _rate_part_bps(rate: str) -> Decimal:
+    unit = rate[-1].upper() if rate and rate[-1].isalpha() else ""
+    number = rate[:-1] if unit else rate
+    return Decimal(number) * _PLAN_UNIT_BPS[unit]
+
+
+def try_parse_speed_to_mikrotik(speed: Optional[str]) -> Optional[str]:
+    """``parse_speed_to_mikrotik`` without the silent 10M/10M fallback.
+
+    Returns the RouterOS upload/download rate-limit, or None when the text is
+    not a speed (empty, words, more than one "/"). "0M/0M" is kept: RouterOS
+    reads 0 as unlimited and some PPPoE plans rely on it.
+    """
+    if speed is None:
+        return None
+    # A trailing "/" ("5M/5/") is a typo, not a third side.
+    speed_text = _fold_per_second(str(speed).strip()).rstrip("/").strip()
+    if not speed_text:
+        return None
+
     if "/" in speed_text:
-        download, upload = [part.strip() for part in speed_text.split("/", 1)]
+        parts = [part.strip() for part in speed_text.split("/")]
+        if len(parts) != 2:
+            return None
+        download, upload = parts
         normalized_download = _normalize_mikrotik_rate_part(download, slash_context=True)
         normalized_upload = _normalize_mikrotik_rate_part(upload, slash_context=True)
-        if normalized_upload and normalized_download:
-            return f"{normalized_upload}/{normalized_download}"
-        logger.warning(f"Could not parse speed '{speed}', using default 10M/10M")
-        return "10M/10M"
+        if not (normalized_upload and normalized_download):
+            return None
+        return f"{normalized_upload}/{normalized_download}"
 
     normalized = _normalize_mikrotik_rate_part(speed_text)
-    if normalized:
-        return f"{normalized}/{normalized}"
+    if not normalized:
+        return None
+    return f"{normalized}/{normalized}"
 
-    logger.warning(f"Could not parse speed '{speed}', using default 10M/10M")
-    return "10M/10M"
+
+PLAN_SPEED_HELP = "Use a speed like 5M or 5M/2M (download/upload)"
+
+
+def plan_speed_error(speed: Optional[str]) -> Optional[str]:
+    """The message to show a reseller whose plan speed cannot be read, or None."""
+    shown = str(speed or "").strip()
+    if not shown:
+        return f"Speed is required. {PLAN_SPEED_HELP}."
+    parsed = try_parse_speed_to_mikrotik(speed)
+    if not parsed:
+        return f"Speed '{shown}' is not recognised. {PLAN_SPEED_HELP}."
+    if any(_rate_part_bps(side) > _MAX_PLAN_RATE_BPS for side in parsed.split("/")):
+        return f"Speed '{shown}' is above 10 Gbps. {PLAN_SPEED_HELP}."
+    return None
+
+
+# What RouterOS says when the API user exists but the password (or name) is
+# wrong: "invalid user name or password (6)" on 6.43+ and 7, "cannot log in"
+# on older builds. login() puts it in last_connect_error after the TCP
+# connect succeeded, i.e. the router answered over the management tunnel.
+_CREDENTIALS_REJECTED_MARKERS = ("invalid user name or password", "cannot log in")
+
+
+def api_credentials_rejected(error: Optional[str]) -> bool:
+    """True when ``last_connect_error`` says the router refused our API
+    username/password (as opposed to a timeout, a refused port or a breaker)."""
+    err = str(error or "").lower()
+    return "api login rejected" in err and any(m in err for m in _CREDENTIALS_REJECTED_MARKERS)
 
 
 def _router_error_is_duplicate(error: str) -> bool:
@@ -566,7 +699,10 @@ class MikroTikAPI:
             error_msg = ""
             while True:
                 sentence = self.read_sentence()
-                logger.info(f"Raw sentence received for command {command}: {sentence}")  # Debug log
+                # /tool/fetch replies carry whatever the far end answered (an AP's
+                # settings page, for one), so they never go in the logs.
+                if command != "/tool/fetch":
+                    logger.info(f"Raw sentence received for command {command}: {sentence}")  # Debug log
                 if not sentence:
                     if not self.connected:
                         connection_lost = True
@@ -1073,11 +1209,26 @@ class MikroTikAPI:
     # A tethered device behind a phone hotspot arrives with TTL=63 or 127
     # because the phone already decremented it once.
     #
-    # We scope the raw rules to the hotspot interface(s) so we don't
-    # accidentally drop WAN or other traffic.
+    # Scope: only packets arriving on a hotspot server's interface. What that
+    # leaves alone, and why:
+    #   * PPPoE customers: their IP traffic arrives on dynamic pppoe-in
+    #     interfaces, never on the hotspot bridge, even on dual ports.
+    #   * Plain (no-auth) ports: moved to bridge-plain, not a hotspot iface.
+    #   * Management: WireGuard/SSTP/L2TP tunnels are their own interfaces,
+    #     and router-originated traffic (check-in, fetch) never hits
+    #     prerouting.
+    #   * Static-IP customers: they sit ON the hotspot LAN (bypassed by IP)
+    #     and are usually the customer's own router, so their devices arrive
+    #     with TTL 63. Every static IP is in the bitwave-static address list
+    #     (app/services/static_ip.py), which every rule excludes.
+    # MAC-bypassed ip-bindings are NOT exempt: a router-mode AP the reseller
+    # bypassed loses the devices behind it until it is put in AP/bridge mode.
     # ------------------------------------------------------------------
     ANTI_TETHER_COMMENT = "ISP_BILLING_ANTI_TETHERING"
     ANTI_TETHER_PACKET_MARK = "isp_tethered_traffic"
+    # Same list app/services/static_ip.py maintains (STATIC_ADDRESS_LIST);
+    # not imported because static_ip imports this module.
+    ANTI_TETHER_EXEMPT_SRC_LIST = "bitwave-static"
     ANTI_TETHER_TTL_MATCHES = ("equal:63", "equal:127", "equal:254")
     ANTI_TETHER_RAW_TTL_MODE = "raw-ttl-drop"
     ANTI_TETHER_STRICT_TTL_MODE = "ttl-marker-plus-return-ttl-clamp"
@@ -1156,6 +1307,7 @@ class MikroTikAPI:
                     "chain": "prerouting",
                     "action": "drop",
                     "in-interface": iface,
+                    "src-address-list": "!" + self.ANTI_TETHER_EXEMPT_SRC_LIST,
                     "ttl": ttl_match,
                     "comment": self.ANTI_TETHER_COMMENT,
                 }
@@ -1212,6 +1364,7 @@ class MikroTikAPI:
                         "new-packet-mark": self.ANTI_TETHER_PACKET_MARK,
                         "passthrough": "no",
                         "in-interface": iface,
+                        "src-address-list": "!" + self.ANTI_TETHER_EXEMPT_SRC_LIST,
                         "ttl": ttl_match,
                         "comment": self.ANTI_TETHER_COMMENT,
                     }
@@ -1228,6 +1381,7 @@ class MikroTikAPI:
                     "new-ttl": "set:1",
                     "passthrough": "yes",
                     "out-interface": iface,
+                    "dst-address-list": "!" + self.ANTI_TETHER_EXEMPT_SRC_LIST,
                     "comment": self.ANTI_TETHER_COMMENT,
                 }
                 if postrouting_insert_id:
@@ -2734,10 +2888,12 @@ class MikroTikAPI:
         dns_server: str = "",
         change_tcp_mss: str = "",
         only_one: str = DEFAULT_PPPOE_PROFILE_ONLY_ONE,
+        on_up: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Ensure a PPPoE profile exists with the specified rate limit.
-        Creates or updates /ppp/profile.
+        Creates or updates /ppp/profile. ``on_up`` (when given) replaces the
+        profile's on-up script; multi-device profiles use it for their limit.
         """
         if not self.connected:
             return {"error": "Not connected"}
@@ -2772,6 +2928,8 @@ class MikroTikAPI:
                 profile_args["change-tcp-mss"] = change_tcp_mss
             if only_one:
                 profile_args["only-one"] = only_one
+            if on_up is not None:
+                profile_args["on-up"] = on_up
 
             if profile_exists:
                 profile_args["numbers"] = profile_id
@@ -3316,12 +3474,17 @@ class MikroTikAPI:
             return {"error": str(e)}
 
     def add_pppoe_secret(self, username: str, password: str, profile: str,
-                         service: str = "pppoe", comment: str = "") -> Dict[str, Any]:
+                         service: str = "pppoe", comment: str = "",
+                         caller_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Add a PPPoE secret (customer credentials) on the router.
         If the secret already exists, update it instead. When password is blank
         or unknown, only an existing secret can be updated; its RouterOS password
         is preserved.
+
+        ``caller_id`` (PPPoE device lock, app/services/pppoe_device_lock.py):
+        None leaves the secret's caller-id as it is (a new secret gets none);
+        a MAC locks the login to that device; "" clears a lock.
         """
         if not self.connected:
             return {"error": "Not connected"}
@@ -3358,6 +3521,8 @@ class MikroTikAPI:
                 }
                 if comment:
                     update_args["comment"] = comment
+                if caller_id is not None:
+                    update_args["caller-id"] = caller_id
                 result = self.send_command("/ppp/secret/set", update_args)
                 if result.get("error"):
                     return result
@@ -3372,6 +3537,8 @@ class MikroTikAPI:
             }
             if comment:
                 args["comment"] = comment
+            if caller_id is not None:
+                args["caller-id"] = caller_id
 
             result = self.send_command("/ppp/secret/add", args)
             if "error" in result:
@@ -3391,6 +3558,8 @@ class MikroTikAPI:
                     }
                     if comment:
                         update_args["comment"] = comment
+                    if caller_id is not None:
+                        update_args["caller-id"] = caller_id
                     result = self.send_command("/ppp/secret/set", update_args)
                     logger.info(f"Updated existing PPPoE secret for '{username}'")
                 else:
@@ -3495,14 +3664,138 @@ class MikroTikAPI:
             logger.error(f"Error getting active PPPoE sessions: {e}")
             return {"error": str(e)}
 
-    def get_pppoe_sessions_with_bandwidth(self) -> Dict[str, Any]:
-        """Get active PPPoE sessions enriched with per-user bandwidth from dynamic queues.
+    @staticmethod
+    def _queue_targets(queue: dict) -> Tuple[set, set]:
+        """Split a simple queue's ``target`` into (IP addresses, interface names).
 
-        MikroTik creates dynamic simple queues named ``<pppoe-USERNAME>`` for
-        each PPPoE user whose PPP profile has a rate-limit set.  This method
-        joins ``/ppp/active/print`` with ``/queue/simple/print`` to return
-        live upload/download byte counters and current rate for every online
-        PPPoE user.
+        Dynamic PPPoE queues on the fleet target the session interface
+        (``<pppoe-alice>``) on RouterOS 6 and 7 alike; hand-made queues
+        target an address (``192.168.89.10/32``).
+        """
+        ips, interfaces = set(), set()
+        for target in (queue.get("target") or "").split(","):
+            target = target.strip()
+            if not target:
+                continue
+            try:
+                ips.add(str(ipaddress.ip_address(target.split("/")[0])))
+            except ValueError:
+                interfaces.add(target)
+        return ips, interfaces
+
+    @staticmethod
+    def _pppoe_queue_indexes(queues: List[dict]) -> Tuple[Dict[str, dict], Dict[str, dict]]:
+        """Index ``<pppoe-…>`` dynamic queues by target and by queue name.
+
+        One username can hold several sessions at once (a profile with
+        ``only-one=no``); each session gets its own dynamic queue, so the
+        session's own interface or address is the reliable join key. The
+        name index is the fallback for when neither is known.
+        """
+        by_target: Dict[str, dict] = {}
+        by_name: Dict[str, dict] = {}
+        for q in queues:
+            qname = q.get("name", "")
+            if not (qname.startswith("<pppoe-") and qname.endswith(">")):
+                continue
+            by_name.setdefault(qname[7:-1], q)
+            ips, interfaces = MikroTikAPI._queue_targets(q)
+            for target in ips | interfaces:
+                by_target[target] = q
+        return by_target, by_name
+
+    @staticmethod
+    def _pppoe_interface_key(user: str, mac: str) -> Tuple[str, str]:
+        return (user or "", (mac or "").upper())
+
+    def _pppoe_session_interfaces(self, username: Optional[str] = None) -> Dict[Tuple[str, str], str]:
+        """Map (username, caller MAC) to the session's ``<pppoe-…>`` interface.
+
+        ``/ppp/active`` does not name the interface; ``/interface/pppoe-server``
+        does, and its ``user`` + ``remote-address`` identify the session. A
+        failed read returns {} and matching falls back to the queue name.
+        """
+        try:
+            result = self.send_command_optimized(
+                "/interface/pppoe-server/print",
+                proplist=["name", "user", "remote-address"],
+                query=f"?user={username}" if username else None,
+            )
+        except Exception:
+            return {}
+        if not result.get("success"):
+            return {}
+        return {
+            self._pppoe_interface_key(row.get("user"), row.get("remote-address")): row["name"]
+            for row in result.get("data", [])
+            if row.get("name")
+        }
+
+    @staticmethod
+    def _pppoe_session_with_queue(
+        session: dict,
+        by_target: Dict[str, dict],
+        by_name: Dict[str, dict],
+        interfaces: Optional[Dict[Tuple[str, str], str]] = None,
+    ) -> Dict[str, Any]:
+        """Shape one ``/ppp/active`` row and attach the queue that belongs to it."""
+        user = session.get("name", "")
+        address = session.get("address", "")
+        interface = (interfaces or {}).get(
+            MikroTikAPI._pppoe_interface_key(user, session.get("caller-id"))
+        )
+        q = None
+        for key in (interface, address):
+            if key and key in by_target:
+                q = by_target[key]
+                break
+        if q is None:
+            q = by_name.get(user, {})
+            # A name match aimed at another session's address or interface is
+            # that session's queue, not ours.
+            target_ips, target_interfaces = MikroTikAPI._queue_targets(q)
+            if address and target_ips and address not in target_ips:
+                q = {}
+            elif interface and target_interfaces and interface not in target_interfaces:
+                q = {}
+
+        bytes_str = q.get("bytes", "0/0")
+        parts = bytes_str.split("/")
+        upload_bytes = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+        download_bytes = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+
+        rate_str = q.get("rate", "0/0")
+        rate_parts = rate_str.split("/")
+        upload_rate = rate_parts[0] if len(rate_parts) > 0 else "0"
+        download_rate = rate_parts[1] if len(rate_parts) > 1 else "0"
+
+        return {
+            "id": session.get(".id", ""),
+            "user": user,
+            "service": session.get("service", ""),
+            "caller_id": session.get("caller-id", ""),
+            "address": address,
+            "uptime": session.get("uptime", ""),
+            "encoding": session.get("encoding", ""),
+            "session_id": session.get("session-id", ""),
+            "upload_bytes": upload_bytes,
+            "download_bytes": download_bytes,
+            "upload_rate": upload_rate,
+            "download_rate": download_rate,
+            "max_limit": q.get("max-limit", ""),
+            "has_queue": bool(q),
+        }
+
+    def get_pppoe_sessions_with_bandwidth(self) -> Dict[str, Any]:
+        """Get active PPPoE sessions enriched with per-session bandwidth from dynamic queues.
+
+        MikroTik creates a dynamic simple queue named ``<pppoe-USERNAME>`` for
+        each PPPoE session whose PPP profile has a rate-limit set, targeted at
+        the session interface.  This method joins ``/ppp/active/print`` with
+        ``/queue/simple/print`` through that interface to return live
+        upload/download byte counters and current rate for every online
+        session — one row per session, so a username logged in on several
+        devices appears several times.
         """
         if not self.connected:
             return {"error": "Not connected"}
@@ -3516,50 +3809,22 @@ class MikroTikAPI:
                 proplist=[".id", "name", "target", "max-limit", "rate", "bytes",
                           "queued-bytes", "dynamic", "disabled"],
             )
-            queue_map: Dict[str, dict] = {}
-            for q in queue_result.get("data", []) if queue_result.get("success") else []:
-                qname = q.get("name", "")
-                if qname.startswith("<pppoe-") and qname.endswith(">"):
-                    username = qname[7:-1]
-                    queue_map[username] = q
+            by_target, by_name = self._pppoe_queue_indexes(
+                queue_result.get("data", []) if queue_result.get("success") else []
+            )
+            interfaces = self._pppoe_session_interfaces()
 
-            sessions = []
-            for session in active.get("data", []):
-                user = session.get("name", "")
-                q = queue_map.get(user, {})
-
-                bytes_str = q.get("bytes", "0/0")
-                parts = bytes_str.split("/")
-                upload_bytes = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
-                download_bytes = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-
-                rate_str = q.get("rate", "0/0")
-                rate_parts = rate_str.split("/")
-                upload_rate = rate_parts[0] if len(rate_parts) > 0 else "0"
-                download_rate = rate_parts[1] if len(rate_parts) > 1 else "0"
-
-                sessions.append({
-                    "user": user,
-                    "service": session.get("service", ""),
-                    "caller_id": session.get("caller-id", ""),
-                    "address": session.get("address", ""),
-                    "uptime": session.get("uptime", ""),
-                    "encoding": session.get("encoding", ""),
-                    "session_id": session.get("session-id", ""),
-                    "upload_bytes": upload_bytes,
-                    "download_bytes": download_bytes,
-                    "upload_rate": upload_rate,
-                    "download_rate": download_rate,
-                    "max_limit": q.get("max-limit", ""),
-                    "has_queue": bool(q),
-                })
+            sessions = [
+                self._pppoe_session_with_queue(session, by_target, by_name, interfaces)
+                for session in active.get("data", [])
+            ]
             return {"success": True, "data": sessions, "count": len(sessions)}
         except Exception as e:
             logger.error(f"Error getting PPPoE sessions with bandwidth: {e}")
             return {"error": str(e)}
 
-    def get_pppoe_session_with_bandwidth(self, username: str) -> Dict[str, Any]:
-        """Get one active PPPoE session, enriched with its dynamic queue if present."""
+    def get_pppoe_user_sessions_with_bandwidth(self, username: str) -> Dict[str, Any]:
+        """Get every active session for one PPPoE username, each with its own queue."""
         if not self.connected:
             return {"error": "Not connected"}
         try:
@@ -3580,61 +3845,54 @@ class MikroTikAPI:
             if not active.get("success"):
                 return active
 
-            session = next(
-                (s for s in active.get("data", []) if s.get("name") == username),
-                None,
-            )
-            if not session:
-                return {"success": True, "found": False, "data": None}
+            rows = [s for s in active.get("data", []) if s.get("name") == username]
+            if not rows:
+                return {"success": True, "data": [], "count": 0}
 
-            queue_result = self.send_command_optimized(
-                "/queue/simple/print",
-                proplist=[".id", "name", "target", "max-limit", "rate", "bytes", "dynamic", "disabled"],
-                query=f"?name=<pppoe-{username}>",
-            )
-            q = {}
-            if queue_result.get("success"):
-                q = next(
-                    (
-                        queue
-                        for queue in queue_result.get("data", [])
-                        if queue.get("name") == f"<pppoe-{username}>"
-                    ),
-                    {},
+            interfaces = self._pppoe_session_interfaces(username)
+            # A dynamic queue is named after the interface it targets, so the
+            # session interfaces find every session's queue, extras included.
+            queue_names = {f"<pppoe-{username}>"} | set(interfaces.values())
+            queue_proplist = [".id", "name", "target", "max-limit", "rate", "bytes", "dynamic", "disabled"]
+            queue_queries = [f"?name={name}" for name in sorted(queue_names)] + [
+                f"?target={s['address']}/32" for s in rows if s.get("address")
+            ]
+            queues: List[dict] = []
+            seen_ids: set = set()
+            for query in queue_queries:
+                queue_result = self.send_command_optimized(
+                    "/queue/simple/print", proplist=queue_proplist, query=query,
                 )
-
-            bytes_str = q.get("bytes", "0/0")
-            parts = bytes_str.split("/")
-            upload_bytes = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
-            download_bytes = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-
-            rate_str = q.get("rate", "0/0")
-            rate_parts = rate_str.split("/")
-            upload_rate = rate_parts[0] if len(rate_parts) > 0 else "0"
-            download_rate = rate_parts[1] if len(rate_parts) > 1 else "0"
-
-            return {
-                "success": True,
-                "found": True,
-                "data": {
-                    "user": username,
-                    "service": session.get("service", ""),
-                    "caller_id": session.get("caller-id", ""),
-                    "address": session.get("address", ""),
-                    "uptime": session.get("uptime", ""),
-                    "encoding": session.get("encoding", ""),
-                    "session_id": session.get("session-id", ""),
-                    "upload_bytes": upload_bytes,
-                    "download_bytes": download_bytes,
-                    "upload_rate": upload_rate,
-                    "download_rate": download_rate,
-                    "max_limit": q.get("max-limit", ""),
-                    "has_queue": bool(q),
-                },
-            }
+                if queue_result.get("success"):
+                    for q in queue_result.get("data", []):
+                        if q.get(".id") not in seen_ids:
+                            seen_ids.add(q.get(".id"))
+                            queues.append(q)
+            by_target, by_name = self._pppoe_queue_indexes(queues)
+            sessions = [
+                self._pppoe_session_with_queue(s, by_target, by_name, interfaces) for s in rows
+            ]
+            return {"success": True, "data": sessions, "count": len(sessions)}
         except Exception as e:
-            logger.error(f"Error getting PPPoE session with bandwidth for {username}: {e}")
+            logger.error(f"Error getting PPPoE sessions with bandwidth for {username}: {e}")
             return {"error": str(e)}
+
+    def get_pppoe_session_with_bandwidth(self, username: str) -> Dict[str, Any]:
+        """Get one active PPPoE session, enriched with its dynamic queue if present.
+
+        ``data`` is the first session; ``sessions`` carries all of them for
+        usernames logged in on more than one device.
+        """
+        result = self.get_pppoe_user_sessions_with_bandwidth(username)
+        if not result.get("success"):
+            return result
+        sessions = result.get("data", [])
+        return {
+            "success": True,
+            "found": bool(sessions),
+            "data": sessions[0] if sessions else None,
+            "sessions": sessions,
+        }
 
     def get_pppoe_secrets_minimal(self) -> Dict[str, Any]:
         """Fetch PPPoE secrets with essential fields."""
@@ -5034,6 +5292,9 @@ class MikroTikAPI:
                 )
 
             for profile_name in sorted(profile_names):
+                if is_multi_device_profile(profile_name):
+                    # Deliberately only-one=no: customers allowed several devices.
+                    continue
                 profile = self.send_command_optimized(
                     "/ppp/profile/print",
                     proplist=[".id", "name", "only-one"],
@@ -6238,6 +6499,8 @@ class MikroTikAPI:
                 if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
                     errors.append(f"NAT: {result['error']}")
 
+            errors.extend(self._ensure_plain_bridge_trusted(bridge_name))
+
             port_errors = []
             for port in target_ports:
                 current_bridge = bridge_map.get(port, "")
@@ -6269,6 +6532,88 @@ class MikroTikAPI:
         except Exception as e:
             logger.error(f"Error setting up plain infrastructure: {e}")
             return {"error": str(e), "partial_errors": errors}
+
+    def _ensure_plain_bridge_trusted(self, bridge_name: str = "bridge-plain") -> List[str]:
+        """Let plain-port devices reach the router's DHCP and DNS.
+
+        The defconf firewall drops input "not coming from LAN", so a new
+        bridge-plain that is not in the LAN interface list gets no DHCP lease.
+        If a LAN list exists, add bridge-plain to it (once). Otherwise add a
+        narrow input accept for DHCP (udp 67-68) and DNS (udp/tcp 53) from
+        bridge-plain, placed before the first input rule. Returns warnings.
+        """
+        lists = self.send_command("/interface/list/print")
+        if lists.get("error"):
+            return [f"Interface list: {lists['error']}"]
+        has_lan = any(
+            (item.get("name") or "") == "LAN" for item in lists.get("data") or []
+        )
+
+        if has_lan:
+            members = self.send_command("/interface/list/member/print")
+            if members.get("error"):
+                return [f"LAN list member: {members['error']}"]
+            if any(
+                m.get("list") == "LAN" and m.get("interface") == bridge_name
+                for m in members.get("data") or []
+            ):
+                return []
+            result = self.send_command("/interface/list/member/add", {
+                "list": "LAN",
+                "interface": bridge_name,
+                "comment": PLAIN_TRUST_COMMENT,
+            })
+            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                return [f"LAN list member: {result['error']}"]
+            logger.info(f"Plain infrastructure: added '{bridge_name}' to LAN interface list")
+            return []
+
+        filters = self.send_command("/ip/firewall/filter/print")
+        if filters.get("error"):
+            return [f"Plain input accept: {filters['error']}"]
+        rules = filters.get("data") or []
+        existing = {
+            (r.get("protocol"), r.get("dst-port"))
+            for r in rules
+            if r.get("comment") == PLAIN_TRUST_COMMENT and r.get("in-interface") == bridge_name
+        }
+        first_input_id = next(
+            (r.get(".id") for r in rules if r.get("chain") == "input" and r.get(".id")),
+            None,
+        )
+        warnings = []
+        for protocol, dst_port in PLAIN_TRUST_INPUT_RULES:
+            if (protocol, dst_port) in existing:
+                continue
+            args = {
+                "chain": "input",
+                "action": "accept",
+                "in-interface": bridge_name,
+                "protocol": protocol,
+                "dst-port": dst_port,
+                "comment": PLAIN_TRUST_COMMENT,
+            }
+            if first_input_id:
+                args["place-before"] = first_input_id
+            result = self.send_command("/ip/firewall/filter/add", args)
+            if result.get("error") and not _router_error_is_duplicate(result.get("error", "")):
+                warnings.append(f"Plain input accept {protocol}/{dst_port}: {result['error']}")
+        return warnings
+
+    def _remove_plain_bridge_trust(self, bridge_name: str = "bridge-plain") -> None:
+        """Undo _ensure_plain_bridge_trusted when the plain bridge is removed."""
+        members = self.send_command("/interface/list/member/print")
+        if members.get("success"):
+            for m in members.get("data") or []:
+                if m.get("list") == "LAN" and m.get("interface") == bridge_name and m.get(".id"):
+                    self.send_command("/interface/list/member/remove", {"numbers": m[".id"]})
+                    logger.info(f"Removed '{bridge_name}' from LAN interface list")
+
+        filters = self.send_command("/ip/firewall/filter/print")
+        if filters.get("success"):
+            for r in filters.get("data") or []:
+                if r.get("comment") == PLAIN_TRUST_COMMENT and r.get(".id"):
+                    self.send_command("/ip/firewall/filter/remove", {"numbers": r[".id"]})
 
     def teardown_plain_infrastructure(
         self,
@@ -6320,6 +6665,10 @@ class MikroTikAPI:
                         aid = addr.get(".id")
                         if aid:
                             self.send_command("/ip/address/remove", {"numbers": aid})
+
+            # Drop the LAN trust before the bridge goes, while the member still
+            # resolves by name (afterwards RouterOS shows it as an unknown *id).
+            self._remove_plain_bridge_trust(bridge_name)
 
             bridges = self.send_command("/interface/bridge/print")
             if bridges.get("success") and bridges.get("data"):

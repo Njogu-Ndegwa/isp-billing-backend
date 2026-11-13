@@ -18,6 +18,7 @@ from app.services.router_availability import record_router_availability, router_
 from app.services.monitor_liveness import clear_live_state, mark_snapshot_unverified
 
 import asyncio
+import re
 import logging
 
 logger = logging.getLogger(__name__)
@@ -115,29 +116,39 @@ def _pppoe_overview_sync(router_info: dict, db_pppoe_ports: list, db_dual_ports:
         # Dual-mode ports (PPPoE + Hotspot on same bridge)
         dual_port_checks = []
         has_dual = access_state.get("has_dual", False)
+        has_hotspot_bridge_pppoe = (
+            access_state.get("has_hotspot_bridge_pppoe", False)
+            if access_state.get("success") else False
+        )
         for port_name in (db_dual_ports or []):
             iface = ifaces.get(port_name, {})
             link_up = iface.get("running", False)
             actual_bridge = port_bridge_map.get(port_name)
             attachment = attachment_map.get(port_name, {})
+            shared_bridge_dual = actual_bridge == "bridge" and has_hotspot_bridge_pppoe
+            attachment_mode = (
+                "shared_hotspot_bridge" if shared_bridge_dual else attachment.get("mode", "none")
+            )
             dual_port_checks.append({
                 "port": port_name,
                 "mode": "dual",
                 "actual_bridge": actual_bridge or "(none)",
-                "pppoe_attachment_mode": attachment.get("mode", "none"),
-                "pppoe_server_on_bridge": has_dual and attachment.get("mode") == "dual",
+                "pppoe_attachment_mode": attachment_mode,
+                "pppoe_server_on_bridge": shared_bridge_dual or (
+                    has_dual and attachment_mode == "dual"
+                ),
                 "link_up": link_up,
             })
         if dual_port_checks:
             all_dual_ports_attached = all(
-                p["pppoe_attachment_mode"] == "dual"
+                p["pppoe_server_on_bridge"]
                 for p in dual_port_checks
             )
             any_dual_port_up = any(p["link_up"] for p in dual_port_checks)
             checks.append({
                 "check": "dual_ports",
-                "description": "Dual-mode ports (PPPoE + Hotspot) on the dual bridge",
-                "passed": has_dual and all_dual_ports_attached,
+                "description": "Dual-mode ports (PPPoE + Hotspot) attached correctly",
+                "passed": all_dual_ports_attached,
                 "any_port_up": any_dual_port_up,
                 "detail": dual_port_checks,
             })
@@ -393,8 +404,11 @@ def _pppoe_diagnose_sync(router_info: dict, username: str, db_pppoe_ports: list)
 
         active_data = api.get_active_pppoe_sessions()
         sessions = active_data.get("data", []) if active_data.get("success") else []
-        user_session = next((s for s in sessions if s.get("user") == username), None)
+        user_sessions = [s for s in sessions if s.get("user") == username]
+        user_session = user_sessions[0] if user_sessions else None
         info["active_session"] = user_session
+        info["active_sessions"] = user_sessions
+        info["session_count"] = len(user_sessions)
 
         if user_session:
             info["status"] = "online"
@@ -468,19 +482,23 @@ def _pppoe_secrets_sync(router_info: dict) -> dict:
         secrets = secrets_data.get("data", []) if secrets_data.get("success") else []
 
         active_data = api.get_active_pppoe_sessions()
-        active = {s["user"]: s for s in active_data.get("data", [])} if active_data.get("success") else {}
+        active = _group_sessions_by_user(
+            active_data.get("data", []) if active_data.get("success") else []
+        )
 
         profiles_data = api.get_ppp_profiles()
         profiles = {p["name"]: p for p in profiles_data.get("data", [])} if profiles_data.get("success") else {}
 
         enriched = []
         for s in secrets:
-            session = active.get(s["name"])
+            user_sessions = active.get(s["name"], [])
             profile = profiles.get(s.get("profile", ""))
             enriched.append({
                 **s,
-                "online": session is not None,
-                "session": session,
+                "online": bool(user_sessions),
+                "session": user_sessions[0] if user_sessions else None,
+                "sessions": user_sessions,
+                "session_count": len(user_sessions),
                 "profile_detail": profile,
             })
         return {"success": True, "data": enriched, "count": len(enriched)}
@@ -489,6 +507,65 @@ def _pppoe_secrets_sync(router_info: dict) -> dict:
         return {"error": str(e)}
     finally:
         api.disconnect()
+
+
+def _group_sessions_by_user(sessions: list) -> dict[str, list]:
+    """``/ppp/active`` rows grouped by username, oldest login first.
+
+    A username can be logged in on several devices at once when its profile
+    has ``only-one=no``, so this is a list per user, never a single row.
+    """
+    grouped: dict[str, list] = {}
+    for s in sessions:
+        grouped.setdefault(s.get("user", ""), []).append(s)
+    for user_sessions in grouped.values():
+        user_sessions.sort(key=lambda s: _uptime_seconds(s.get("uptime", "")), reverse=True)
+    return grouped
+
+
+def _uptime_seconds(uptime: str) -> int:
+    """Parse a RouterOS duration like ``1w2d03:04:05`` or ``3h4m5s`` to seconds."""
+    if not uptime:
+        return 0
+    units = {"w": 604800, "d": 86400, "h": 3600, "m": 60, "s": 1}
+    total = 0
+    number = ""
+    clock = ""
+    for ch in uptime:
+        if ch.isdigit():
+            number += ch
+        elif ch in units and number:
+            total += int(number) * units[ch]
+            number = ""
+        elif ch == ":":
+            clock += number + ":"
+            number = ""
+        else:
+            number = ""
+    if clock:
+        parts = (clock + number).split(":")
+        for value, unit in zip(reversed(parts), (1, 60, 3600)):
+            if value.isdigit():
+                total += int(value) * unit
+    elif number:
+        total += int(number)
+    return total
+
+
+def _session_device(session: dict) -> dict:
+    """One connected device for the monitor's per-user ``sessions`` list."""
+    return {
+        "id": session.get("id", ""),
+        "address": session.get("address", ""),
+        "caller_id": session.get("caller_id", ""),
+        "uptime": session.get("uptime", ""),
+        "upload_bytes": session.get("upload_bytes", 0),
+        "download_bytes": session.get("download_bytes", 0),
+        "upload_rate": session.get("upload_rate", "0"),
+        "download_rate": session.get("download_rate", "0"),
+        "max_limit": session.get("max_limit", ""),
+        "has_queue": session.get("has_queue", False),
+    }
 
 
 def _pppoe_users_sync(router_info: dict) -> dict:
@@ -505,10 +582,9 @@ def _pppoe_users_sync(router_info: dict) -> dict:
         secrets = secrets_data.get("data", []) if secrets_data.get("success") else []
 
         sessions_data = api.get_pppoe_sessions_with_bandwidth()
-        active_map = {
-            s["user"]: s
-            for s in sessions_data.get("data", [])
-        } if sessions_data.get("success") else {}
+        sessions_by_user = _group_sessions_by_user(
+            sessions_data.get("data", []) if sessions_data.get("success") else []
+        )
 
         profiles_data = api.get_ppp_profiles()
         profiles = {
@@ -521,19 +597,25 @@ def _pppoe_users_sync(router_info: dict) -> dict:
         total_download_rate = 0
         online_count = 0
         offline_count = 0
+        online_sessions = 0
+        multi_device_users = 0
 
         for secret in secrets:
             username = secret["name"]
-            session = active_map.get(username)
+            user_sessions = sessions_by_user.get(username, [])
+            session = user_sessions[0] if user_sessions else None
             profile = profiles.get(secret.get("profile", ""))
             is_online = session is not None
+            upload_rate_bps = sum(_parse_rate_to_bps(s.get("upload_rate", "0")) for s in user_sessions)
+            download_rate_bps = sum(_parse_rate_to_bps(s.get("download_rate", "0")) for s in user_sessions)
 
             if is_online:
                 online_count += 1
-                upload_rate_raw = _parse_rate_to_bps(session.get("upload_rate", "0"))
-                download_rate_raw = _parse_rate_to_bps(session.get("download_rate", "0"))
-                total_upload_rate += upload_rate_raw
-                total_download_rate += download_rate_raw
+                online_sessions += len(user_sessions)
+                if len(user_sessions) > 1:
+                    multi_device_users += 1
+                total_upload_rate += upload_rate_bps
+                total_download_rate += download_rate_bps
             else:
                 offline_count += 1
 
@@ -544,16 +626,21 @@ def _pppoe_users_sync(router_info: dict) -> dict:
                 "disabled": secret.get("disabled", False),
                 "comment": secret.get("comment", ""),
                 "online": is_online,
+                # Scalar session fields describe the first device; totals
+                # (bytes, rates) cover every device on this username.
                 "address": session.get("address", "") if session else None,
                 "uptime": session.get("uptime", "") if session else None,
                 "caller_id": session.get("caller_id", "") if session else None,
-                "upload_bytes": session.get("upload_bytes", 0) if session else 0,
-                "download_bytes": session.get("download_bytes", 0) if session else 0,
-                "upload_rate": session.get("upload_rate", "0") if session else "0",
-                "download_rate": session.get("download_rate", "0") if session else "0",
+                "upload_bytes": sum(s.get("upload_bytes", 0) for s in user_sessions),
+                "download_bytes": sum(s.get("download_bytes", 0) for s in user_sessions),
+                "upload_rate": str(upload_rate_bps),
+                "download_rate": str(download_rate_bps),
                 "max_limit": session.get("max_limit", "") if session else (
                     profile.get("rate_limit", "") if profile else ""
                 ),
+                "profile_only_one": profile.get("only_one", "") if profile else "",
+                "session_count": len(user_sessions),
+                "sessions": [_session_device(s) for s in user_sessions],
                 "last_logged_out": secret.get("last_logged_out", ""),
                 "last_disconnect_reason": secret.get("last_disconnect_reason", ""),
                 "last_caller_id": secret.get("last_caller_id", ""),
@@ -567,6 +654,8 @@ def _pppoe_users_sync(router_info: dict) -> dict:
                 "online": online_count,
                 "offline": offline_count,
                 "disabled": sum(1 for u in users if u["disabled"]),
+                "online_sessions": online_sessions,
+                "multi_device_users": multi_device_users,
                 "total_upload_rate_bps": total_upload_rate,
                 "total_download_rate_bps": total_download_rate,
             },
@@ -576,6 +665,51 @@ def _pppoe_users_sync(router_info: dict) -> dict:
         return {"error": str(e)}
     finally:
         api.disconnect()
+
+
+def _pppoe_server_summary(api: MikroTikAPI) -> dict:
+    """Which interfaces run an enabled PPPoE server (``lookup_success`` False if unread).
+
+    A login can be perfect and still never connect when no port answers PPPoE
+    discovery, so the customer page needs this alongside the secret check.
+    """
+    try:
+        result = api.get_pppoe_server_status()
+    except Exception as e:  # noqa: BLE001 - the rest of the presence check still matters
+        return {"lookup_success": False, "enabled_interfaces": [], "error": str(e)}
+    if not result.get("success"):
+        return {"lookup_success": False, "enabled_interfaces": [], "error": result.get("error")}
+    enabled = [
+        s.get("interface", "")
+        for s in result.get("data", [])
+        if not s.get("disabled")
+    ]
+    return {"lookup_success": True, "enabled_interfaces": enabled, "error": None}
+
+
+def _recent_auth_failures(api: MikroTikAPI, username: str) -> dict:
+    """Count "user <name> authentication failed" lines in the router's log.
+
+    Read only when the login is missing or disabled on the router: that is
+    when a client router keeps dialling with credentials the reseller was
+    shown but that are not live yet (LKR0101: 457 failures in 12 minutes on
+    8 Nov 2026). The memory log holds the last ~1000 lines, so this is "recent",
+    not a full history.
+    """
+    try:
+        logs = api.get_router_logs(topics="ppp", limit=1000)
+    except Exception as e:  # noqa: BLE001 - the presence check must still answer
+        return {"lookup_success": False, "count": 0, "last_at": None, "error": str(e)}
+    if not logs.get("success"):
+        return {"lookup_success": False, "count": 0, "last_at": None, "error": logs.get("error")}
+    pattern = re.compile(rf"\buser {re.escape(username)} authentication failed", re.IGNORECASE)
+    hits = [e for e in logs.get("data", []) if pattern.search(e.get("message", "") or "")]
+    return {
+        "lookup_success": True,
+        "count": len(hits),
+        "last_at": hits[-1].get("time") if hits else None,
+        "error": None,
+    }
 
 
 def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
@@ -591,6 +725,7 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
         secret_data = api.get_pppoe_secret_detail(username)
         if secret_data.get("error"):
             return {"error": secret_data["error"]}
+        pppoe_server = _pppoe_server_summary(api)
 
         secret = secret_data.get("data") if secret_data.get("found") else None
         if not secret:
@@ -602,12 +737,16 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
                 "state": "missing",
                 "secret": None,
                 "active_session": None,
+                "active_sessions": [],
+                "session_count": 0,
                 "profile_detail": None,
                 "profile_lookup_success": None,
                 "profile_lookup_error": None,
                 "session_lookup_success": None,
                 "session_found": None,
                 "session_lookup_error": None,
+                "pppoe_server": pppoe_server,
+                "auth_failures": _recent_auth_failures(api, username),
             }
 
         if secret.get("disabled"):
@@ -619,17 +758,22 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
                 "state": "disabled",
                 "secret": secret,
                 "active_session": None,
+                "active_sessions": [],
+                "session_count": 0,
                 "profile_detail": None,
                 "profile_lookup_success": None,
                 "profile_lookup_error": None,
                 "session_lookup_success": None,
                 "session_found": None,
                 "session_lookup_error": None,
+                "pppoe_server": pppoe_server,
+                "auth_failures": _recent_auth_failures(api, username),
             }
 
         session_lookup = api.get_pppoe_session_with_bandwidth(username)
         session_lookup_success = bool(session_lookup.get("success"))
         active_session = session_lookup.get("data") if session_lookup.get("found") else None
+        active_sessions = session_lookup.get("sessions") or ([active_session] if active_session else [])
 
         profile_data = api.get_ppp_profile_detail(secret.get("profile", ""))
         profile_lookup_success = bool(profile_data.get("success"))
@@ -651,12 +795,17 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
             "state": state,
             "secret": secret,
             "active_session": active_session,
+            "active_sessions": active_sessions,
+            "session_count": len(active_sessions),
             "profile_detail": profile_detail,
             "profile_lookup_success": profile_lookup_success,
             "profile_lookup_error": profile_lookup_error,
             "session_lookup_success": session_lookup_success,
             "session_found": bool(session_lookup.get("found")) if session_lookup_success else None,
             "session_lookup_error": session_lookup.get("error") if not session_lookup_success else None,
+            "pppoe_server": pppoe_server,
+            # Only read when the login is not live; see _recent_auth_failures.
+            "auth_failures": None,
         }
     except Exception as e:
         logger.error(f"PPPoE customer presence error for {username}: {e}")
@@ -767,8 +916,12 @@ async def pppoe_customer_presence(
             Router.username.label("router_username"),
             Router.password.label("router_password"),
             Router.port.label("router_port"),
+            Router.pppoe_ports.label("router_pppoe_ports"),
+            Router.dual_ports.label("router_dual_ports"),
             Plan.name.label("plan_name"),
             Plan.speed.label("plan_speed"),
+            Plan.max_shared_users.label("plan_max_shared_users"),
+            Customer.max_devices_override.label("customer_max_devices_override"),
         )
         .outerjoin(Router, Customer.router_id == Router.id)
         .outerjoin(Plan, Customer.plan_id == Plan.id)
@@ -887,6 +1040,20 @@ async def pppoe_customer_presence(
         and not db_customer["is_expired"]
     )
 
+    # Live read of /interface/pppoe-server/server. None = could not tell.
+    server_read = presence.get("pppoe_server") or {}
+    enabled_server_interfaces = list(server_read.get("enabled_interfaces") or [])
+    pppoe_server_available = (
+        bool(enabled_server_interfaces) if server_read.get("lookup_success") is True else None
+    )
+    pppoe_server = {
+        "available": pppoe_server_available,
+        "enabled_interfaces": enabled_server_interfaces,
+        # What Ports configuration last saved, for context; the live read wins.
+        "configured_pppoe_ports": list(row["router_pppoe_ports"] or []),
+        "configured_dual_ports": list(row["router_dual_ports"] or []),
+    }
+
     if not present:
         verdict = {
             "code": "missing_from_mikrotik",
@@ -903,6 +1070,12 @@ async def pppoe_customer_presence(
         verdict = {
             "code": "present_but_profile_missing",
             "message": "The PPP secret exists, but its referenced PPP profile was not found on the router.",
+            "our_side_confirmed": False,
+        }
+    elif pppoe_server_available is False and online is not True:
+        verdict = {
+            "code": "no_pppoe_server",
+            "message": "No port on this router runs a PPPoE server, so no device can connect with this login.",
             "our_side_confirmed": False,
         }
     elif profile_rate_matches is False:
@@ -953,7 +1126,31 @@ async def pppoe_customer_presence(
         },
         "billing_active": billing_active,
         "speed_enforcement": speed_enforcement,
+        "pppoe_server": pppoe_server,
+        # {"count", "last_at", "lookup_success"} when the login is missing or
+        # disabled on the router, else None.
+        "auth_failures": presence.get("auth_failures"),
+        "device_limit": {
+            "plan_max_devices": max(1, int(row["plan_max_shared_users"] or 1)),
+            "max_devices_override": row["customer_max_devices_override"],
+            "max_devices": max(
+                1,
+                int(row["customer_max_devices_override"] or row["plan_max_shared_users"] or 1),
+            ),
+        },
         "mikrotik": presence,
+        # Plain-language reading of the router's last-disconnect-reason, so
+        # the customer page can say why nobody is connected.
+        "last_disconnect": (
+            {
+                "reason": secret.get("last_disconnect_reason", ""),
+                "at": secret.get("last_logged_out", ""),
+                "caller_id": secret.get("last_caller_id", ""),
+                **_infer_disconnect_cause(secret.get("last_disconnect_reason", "")),
+            }
+            if present and online is not True and secret.get("last_disconnect_reason")
+            else None
+        ),
         "verdict": verdict,
     }
 
@@ -1353,6 +1550,8 @@ async def _build_pppoe_users_db_fallback(
             "address": None,
             "uptime": None,
             "caller_id": None,
+            "session_count": 0,
+            "sessions": [],
             "upload_bytes": int(usage.upload_bytes or 0) if usage else 0,
             "download_bytes": int(usage.download_bytes or 0) if usage else 0,
             "upload_rate": "0",
@@ -1396,6 +1595,8 @@ async def _build_pppoe_users_db_fallback(
             "online": 0,
             "offline": len(users),
             "disabled": sum(1 for u in users if u["disabled"]),
+            "online_sessions": 0,
+            "multi_device_users": 0,
             "total_upload_rate_bps": 0,
             "total_download_rate_bps": 0,
         },

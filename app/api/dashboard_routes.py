@@ -17,6 +17,7 @@ from app.db.models import (
 from app.services.auth import verify_token, get_current_user
 from app.services.markets import REPORTING_CURRENCY, reseller_market, sql_kes_by_market
 from app.services.subscription import get_invoice_alert_for_user
+from app.services.payment_plan import payment_plan_id
 from app.services.router_helpers import get_router_by_id
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address, validate_mac_address
 
@@ -235,17 +236,18 @@ async def get_dashboard_overview(
             for row in router_revenue_result
         ]
         
-        # Revenue by plan (filtered by router if specified)
+        # Revenue by plan (filtered by router if specified), credited to the
+        # plan each payment bought, not the customer's current plan
         plan_revenue_stmt = select(
             Plan.id,
             Plan.name,
             Plan.price,
             func.count(CustomerPayment.id).label('sales_count'),
             func.sum(case((CustomerPayment.counts_as_revenue == True, CustomerPayment.amount), else_=0)).label('revenue')
+        ).select_from(CustomerPayment).outerjoin(
+            Customer, CustomerPayment.customer_id == Customer.id
         ).join(
-            Customer, Customer.plan_id == Plan.id
-        ).join(
-            CustomerPayment, CustomerPayment.customer_id == Customer.id
+            Plan, Plan.id == payment_plan_id()
         ).where(
             Plan.user_id == user_id
         )
@@ -269,7 +271,7 @@ async def get_dashboard_overview(
         recent_txn_stmt = select(CustomerPayment, Customer, Plan).join(
             Customer, CustomerPayment.customer_id == Customer.id
         ).join(
-            Plan, Customer.plan_id == Plan.id, isouter=True
+            Plan, Plan.id == payment_plan_id(), isouter=True
         ).where(
             CustomerPayment.reseller_id == user_id
         )
@@ -456,7 +458,7 @@ async def get_dashboard_analytics(
         ).join(
             Customer, CustomerPayment.customer_id == Customer.id
         ).outerjoin(
-            Plan, Customer.plan_id == Plan.id
+            Plan, Plan.id == payment_plan_id()
         ).where(
             CustomerPayment.reseller_id == user_id,
             CustomerPayment.created_at >= filter_start,
@@ -1423,6 +1425,8 @@ async def get_reseller_account_statement(
     date_filters_payout: list = [ResellerPayout.reseller_id == reseller_id]
     date_filters_charge: list = [ResellerTransactionCharge.reseller_id == reseller_id]
     date_filters_payment: list = []
+    period_start: Optional[datetime] = None
+    period_end: Optional[datetime] = None
 
     if start_date:
         try:
@@ -1432,6 +1436,7 @@ async def get_reseller_account_statement(
         date_filters_payout.append(ResellerPayout.created_at >= sd)
         date_filters_charge.append(ResellerTransactionCharge.created_at >= sd)
         date_filters_payment.append(CustomerPayment.created_at >= sd)
+        period_start = sd
     if end_date:
         try:
             ed = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
@@ -1440,6 +1445,7 @@ async def get_reseller_account_statement(
         date_filters_payout.append(ResellerPayout.created_at < ed)
         date_filters_charge.append(ResellerTransactionCharge.created_at < ed)
         date_filters_payment.append(CustomerPayment.created_at < ed)
+        period_end = ed
 
     # All-time M-Pesa revenue (system-collected). Uses the SAME canonical
     # filters as the payout engine (app/services/mpesa_b2b.py) so the balance
@@ -1475,8 +1481,15 @@ async def get_reseller_account_statement(
         )
     )).scalar_one_or_none() or 0)
 
+    # The reseller's 80% of ads they sold through Bitwave (credited when the
+    # paid weeks start running) - a term of the canonical balance, kept apart
+    # from hotspot revenue (app/services/ad_sales.py).
+    from app.services.ad_sales import ad_credit_entries, ad_credit_total
+    total_ad_revenue = await ad_credit_total(db, reseller_id)
+    period_ad_revenue = await ad_credit_total(db, reseller_id, start=period_start, end=period_end)
+
     unpaid_balance = round(
-        all_time_mpesa + balance_correction - total_paid - total_charges, 2
+        all_time_mpesa + total_ad_revenue + balance_correction - total_paid - total_charges, 2
     )
 
     # M-Pesa that went straight into the reseller's own paybill/till/bank
@@ -1543,8 +1556,12 @@ async def get_reseller_account_statement(
         for c in charges_result.scalars().all()
     ]
 
+    ad_entries = await ad_credit_entries(db, reseller_id, start=period_start, end=period_end)
+
     # Merge and sort chronologically (newest first)
-    all_entries = sorted(payout_entries + charge_entries, key=lambda e: e["date"], reverse=True)
+    all_entries = sorted(
+        payout_entries + charge_entries + ad_entries, key=lambda e: e["date"], reverse=True
+    )
     total_entries = len(all_entries)
 
     offset = (page - 1) * per_page
@@ -1566,6 +1583,8 @@ async def get_reseller_account_statement(
             "total_transaction_charges": total_charges,
             "balance_correction": balance_correction,
             "unpaid_balance": unpaid_balance,
+            # Your share of ads sold through Bitwave (included in the balance).
+            "total_ad_revenue": round(total_ad_revenue, 2),
             # Paid straight into the reseller's own account — not owed.
             "total_direct_received": round(total_direct, 2),
         },
@@ -1575,6 +1594,7 @@ async def get_reseller_account_statement(
             "net": round(period_payouts - period_charges, 2),
             "direct_received": round(period_direct, 2),
             "system_collected": round(period_collected, 2),
+            "ad_revenue": round(period_ad_revenue, 2),
         },
         "page": page,
         "per_page": per_page,

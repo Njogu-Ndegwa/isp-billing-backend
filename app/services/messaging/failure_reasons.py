@@ -180,6 +180,7 @@ _RULES: list[tuple[FailureReason, tuple[str, ...]]] = [
     (INVALID_RECIPIENT, (
         "invalid phone", "invalid_recipient", "invalid mobile", "invalid number",
         "is a invalid", "is an invalid", "invalid msisdn",
+        "valid kenyan phone number", "must be a valid phone",  # 4K Net's 400 wording
     )),
     (NETWORK, ("network_error", "timed out", "timeout", "connecterror", "connection")),
     (NO_RESPONSE, ("no_response", "no_result", "bad_response", "no result")),

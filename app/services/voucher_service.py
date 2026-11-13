@@ -3,7 +3,7 @@ import uuid
 import json
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -114,6 +114,12 @@ async def generate_vouchers(
         return {"error": "Plan not found"}
     if plan.user_id != user_id:
         return {"error": "Plan does not belong to this user"}
+
+    # vouchers.expires_at is a naive (UTC) column. A timezone-aware value, e.g.
+    # the admin's `toISOString()` "...Z", made asyncpg reject the insert with
+    # "can't subtract offset-naive and offset-aware datetimes" (500).
+    if expires_at is not None and expires_at.tzinfo is not None:
+        expires_at = expires_at.astimezone(timezone.utc).replace(tzinfo=None)
 
     if router_id:
         router = await db.get(Router, router_id)
@@ -288,7 +294,18 @@ async def redeem_voucher(
     )
     customer = cust_result.scalar_one_or_none()
 
+    from app.services.subscription_sharing import (
+        apply_voucher_plan_if_plan_ended,
+        smaller_voucher_refusal,
+    )
+
+    refusal = await smaller_voucher_refusal(db, customer=customer, new_plan=plan)
+    if refusal:
+        await db.commit()
+        return {"success": False, "error": refusal}
+
     if customer:
+        apply_voucher_plan_if_plan_ended(customer, plan)
         customer.plan_id = plan.id
         customer.router_id = router_id
         customer.user_id = voucher.user_id

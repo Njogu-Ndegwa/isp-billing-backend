@@ -3,6 +3,8 @@
 import itertools
 import time
 
+from datetime import datetime
+
 import pytest
 
 from app.services import checkin_delivery, hotspot_mac_login as ml, hotspot_provisioning, mikrotik_background
@@ -40,6 +42,7 @@ class FakeRouter:
             self.tables["/ip/firewall/filter"].append(self._row(
                 chain="forward", action="accept", comment="defconf: accept established,related"))
         self.writes = []
+        self.reads = []
 
     def _row(self, **fields):
         return {".id": f"*{next(self._ids)}", **fields}
@@ -48,8 +51,19 @@ class FakeRouter:
         api = MikroTikAPI.__new__(MikroTikAPI)
         api.connected = True
         api.send_command = self.send_command
-        api.send_command_optimized = lambda path, proplist=None, query=None: self.send_command(path)
+        api.send_command_optimized = self.read_optimized
         return api
+
+    def read_optimized(self, path, proplist=None, query=None):
+        self.reads.append((path, proplist, query))
+        result = self.send_command(path)
+        data = result['data']
+        if query:
+            key, value = query[1:].split('=', 1)
+            data = [row for row in data if str(row.get(key, '')) == value]
+        if proplist:
+            data = [{k: v for k, v in row.items() if k in proplist} for row in data]
+        return {**result, 'data': data}
 
     def send_command(self, path, args=None):
         args = dict(args or {})
@@ -223,6 +237,123 @@ def test_provision_updates_an_existing_user_in_place():
     # plan speeds are download/upload; RouterOS profiles are upload/download
     assert user["profile"] == "plan_5M_10M"
     assert user["disabled"] == "no" and user["limit-uptime"] == "0s"
+
+
+def _healthy_renewal(router):
+    router.tables['/ip/hotspot/user/profile'].append(router._row(
+        name='plan_5M_5M', **{'rate-limit': '5M/5M', 'shared-users': '2'}))
+    router.tables['/ip/hotspot/user'].append(router._row(
+        name=MAC, profile='plan_5M_5M', disabled='false', password='',
+        comment=f'MACLOGIN|MAC:{MAC}|T:1|EXP:1900000000',
+        **{'mac-address': MAC, 'limit-uptime': '0s'}))
+    router.tables['/ip/hotspot/active'].append(router._row(
+        user=MAC, address='192.168.88.10', **{'mac-address': MAC}))
+    router.tables['/ip/hotspot/host'].append(router._row(
+        address='192.168.88.10', authorized='true', bypassed='false',
+        **{'mac-address': MAC}))
+    router.tables['/queue/simple'].append(router._row(
+        name='<hotspot-test>', dynamic='true', target='192.168.88.10/32',
+        **{'max-limit': '5M/5M'}))
+
+
+def test_same_plan_renewal_preserves_authorized_session_host_and_native_queue():
+    router = FakeRouter()
+    _healthy_renewal(router)
+    before = {table: [dict(x) for x in router.tables[table]] for table in
+              ['/ip/hotspot/active', '/ip/hotspot/host', '/queue/simple']}
+    result = ml.provision_customer(router.api(), MAC, '5M/5M', note='renewal')
+    assert result['success'] and result['session_preserved']
+    assert result['kick_result'] == {'sessions_removed': 0, 'hosts_removed': 0}
+    assert all(router.tables[table] == rows for table, rows in before.items())
+    assert router.user(MAC)['comment'] != f'MACLOGIN|MAC:{MAC}|T:1|EXP:1900000000'
+    assert not any(path.endswith('/remove') for path, _ in router.writes)
+    user_writes = [args for path, args in router.writes if path == '/ip/hotspot/user/set']
+    assert len(user_writes) == 1 and set(user_writes[0]) == {'numbers', 'comment'}
+
+
+def test_same_plan_renewal_preserves_universal_nat_session():
+    router = FakeRouter()
+    _healthy_renewal(router)
+    router.tables['/ip/hotspot/host'][0].update(
+        {'address': '198.18.1.2', 'to-address': '192.168.88.10'})
+    result = ml.provision_customer(router.api(), MAC, '5M/5M')
+    assert result['success'] and result['session_preserved']
+    assert result['kick_result'] == {'sessions_removed': 0, 'hosts_removed': 0}
+
+
+def test_renewal_reads_only_customer_metadata_and_static_queue_ownership():
+    router = FakeRouter()
+    _healthy_renewal(router)
+    result = ml.provision_customer(router.api(), MAC, '5M/5M')
+    assert result['session_preserved']
+    customer_reads = [r for r in router.reads if r[0] in (
+        '/ip/hotspot/user/print', '/ip/hotspot/active/print',
+        '/ip/hotspot/host/print', '/ip/hotspot/ip-binding/print')]
+    assert customer_reads and all(r[2] in (f'?name={MAC}', f'?mac-address={MAC}') for r in customer_reads)
+    queue_reads = [r for r in router.reads if r[0] == '/queue/simple/print']
+    assert queue_reads == [('/queue/simple/print', ['.id', 'name', 'comment', 'dynamic'], '?dynamic=false')]
+
+
+def test_renewal_still_finds_lowercase_legacy_username_without_duplicate():
+    router = FakeRouter()
+    _healthy_renewal(router)
+    router.user(MAC)['name'] = MAC.lower()
+    result = ml.provision_customer(router.api(), MAC, '5M/5M')
+    assert result['success'] and result['session_preserved']
+    assert len(router.tables['/ip/hotspot/user']) == 1
+    assert router.user(MAC.lower())['comment'].startswith('MACLOGIN|')
+    assert not any(path == '/ip/hotspot/user/add' for path, _ in router.writes)
+
+
+@pytest.mark.parametrize('fail_fallback', [False, True])
+def test_failed_user_lookup_never_creates_a_duplicate(fail_fallback):
+    router = FakeRouter()
+    _healthy_renewal(router)
+    api = router.api()
+    original_read = api.send_command_optimized
+
+    def read(path, proplist=None, query=None):
+        if path == '/ip/hotspot/user/print':
+            if fail_fallback and query:
+                return {'success': True, 'data': []}
+            return {'success': False, 'error': 'read unavailable'}
+        return original_read(path, proplist=proplist, query=query)
+
+    api.send_command_optimized = read
+    result = ml.provision_customer(api, MAC, '5M/5M')
+    assert 'read failed' in result['error']
+    assert not any(path in ('/ip/hotspot/user/add', '/ip/hotspot/user/set') for path, _ in router.writes)
+    assert len(router.tables['/ip/hotspot/user']) == 1
+
+
+@pytest.mark.parametrize('case', ['speed_change', 'disabled', 'unauthorized', 'bypassed', 'timed', 'missing_host', 'wrong_login', 'profile_repaired', 'legacy_queue', 'limited_uptime'])
+def test_renewal_keeps_relogin_for_access_or_rate_repairs(case):
+    router = FakeRouter()
+    _healthy_renewal(router)
+    speed = '5M/5M'
+    if case == 'speed_change':
+        speed = '10M/5M'
+    elif case == 'disabled':
+        router.user(MAC)['disabled'] = 'true'
+    elif case == 'unauthorized':
+        router.tables['/ip/hotspot/host'][0]['authorized'] = 'false'
+    elif case == 'bypassed':
+        router.tables['/ip/hotspot/host'][0]['bypassed'] = 'true'
+    elif case == 'timed':
+        router.tables['/ip/hotspot/active'][0]['session-time-left'] = '1m'
+    elif case == 'missing_host':
+        router.tables['/ip/hotspot/host'].clear()
+    elif case == 'wrong_login':
+        router.tables['/ip/hotspot/active'][0]['user'] = 'voucher'
+    elif case == 'profile_repaired':
+        router.tables['/ip/hotspot/user/profile'][-1]['rate-limit'] = '10M/10M'
+    elif case == 'legacy_queue':
+        router.tables['/queue/simple'].append(router._row(name='plan_AABBCCDDEE01', dynamic='false'))
+    elif case == 'limited_uptime':
+        router.user(MAC)['limit-uptime'] = '1h'
+    result = ml.provision_customer(router.api(), MAC, speed)
+    assert result['success'] and not result['session_preserved']
+    assert result['kick_result']['sessions_removed'] == 1
 
 
 def test_verify_requires_the_user_not_a_binding():
@@ -487,3 +618,112 @@ def test_queue_sync_items_carry_the_expiry():
     c = SimpleNamespace(id=1, mac_address=MAC, expiry=datetime(2026, 10, 1),
                         plan=SimpleNamespace(speed="5M/5M", fup_action=None))
     assert mikrotik_background._queue_sync_customer_item(c, None)["expiry"] == datetime(2026, 10, 1)
+
+
+# ---------------------------------------------------------------- FUP direction
+# Router 446, 4 Nov 2026: TV BUNDLE throttle "2M/0.5M" (2 Mbps down, 0.5 up) was
+# converted twice, reached the router as plan_2M_500K (2M UP, 500k DOWN), and
+# throttled TVs sat at 500 kbps download.
+
+@pytest.mark.parametrize("speed,profile,rate", [
+    ("2M/0.5M", "plan_500k_2M", "500k/2M"),
+    ("0.7M/0.6M", "plan_600k_700k", "600k/700k"),
+    ("5M/2M", "plan_2M_5M", "2M/5M"),
+    ("1M/1M", "plan_1M_1M", "1M/1M"),
+])
+def test_set_customer_rate_keeps_download_upload_direction(speed, profile, rate):
+    router = FakeRouter()
+    ml.provision_customer(router.api(), MAC, "5M/2M")
+
+    assert ml.set_customer_rate(router.api(), MAC, speed)["success"] is True
+
+    assert router.user(MAC)["profile"] == profile
+    stored = next(p for p in router.tables["/ip/hotspot/user/profile"] if p["name"] == profile)
+    assert stored["rate-limit"] == rate
+
+
+def _plan(**kw):
+    from types import SimpleNamespace
+    return SimpleNamespace(**{"speed": "5M/2M", "fup_throttle_profile": "2M/0.5M",
+                              "fup_action": None, **kw})
+
+
+def test_queue_sync_item_carries_throttle_in_plan_format():
+    from types import SimpleNamespace
+
+    from app.db.models import FupAction
+    from app.services import mikrotik_background
+
+    customer = SimpleNamespace(id=1, mac_address=MAC, plan=_plan(), expiry=datetime(2030, 1, 1),
+                               grace_period_minutes=0)
+    period = SimpleNamespace(fup_action_taken=FupAction.THROTTLE, fup_action_snapshot=None)
+
+    item = mikrotik_background._queue_sync_customer_item(customer, period)
+
+    assert item["plan_speed"] == "2M/0.5M"
+
+
+def test_reconcile_throttled_customer_ends_with_2m_down_and_stays_put():
+    from types import SimpleNamespace
+
+    from app.db.models import FupAction
+    from app.services import mikrotik_background
+
+    router = FakeRouter()
+    ml.provision_customer(router.api(), MAC, "5M/2M")
+    customer = SimpleNamespace(id=1, mac_address=MAC, plan=_plan(), expiry=datetime(2030, 1, 1),
+                               grace_period_minutes=0)
+    period = SimpleNamespace(fup_action_taken=FupAction.THROTTLE, fup_action_snapshot=None)
+    item = mikrotik_background._queue_sync_customer_item(customer, period)
+
+    ml.reconcile_router(router.api(), [item])
+    assert router.user(MAC)["profile"] == "plan_500k_2M"
+
+    # Second pass: already right, so no further writes or kicks.
+    router.writes.clear()
+    summary = ml.reconcile_router(router.api(), [item])
+    assert summary["already_ok"] == 1 and summary["provisioned"] == 0
+
+
+def test_reconcile_repairs_a_user_left_on_the_reversed_throttle():
+    router = FakeRouter()
+    ml.provision_customer(router.api(), MAC, "2M/0.5M")
+    router.user(MAC)["profile"] = "plan_2M_500K"   # what the old double conversion wrote
+
+    summary = ml.reconcile_router(router.api(), [
+        {"mac_address": MAC, "plan_speed": "2M/0.5M", "fup_action": "throttle"},
+    ])
+
+    assert summary["provisioned"] == 1
+    assert router.user(MAC)["profile"] == "plan_500k_2M"
+
+
+@pytest.mark.asyncio
+async def test_fup_throttle_and_restore_pass_plan_format_to_mac_login(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.db.models import ConnectionType
+    from app.services import fup
+
+    calls = []
+    monkeypatch.setattr(fup, "_mac_login_sync",
+                        lambda info, action, mac, speed="": calls.append((action, speed)) or {"success": True})
+    monkeypatch.setattr(fup, "mac_login_enabled", lambda _rid: True)
+    monkeypatch.setattr(fup, "_hotspot_identity", lambda _c: (MAC, MAC.replace(":", "")))
+    monkeypatch.setattr(fup, "_router_info", lambda _r: {"id": 1})
+
+    async def router(_db, _rid):
+        return SimpleNamespace(id=1)
+
+    monkeypatch.setattr(fup, "_load_router", router)
+
+    class DB:
+        async def commit(self):
+            return None
+
+    plan = _plan(connection_type=ConnectionType.HOTSPOT)
+    customer = SimpleNamespace(plan=plan, router_id=1)
+    await fup.apply_throttle(DB(), customer, plan)
+    await fup.restore_normal_profile(DB(), customer, plan)
+
+    assert calls == [("rate", "2M/0.5M"), ("rate", "5M/2M")]

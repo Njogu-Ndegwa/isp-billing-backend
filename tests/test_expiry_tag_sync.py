@@ -312,7 +312,7 @@ def test_admin_expiry_edit_schedules_a_tag_sync():
     import inspect
     from app.api import customer_routes
     src = inspect.getsource(customer_routes)
-    assert 'schedule_expiry_tag_sync([customer.id], "admin expiry edit")' in src
+    assert 'schedule_expiry_tag_sync([customer.id, *shared_devices_changed], "admin expiry edit")' in src
 
 
 # --- MAC-login users (2026-09-29) ----------------------------------------------

@@ -4,6 +4,7 @@ import hmac
 import uuid
 import secrets
 import string
+import unicodedata
 import ipaddress
 import logging
 import os
@@ -31,6 +32,13 @@ WG_SERVER_IP = ipaddress.IPv4Address("10.0.0.1")
 WG_IP_RANGE = (ipaddress.IPv4Address("10.0.0.2"), ipaddress.IPv4Address("10.0.99.255"))
 L2TP_IP_RANGE = (ipaddress.IPv4Address("10.0.100.0"), ipaddress.IPv4Address("10.0.199.255"))
 TOKEN_EXPIRY_HOURS = 24
+
+# What a v7 router's device-mode has to allow for provisioning. `home` mode
+# blocks all three and `basic` blocks hotspot, so naming hotspot alone leaves a
+# home-mode router stuck on the next attempt.
+DEVICE_MODE_UPDATE_COMMAND = (
+    "/system/device-mode/update fetch=yes scheduler=yes hotspot=yes"
+)
 INSURANCE_KEY_CONTEXT = b"bitwave-insurance-wireguard-v1"
 
 LOGIN_PAGE_PATH = os.path.join(
@@ -64,6 +72,22 @@ DEFAULT_WIFI_SSID = "Bitwave WiFi"
 WIFI_SECURITY_PROFILE = "bw-open"
 # Name of the hotspot bridge every LAN port must belong to.
 HOTSPOT_BRIDGE = "bridge"
+# The hotspot LAN the script configures (STEP 2 address + DHCP, STEP 4
+# hotspot-address). The anti-tunnel rules exempt exactly this LAN, so all of
+# them read from here.
+HOTSPOT_LAN = ipaddress.IPv4Interface("192.168.88.1/24")
+HOTSPOT_GATEWAY = str(HOTSPOT_LAN.ip)
+HOTSPOT_SUBNET = str(HOTSPOT_LAN.network)
+
+# Hotspot anti-tunnel (HTTP Injector) rules. The comments are what the
+# hotspot-bypass-fix skill's apply/verify scripts look for -- keep them exact.
+PORTAL_ALLOW_LIST = "isp_portal_allow"
+PORTAL_ALLOW_COMMENT = "portal/api/backend allow (anti-tunnel)"
+PROXY_RELAY_BLOCK_COMMENT = "ISP_BILLING_PROXY_RELAY_BLOCK"
+ANTI_TUNNEL_COMMENT = "ISP_BILLING_ANTI_TUNNEL"
+# Every port the hotspot hands to its transparent proxy (wproxy 64874) for
+# unauthenticated clients -- three dynamic hs-unauth redirects, not one.
+PROXY_RELAY_PORTS = "80,3128,8080"
 
 # RouterOS 7 WireGuard management tunnel to Hetzner wg2 (PROVISION_MGMT_TO_HETZNER).
 # Same name the manual migrations used (skill migrate-router-to-sstp).
@@ -600,20 +624,38 @@ def _rsc_parse_block(code: str, var: str, failure_log: str) -> str:
 }}"""
 
 
-def hotspot_wifi_ssid(token: ProvisioningToken) -> str:
-    """SSID for the hotspot AP: the token's ssid, or DEFAULT_WIFI_SSID.
+def sanitize_wifi_ssid(raw: Optional[str]) -> str:
+    """`raw` as a safe SSID, or "" when nothing usable is left.
 
-    Kept to printable ASCII without RouterOS-special characters and at most
-    32 bytes (the 802.11 limit) so it can never break the generated script.
+    Accents are folded to ASCII ("Café" -> "Cafe"), then only printable ASCII
+    without RouterOS-special characters is kept, whitespace runs collapse to
+    one space, and the result is cut to 32 bytes (the 802.11 limit), so it can
+    never break the generated script.
     """
+    folded = unicodedata.normalize("NFKD", raw or "").encode("ascii", "ignore").decode("ascii")
+    cleaned = "".join(
+        ch for ch in folded
+        if 0x20 <= ord(ch) < 0x7F and ch not in '"\\$?;{}[]`'
+    )
+    return " ".join(cleaned.split())[:32].strip()
+
+
+def wifi_ssid_for_owner(user) -> str:
+    """Default hotspot SSID for a new router: the reseller's business name,
+    else their organisation (account) name, else DEFAULT_WIFI_SSID."""
+    for raw in (getattr(user, "business_name", None), getattr(user, "organization_name", None)):
+        ssid = sanitize_wifi_ssid(raw)
+        if ssid and "@" not in ssid and ssid.upper() != "N/A":
+            return ssid
+    return DEFAULT_WIFI_SSID
+
+
+def hotspot_wifi_ssid(token: ProvisioningToken) -> str:
+    """SSID for the hotspot AP: the token's ssid, or DEFAULT_WIFI_SSID."""
     raw = (getattr(token, "ssid", None) or "").strip()
     if raw.upper() in ("", "N/A"):
         raw = DEFAULT_WIFI_SSID
-    cleaned = "".join(
-        ch for ch in raw
-        if 0x20 <= ord(ch) < 0x7F and ch not in '"\\$?;{}[]`'
-    ).strip()[:32].strip()
-    return cleaned or DEFAULT_WIFI_SSID
+    return sanitize_wifi_ssid(raw) or DEFAULT_WIFI_SSID
 
 
 def _rsc_header(token: ProvisioningToken) -> str:
@@ -664,12 +706,22 @@ def _rsc_preflight_hotspot(token: ProvisioningToken) -> str:
         )
     else:
         remedy = (
-            "this is usually device-mode blocking hotspot (newer RouterBOARDs "
-            "ship this way). Run: /system/device-mode/update hotspot=yes  -- "
-            "then press the physical reset button briefly (or power-cycle) "
+            "this is usually device-mode blocking hotspot (home mode also blocks "
+            f"fetch and scheduler). Run: {DEVICE_MODE_UPDATE_COMMAND}  -- "
+            "then press the physical reset or mode button briefly (or power-cycle) "
             "within 5 minutes when prompted, wait for the router to come back, "
-            "then re-run this provisioning command"
+            "then re-run this same provisioning command to connect the router to "
+            "the billing system (the code stays valid until it is completed or "
+            f"expires after {TOKEN_EXPIRY_HOURS} hours)"
         )
+    # smips builds (hAP lite, hAP mini, cAP lite) on RouterOS 7.20+ ship
+    # without hotspot in the main package -- it is a separate
+    # hotspot-<ver>-smips.npk in the extra-packages zip (7.20 changelog), so
+    # the device-mode remedy above is wrong there. The script reads the
+    # architecture and version at runtime (the router may not run the version
+    # the reseller picked) and swaps in the right message. Message only: the
+    # abort itself is unchanged, and if /system resource cannot be read the
+    # default remedy is kept.
     return f"""
 # ---- PRE-FLIGHT: HOTSPOT AVAILABILITY CHECK ----
 # If the hotspot feature is unavailable its console menus do not exist and
@@ -682,7 +734,38 @@ def _rsc_preflight_hotspot(token: ProvisioningToken) -> str:
     $bwHsProbe
     :log info "Provisioning: hotspot feature available"
 }} on-error={{
-    :log error "PROVISION ABORTED: the hotspot feature is not available on this router -- {remedy}."
+    :local bwRemedy "{remedy}"
+    # smips (hAP lite / hAP mini / cAP lite) on RouterOS 7.20+: hotspot is a
+    # separate extra package, so device-mode cannot fix it. Message only.
+    :do {{
+        :local bwArch [/system resource get architecture-name]
+        :local bwVer [/system resource get version]
+        :local bwSp [:find $bwVer " "]
+        :if ([:typeof $bwSp] = "num") do={{ :set bwVer [:pick $bwVer 0 $bwSp] }}
+        :local bwDot [:find $bwVer "."]
+        :if (($bwArch = "smips") && ([:typeof $bwDot] = "num")) do={{
+            :local bwMajor [:tonum [:pick $bwVer 0 $bwDot]]
+            :local bwMinor ""
+            :local bwI ($bwDot + 1)
+            :local bwMore true
+            :while ($bwMore && ($bwI < [:len $bwVer])) do={{
+                :local bwCh [:pick $bwVer $bwI]
+                :if ([:typeof [:find "0123456789" $bwCh]] = "num") do={{
+                    :set bwMinor ($bwMinor . $bwCh)
+                    :set bwI ($bwI + 1)
+                }} else={{
+                    :set bwMore false
+                }}
+            }}
+            :if (([:typeof $bwMajor] = "num") && ([:len $bwMinor] > 0)) do={{
+                :if (($bwMajor > 7) || (($bwMajor = 7) && ([:tonum $bwMinor] >= 20))) do={{
+                    :set bwRemedy ("this is a smips router (hAP lite / hAP mini / cAP lite) on RouterOS " . $bwVer . ", and since RouterOS 7.20 smips builds do not include hotspot. Fix: downgrade to RouterOS 6.49.x (recommended for these models), or upload hotspot-" . $bwVer . "-smips.npk from the extra-packages zip for " . $bwVer . " (mikrotik.com/download) to Files, reboot, then re-run this provisioning command")
+                }}
+            }}
+        }}
+    }} on-error={{}}
+    :log error ("PROVISION ABORTED: the hotspot feature is not available on this router -- " . $bwRemedy . ".")
+    :put ("PROVISION ABORTED: the hotspot feature is not available on this router -- " . $bwRemedy . ".")
     :error "hotspot feature unavailable -- aborting before any config is applied (see /log print)"
 }}"""
 
@@ -809,13 +892,15 @@ def _rsc_wan_setup() -> str:
 
 
 def _rsc_lan_setup() -> str:
-    return """
+    hosts = list(HOTSPOT_LAN.network.hosts())
+    pool = f"{hosts[9]}-{hosts[-1]}"
+    return f"""
 # ---- STEP 2: LAN SETUP ----
 
-:do { /ip address add address=192.168.88.1/24 interface=bridge } on-error={}
-:do { /ip pool add name=dhcp-pool ranges=192.168.88.10-192.168.88.254 } on-error={}
-:do { /ip dhcp-server add name=dhcp1 interface=bridge address-pool=dhcp-pool disabled=no } on-error={}
-:do { /ip dhcp-server network add address=192.168.88.0/24 gateway=192.168.88.1 dns-server=8.8.8.8,8.8.4.4 } on-error={}
+:do {{ /ip address add address={HOTSPOT_LAN.with_prefixlen} interface=bridge }} on-error={{}}
+:do {{ /ip pool add name=dhcp-pool ranges={pool} }} on-error={{}}
+:do {{ /ip dhcp-server add name=dhcp1 interface=bridge address-pool=dhcp-pool disabled=no }} on-error={{}}
+:do {{ /ip dhcp-server network add address={HOTSPOT_SUBNET} gateway={HOTSPOT_GATEWAY} dns-server=8.8.8.8,8.8.4.4 }} on-error={{}}
 
 :log info "Provisioning: LAN and DHCP setup complete" """
 
@@ -1006,6 +1091,23 @@ def _rsc_input_accept_first(comment: str, match: str) -> str:
 }}"""
 
 
+def _rsc_drop_stale_addresses(interface: str, keep: str) -> str:
+    """Remove every address on one of OUR interfaces except this setup's.
+
+    The address `add` is wrapped in on-error={} so a re-run does not abort --
+    but a router set up before (a new token, so a new address) then carries
+    the OLD address next to the new one. On the tunnel interface both sit in
+    the same /16, the router may source its own traffic (watchdog, check-in)
+    from the old one, and the server drops it because that address belongs to
+    no peer any more. Only our dedicated interfaces (wg-hz, lo-mgmt) are
+    cleaned, never a reseller's.
+    """
+    return (
+        f':do {{ /ip address remove [find where interface={interface} and address!="{keep}"] }} '
+        f'on-error={{ :log warning "Provisioning: could not remove stale addresses on {interface}" }}'
+    )
+
+
 def _rsc_mgmt_loopback_pin(token: ProvisioningToken) -> str:
     """Pin the router's DB address 10.0.X.Y on the `lo-mgmt` loopback bridge.
 
@@ -1023,6 +1125,7 @@ def _rsc_mgmt_loopback_pin(token: ProvisioningToken) -> str:
 :if ([:len [/interface bridge find where name={loopback}]] = 0) do={{
     :do {{ /interface bridge add name={loopback} comment="Management IP pin" }} on-error={{}}
 }}
+{_rsc_drop_stale_addresses(loopback, f"{mgmt_ip}/32")}
 :if ([:len [/ip address find where address="{mgmt_ip}/32" and interface={loopback}]] = 0) do={{
     :do {{ /ip address add address={mgmt_ip}/32 interface={loopback} comment="Management IP pin" }} on-error={{}}
 }}"""
@@ -1048,6 +1151,7 @@ def _rsc_vpn_hetzner_wireguard(token: ProvisioningToken) -> str:
 }} on-error={{
     /interface wireguard set [find where name={iface}] listen-port={port} private-key="{token.wg_private_key}"
 }}
+{_rsc_drop_stale_addresses(iface, f"{tunnel_ip}/16")}
 :do {{ /ip address add address={tunnel_ip}/16 interface={iface} }} on-error={{}}
 :do {{
     /interface wireguard peers add interface={iface} {peer_params}
@@ -1283,7 +1387,7 @@ def _rsc_hotspot(token: ProvisioningToken) -> str:
 }
 
 :do {
-    /ip hotspot profile add name=hsprof1 hotspot-address=192.168.88.1 dns-name="" login-by=http-chap,http-pap html-directory=$bwHtmlDir
+    /ip hotspot profile add name=hsprof1 hotspot-address=""" + HOTSPOT_GATEWAY + """ dns-name="" login-by=http-chap,http-pap html-directory=$bwHtmlDir
     :log info ("Provisioning: hotspot profile hsprof1 created with html-directory=" . $bwHtmlDir)
 } on-error={
     :do { /ip hotspot profile set hsprof1 html-directory=$bwHtmlDir } on-error={
@@ -1316,10 +1420,10 @@ def _rsc_hotspot(token: ProvisioningToken) -> str:
 :do {
     :set hsCount [:len [/ip hotspot find where name=hotspot1]]
 } on-error={
-    :log error "PROVISION WARNING: could not query hotspot -- the hotspot feature may not be available. Ensure device-mode hotspot is enabled: /system/device-mode/update hotspot=yes then press the physical reset button."
+    :log error "PROVISION WARNING: could not query hotspot -- the hotspot feature may not be available. Ensure device-mode allows it: /system/device-mode/update fetch=yes scheduler=yes hotspot=yes then press the physical reset or mode button within 5 minutes."
 }
 :if ($hsCount = 0) do={
-    :log error "PROVISION WARNING: hotspot1 was not found -- hotspot feature may not be enabled. Run: /system/device-mode/update hotspot=yes then press the physical reset button."
+    :log error "PROVISION WARNING: hotspot1 was not found -- hotspot feature may not be enabled. Run: /system/device-mode/update fetch=yes scheduler=yes hotspot=yes then press the physical reset or mode button within 5 minutes."
 } else={
     :log info "Provisioning: hotspot1 confirmed running"
 }
@@ -1370,6 +1474,186 @@ def _rsc_login_page(token: ProvisioningToken) -> str:
             :delay 5s
         }}
     }}
+}}"""
+
+
+def _backend_public_ips(token: ProvisioningToken) -> list[str]:
+    """Public IPs of the backend a hotspot must reach before login: the
+    token's server, plus the insurance/Hetzner server when it differs. The
+    walled garden and the anti-tunnel allow-list both use this list."""
+    ips = [token.server_public_ip]
+    insurance_public_ip = (settings.INSURANCE_SERVER_PUBLIC_IP or "").strip()
+    if insurance_public_ip and insurance_public_ip != token.server_public_ip:
+        ips.append(insurance_public_ip)
+    return ips
+
+
+def portal_allow_entries(token: ProvisioningToken) -> list[str]:
+    """What goes in the router's isp_portal_allow list: backend IPs, then the
+    portal CIDRs from settings.HOTSPOT_PORTAL_ALLOW_CIDRS."""
+    entries = _backend_public_ips(token)
+    for raw in (settings.HOTSPOT_PORTAL_ALLOW_CIDRS or "").split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        # Fails loudly on a typo: a malformed entry would make RouterOS reject
+        # the add and the router would ship with a narrower allow-list.
+        cidr = str(ipaddress.IPv4Network(raw, strict=False))
+        if cidr not in entries:
+            entries.append(cidr)
+    return entries
+
+
+def _rsc_anti_tunnel_lift() -> str:
+    """Re-provisioning a router that already carries the relay block: lift it
+    for the rest of the import. RouterOS 6 fetches the login page and calls
+    /complete over plain HTTP via PROVISION_LEGACY_BASE_URL, and the block
+    rejects the router's own tcp/80 to anything outside isp_portal_allow (the
+    backend hostname is behind Cloudflare). STEP 9b puts it back."""
+    return f"""
+# ---- STEP 4b: LIFT ANY EXISTING PROXY-RELAY BLOCK UNTIL STEP 9b ----
+# The block also rejects this script's own plain-HTTP fetches (login page,
+# /complete). STEP 9b re-applies it right after the server is notified.
+
+:foreach i in=[/ip firewall filter find comment="{PROXY_RELAY_BLOCK_COMMENT}"] do={{ :do {{ /ip firewall filter remove $i }} on-error={{}} }}"""
+
+
+def _rsc_anti_tunnel(token: ProvisioningToken) -> str:
+    """Stop the hotspot's transparent web proxy being used as an open relay.
+
+    MikroTik redirects unauthenticated TCP 80/3128/8080 to its built-in proxy
+    (wproxy, port 64874), which forwards to *any* external host. HTTP Injector
+    rides that relay out and gets internet without signing in. The walled
+    garden does not stop it (a raw-IP WebSocket Upgrade carries no Host/SNI),
+    and /ip proxy access is ignored for transparently intercepted connections.
+
+    The relay is router-originated, so the cure is chain=output: the router
+    may reach only the portal/backend on those ports. Deliberately no
+    connection-state, so live tunnels are cut too. Serving the login page is
+    local and untouched.
+
+    Reseller walled-garden IP allows (e.g. radios reaching UISP) keep
+    working: RouterOS turns them into dynamic pre-hotspot NAT accepts and
+    hs-unauth returns, so that traffic is forwarded -- never relayed through
+    the proxy, never seen by chain=output -- and returns from hs-unauth
+    before the static rules below, which are appended (no place-before)
+    after the hotspot's dynamic rules.
+
+    Runs after /complete (see _rsc_anti_tunnel_lift) and before the reboot.
+    Idempotent: each rule and allow entry is removed by comment and re-added.
+    """
+    lines = [
+        "",
+        "# ---- STEP 9b: ANTI-TUNNEL (HTTP Injector / open transparent proxy) ----",
+        "# Only portal + backend may be reached through the hotspot's transparent",
+        "# proxy. See the hotspot-bypass-fix skill before changing these rules.",
+        "",
+        ":foreach i in=[/ip firewall address-list find where list=" + PORTAL_ALLOW_LIST
+        + ' and comment="' + PORTAL_ALLOW_COMMENT + '"] do={ :do { /ip firewall address-list remove $i } on-error={} }',
+    ]
+    for entry in portal_allow_entries(token):
+        lines.append(
+            ":do { /ip firewall address-list add list=" + PORTAL_ALLOW_LIST
+            + " address=" + entry + ' comment="' + PORTAL_ALLOW_COMMENT + '" } on-error={}'
+        )
+
+    rules = [
+        (
+            PROXY_RELAY_BLOCK_COMMENT,
+            "chain=output protocol=tcp dst-port=" + PROXY_RELAY_PORTS
+            + " dst-address-list=!" + PORTAL_ALLOW_LIST
+            + " dst-address=!" + HOTSPOT_SUBNET
+            + " action=reject reject-with=tcp-reset",
+        ),
+        (
+            ANTI_TUNNEL_COMMENT,
+            "chain=hs-unauth protocol=tcp dst-port=80,443 dst-address=!" + HOTSPOT_GATEWAY
+            + " dst-address-list=!" + PORTAL_ALLOW_LIST
+            + " connection-state=new action=reject reject-with=tcp-reset",
+        ),
+        (
+            ANTI_TUNNEL_COMMENT + "_OTHER",
+            "chain=hs-unauth protocol=tcp dst-port=!53,80,443 dst-address=!" + HOTSPOT_GATEWAY
+            + " action=reject reject-with=tcp-reset",
+        ),
+        (
+            ANTI_TUNNEL_COMMENT + "_DNS",
+            "chain=hs-unauth protocol=udp dst-port=53 dst-address=!" + HOTSPOT_GATEWAY
+            + " action=reject reject-with=icmp-net-prohibited",
+        ),
+    ]
+    lines.append("")
+    for comment, _ in rules:
+        lines.append(
+            ':foreach i in=[/ip firewall filter find comment="' + comment
+            + '"] do={ :do { /ip firewall filter remove $i } on-error={} }'
+        )
+    for comment, params in rules:
+        lines.append(
+            ":do { /ip firewall filter add " + params + ' comment="' + comment + '" } on-error={'
+            + ' :log error "Provisioning: could not add ' + comment + '" }'
+        )
+    lines += [
+        "",
+        ':log info "Provisioning: anti-tunnel proxy-relay rules applied"',
+    ]
+    return chr(10).join(lines)
+
+
+def _rsc_anti_tethering() -> str:
+    """Anti-tethering on by default: drop hotspot traffic that already passed
+    through another router or a phone hotspot (TTL 63/127/254).
+
+    Byte-for-byte the rules MikroTikAPI.enable_anti_tethering() pushes in its
+    default raw-ttl-drop mode -- same table, chain, matches and comment -- so
+    the admin toggle's disable/repair find and replace them. One drop per
+    enabled hotspot server interface and TTL, placed before the first static
+    prerouting rule. Static-IP customers (address list bitwave-static) are
+    exempt; see the scoping note above ANTI_TETHER_COMMENT.
+
+    Runs before /complete, which records routers.hotspot_sharing_blocked=True.
+    Idempotent: managed rules in raw, mangle and filter (strict mode) are
+    removed by comment first.
+    """
+    from app.services.mikrotik_api import MikroTikAPI
+
+    comment = MikroTikAPI.ANTI_TETHER_COMMENT
+    exempt = MikroTikAPI.ANTI_TETHER_EXEMPT_SRC_LIST
+    ttls = ";".join(f'"{ttl}"' for ttl in MikroTikAPI.ANTI_TETHER_TTL_MATCHES)
+    add = (
+        "/ip firewall raw add chain=prerouting action=drop in-interface=$bwIf"
+        f" src-address-list=!{exempt} ttl=$bwTtl comment=\"{comment}\""
+    )
+    return f"""
+# ---- STEP 8b: ANTI-TETHERING (on by default) ----
+# Blocks customers sharing their plan via phone hotspot or their own router.
+# The reseller can turn it off per router in the dashboard.
+
+:foreach i in=[/ip firewall raw find where comment="{comment}"] do={{ :do {{ /ip firewall raw remove $i }} on-error={{}} }}
+:foreach i in=[/ip firewall mangle find where comment="{comment}"] do={{ :do {{ /ip firewall mangle remove $i }} on-error={{}} }}
+:foreach i in=[/ip firewall filter find where comment="{comment}"] do={{ :do {{ /ip firewall filter remove $i }} on-error={{}} }}
+:do {{
+    :local bwAnchor ""
+    :local bwStatic [/ip firewall raw find where chain=prerouting disabled=no dynamic=no]
+    :if ([:len $bwStatic] > 0) do={{ :set bwAnchor [:pick $bwStatic 0] }}
+    :foreach hs in=[/ip hotspot find where disabled=no] do={{
+        :local bwIf [/ip hotspot get $hs interface]
+        :foreach bwTtl in={{{ttls}}} do={{
+            :local bwPlaced false
+            :if ([:len $bwStatic] > 0) do={{
+                :do {{
+                    {add} place-before=$bwAnchor
+                    :set bwPlaced true
+                }} on-error={{}}
+            }}
+            :if ($bwPlaced = false) do={{
+                {add}
+            }}
+        }}
+    }}
+    :log info "Provisioning: anti-tethering rules applied"
+}} on-error={{
+    :log error "Provisioning: could not add {comment} rules"
 }}"""
 
 
@@ -1438,13 +1722,39 @@ def _rsc_api_access_hetzner(token: ProvisioningToken) -> str:
 
 
 def _rsc_identity_and_user(token: ProvisioningToken) -> str:
+    """Create the API account, or reset it when it already exists.
+
+    The router is registered with THIS token's password, so the account must
+    end up with it whatever state the router is in. A plain `add` inside
+    `:do ... on-error={}` failed silently on a router that already had
+    bitwave-api from an earlier setup run: the router kept the old password,
+    the server stored the new one, and every API login was refused with
+    "invalid user name or password" (router 714, SPEEDNET, 2026-11-12, the
+    same MikroTik set up the day before as router 711). So: add when missing,
+    otherwise set the password (and what the add would set) on the existing
+    account, and say so loudly in the log if neither works.
+    """
+    user = API_USERNAME
+    params = f'password="{token.router_admin_password}" group=full comment="Bitwave backend API account"'
     return f"""
 # ---- STEP 8: CREATE API SERVICE ACCOUNT & SET IDENTITY ----
 
 /system identity set name={token.identity}
-:do {{ /user add name={API_USERNAME} password="{token.router_admin_password}" group=full comment="Bitwave backend API account" }} on-error={{}}
+# add-or-set: a router set up before already has {user} with an older
+# password; it must get this setup's password or the server cannot log in.
+:do {{
+    :if ([:len [/user find where name={user}]] = 0) do={{
+        /user add name={user} {params}
+        :log info "Provisioning: API user {user} created"
+    }} else={{
+        /user set [find where name={user}] {params} disabled=no
+        :log info "Provisioning: API user {user} already existed -- password reset for this setup"
+    }}
+}} on-error={{
+    :log error "PROVISION WARNING: could not create or update API user {user} -- the server will not be able to log in"
+}}
 
-:log info "Provisioning: Identity set to {token.identity}, API user created" """
+:log info "Provisioning: Identity set to {token.identity}, API user ready" """
 
 
 def _rsc_remove_router_command_agent() -> str:
@@ -1466,7 +1776,7 @@ def _rsc_remove_router_command_agent() -> str:
 """
 
 
-def _rsc_notify_and_reboot(token: ProvisioningToken) -> str:
+def _rsc_notify_server(token: ProvisioningToken) -> str:
     base_url = provision_base_url_for_vpn(token.vpn_type)
     t = token.token
     cert_flag = fetch_certificate_flag_for_url(base_url, token.vpn_type)
@@ -1479,13 +1789,28 @@ def _rsc_notify_and_reboot(token: ProvisioningToken) -> str:
     :log info "Provisioning: Server notified -- router registered"
 }} on-error={{
     :log warning "Provisioning: Could not notify server (register manually via admin panel)"
-}}
+}}"""
 
+
+def _rsc_reboot() -> str:
+    """Reboot from a background job, never inline.
+
+    Run inline under /import from a terminal, /system reboot asks
+    "Reboot, yes? [y/N]" on the console. When that terminal is closed (Winbox
+    New Terminal, router 689 on 2026-11-07) nobody answers: the import job
+    hangs for good, burns CPU and the router never reboots. A job started with
+    :execute (RouterOS 6 and 7) has no console, so the reboot runs without a
+    prompt, and the import itself finishes and returns at once.
+    """
+    return """
 # ---- STEP 10: REBOOT ----
 
 :log info "Provisioning complete! Rebooting in 5 seconds..."
-:delay 5s
-/system reboot
+:do {
+    :execute script=":delay 5s; /system reboot"
+} on-error={
+    :log warning "Provisioning: could not schedule the reboot -- reboot the router manually"
+}
 """
 
 
@@ -1518,12 +1843,19 @@ def generate_rsc_script(token: ProvisioningToken) -> str:
         parts.append(_rsc_backup_wireguard(token))
 
     parts.append(_rsc_hotspot(token))
+    parts.append(_rsc_anti_tunnel_lift())
     parts.append(_rsc_login_page(token))
     parts.append(_rsc_walled_garden(token))
     parts.append(_rsc_api_access_hetzner(token) if hetzner else _rsc_api_access())
     parts.append(_rsc_identity_and_user(token))
     parts.append(_rsc_remove_router_command_agent())
-    parts.append(_rsc_notify_and_reboot(token))
+    # Before /complete, which records the router with anti-tethering ON.
+    parts.append(_rsc_anti_tethering())
+    parts.append(_rsc_notify_server(token))
+    # After /complete: the relay block would reject a RouterOS 6 router's
+    # plain-HTTP /complete to the Cloudflare-fronted backend.
+    parts.append(_rsc_anti_tunnel(token))
+    parts.append(_rsc_reboot())
 
     return "\n".join(parts)
 
@@ -1582,6 +1914,7 @@ async def _create_hetzner_provisioning_token(
     payment_methods: Optional[list],
     vpn_type: str,
     is_routerboard: bool,
+    ssid: Optional[str] = None,
 ) -> ProvisioningToken:
     """PROVISION_MGMT_TO_HETZNER: one management tunnel, to Hetzner, nothing on AWS.
 
@@ -1634,7 +1967,7 @@ async def _create_hetzner_provisioning_token(
             router_name=router_name,
             identity=identity,
             wireguard_ip=vpn_ip,
-            ssid=DEFAULT_WIFI_SSID,
+            ssid=sanitize_wifi_ssid(ssid) or DEFAULT_WIFI_SSID,
             router_admin_password=api_password,
             vpn_type=vpn_type,
             wg_private_key=wg_private_key,
@@ -1687,6 +2020,7 @@ async def create_provisioning_token(
     payment_methods: Optional[list] = None,
     vpn_type: str = "wireguard",
     is_routerboard: bool = False,
+    ssid: Optional[str] = None,
 ) -> ProvisioningToken:
     """
     By default (PROVISION_MGMT_TO_HETZNER) the token gets one management
@@ -1705,7 +2039,7 @@ async def create_provisioning_token(
 
     if mgmt_to_hetzner_active(vpn_type):
         return await _create_hetzner_provisioning_token(
-            db, user_id, payment_methods, vpn_type, is_routerboard
+            db, user_id, payment_methods, vpn_type, is_routerboard, ssid
         )
 
     if not settings.SERVER_PUBLIC_IP:
@@ -1766,7 +2100,7 @@ async def create_provisioning_token(
             router_name=router_name,
             identity=identity,
             wireguard_ip=vpn_ip,
-            ssid=DEFAULT_WIFI_SSID,
+            ssid=sanitize_wifi_ssid(ssid) or DEFAULT_WIFI_SSID,
             router_admin_password=api_password,
             vpn_type=vpn_type,
             wg_private_key=wg_private_key,
@@ -1858,6 +2192,9 @@ async def complete_provisioning(
         payment_methods=token.payment_methods,
         # The generated RouterOS script no longer installs the outbound agent.
         router_agent_enabled=False,
+        # STEP 8b of the script installed the anti-tethering rules, so the
+        # admin toggle starts ON; the reseller can turn it off per router.
+        hotspot_sharing_blocked=True,
     )
     if token_mgmt_to_hetzner(token):
         # "wireguard" (wg-hz) / "sstp" (sstp-hetzner): the router's only

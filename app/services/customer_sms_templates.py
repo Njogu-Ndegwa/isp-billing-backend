@@ -46,7 +46,7 @@ _PLACEHOLDER = re.compile(r"\{([A-Za-z_]+)\}")
 # to customise a message. It is the full form of the built-in default.
 DEFAULT_TEMPLATE_TEXT: dict[str, str] = {
     EVENT_RECEIPT: (
-        "Payment of {amount} received. Your {plan} is active until {expiry}. "
+        "Payment of {amount} received. Your internet is active until {expiry}. "
         "Ref {reference}. - {brand}"
     ),
     EVENT_WELCOME: (
@@ -246,7 +246,7 @@ def default_reminder(context: dict[str, str]) -> str:
 
 
 def default_receipt(context: dict[str, str]) -> str:
-    text = f"Payment of {context['amount']} received. Your {context['plan']}"
+    text = f"Payment of {context['amount']} received. Your internet"
     text += f" is active until {context['expiry']}." if context["expiry"] else " is active."
     if context["reference"]:
         text += f" Ref {context['reference']}."

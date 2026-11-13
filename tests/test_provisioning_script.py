@@ -9,7 +9,7 @@ BEFORE applying any configuration.
 """
 
 from app.db.models import ProvisioningToken
-from app.services.provisioning import generate_rsc_script
+from app.services.provisioning import DEVICE_MODE_UPDATE_COMMAND, generate_rsc_script
 
 
 def _token(vpn_type: str) -> ProvisioningToken:
@@ -61,13 +61,13 @@ def test_no_direct_device_mode_reference():
     for vpn_type in ("wireguard", "l2tp"):
         script = generate_rsc_script(_token(vpn_type))
         assert "/system/device-mode" not in script.replace(
-            "/system/device-mode/update hotspot=yes", ""
+            DEVICE_MODE_UPDATE_COMMAND, ""
         ), vpn_type  # the remedy text in log messages is allowed
 
 
 def test_remedy_message_matches_platform():
     wg_script = generate_rsc_script(_token("wireguard"))
-    assert "/system/device-mode/update hotspot=yes" in wg_script
+    assert DEVICE_MODE_UPDATE_COMMAND in wg_script
     l2tp_script = generate_rsc_script(_token("l2tp"))
     assert "hotspot package" in l2tp_script
 
@@ -98,3 +98,84 @@ def test_no_line_continuation_backslashes():
         assert not any(
             line.rstrip().endswith("\\") for line in script.splitlines()
         ), vpn_type
+
+
+# ---- smips on RouterOS 7.20+ (hAP lite / hAP mini / cAP lite) ----
+# Since 7.20 smips builds ship hotspot as a separate extra package, so the
+# device-mode remedy is wrong there (reseller 449, 2026-10-24). The script
+# reads architecture + version at runtime and swaps in the right message.
+
+SMIPS_TEXT = "since RouterOS 7.20 smips builds do not include hotspot"
+
+
+def _preflight_abort_block(script: str) -> str:
+    start = script.index(PROBE)
+    end = script.index(":error \"hotspot feature unavailable", start)
+    return script[start:end]
+
+
+def test_smips_720_message_in_preflight_for_both_vpn_types():
+    # The router may run a different RouterOS than the reseller picked, so the
+    # runtime check is in both the v6 and v7 scripts.
+    for vpn_type in ("wireguard", "l2tp"):
+        script = generate_rsc_script(_token(vpn_type))
+        block = _preflight_abort_block(script)
+        assert SMIPS_TEXT in block, vpn_type
+        assert "RouterOS 6.49.x" in block, vpn_type
+        assert 'hotspot-" . $bwVer . "-smips.npk from the extra-packages zip' in block, vpn_type
+        assert "[/system resource get architecture-name]" in block, vpn_type
+        assert "[/system resource get version]" in block, vpn_type
+        assert '($bwArch = "smips")' in block, vpn_type
+        assert "[:tonum $bwMinor] >= 20" in block, vpn_type
+        # Still aborts before any config is applied.
+        assert script.index(SMIPS_TEXT) < script.index("STEP 1: WAN"), vpn_type
+
+
+def test_remedy_gives_the_full_command_and_says_to_rerun_it():
+    # `home` mode also blocks fetch and scheduler, so hotspot=yes alone is not
+    # enough. A code stays usable until completed or expired, so re-running the
+    # same command is the right advice.
+    assert DEVICE_MODE_UPDATE_COMMAND == (
+        "/system/device-mode/update fetch=yes scheduler=yes hotspot=yes"
+    )
+    block = _preflight_abort_block(generate_rsc_script(_token("wireguard")))
+    assert DEVICE_MODE_UPDATE_COMMAND in block
+    assert "re-run this same provisioning command" in block
+    assert "connect the router to the billing system" in block
+    assert "until it is completed or expires after 24 hours" in block
+    assert "within 5 minutes" in block
+
+
+def test_no_script_message_names_hotspot_alone():
+    for vpn_type in ("wireguard", "l2tp"):
+        assert "device-mode/update hotspot=yes" not in generate_rsc_script(_token(vpn_type))
+
+
+def test_default_remedy_kept_for_other_architectures():
+    # The platform remedy is the default; the smips text only replaces it at
+    # runtime when the router reports smips >= 7.20.
+    wg_block = _preflight_abort_block(generate_rsc_script(_token("wireguard")))
+    assert ':local bwRemedy "this is usually device-mode blocking hotspot' in wg_block
+    l2tp_block = _preflight_abort_block(generate_rsc_script(_token("l2tp")))
+    assert ':local bwRemedy "on RouterOS v6 this usually means the hotspot package' in l2tp_block
+    for block in (wg_block, l2tp_block):
+        assert ":log error (\"PROVISION ABORTED: the hotspot feature is not available on this router -- \" . $bwRemedy . \".\")" in block
+        # A failed /system resource read must not change the abort.
+        assert "} on-error={}" in block
+
+
+def test_preflight_block_is_balanced():
+    # An unbalanced brace/bracket/quote here would be a parse error that
+    # breaks the import on EVERY router, not just smips ones.
+    for vpn_type in ("wireguard", "l2tp"):
+        script = generate_rsc_script(_token(vpn_type))
+        start = script.index("# ---- PRE-FLIGHT: HOTSPOT AVAILABILITY CHECK ----")
+        end = script.index("STEP 1: WAN")
+        code = "\n".join(
+            line for line in script[start:end].splitlines()
+            if not line.strip().startswith("#")
+        )
+        assert code.count("{") == code.count("}"), vpn_type
+        assert code.count("[") == code.count("]"), vpn_type
+        assert code.count("(") == code.count(")"), vpn_type
+        assert code.count('"') % 2 == 0, vpn_type

@@ -38,6 +38,7 @@ os.environ.setdefault("MPESA_ENVIRONMENT", "sandbox")
 # inherit pilot behaviour by accident. Pilot tests opt in explicitly.
 os.environ.setdefault("REALTIME_PILOT_ROUTER_IDS", "")
 os.environ.setdefault("REALTIME_PUSH_INSTALL_AT_SETUP", "false")  # no background router installs in tests
+os.environ.setdefault("PPPOE_RECOVERY_SWEEP_ENABLED", "false")  # no background recovery sweeps in tests
 
 from datetime import datetime
 from typing import AsyncIterator
@@ -190,6 +191,8 @@ async def engine(monkeypatch):
     monkeypatch.setattr(_router_agent_routes, "async_session", factory)
     import app.services.router_agent_fleet as _router_agent_fleet
     monkeypatch.setattr(_router_agent_fleet, "async_session", factory)
+    import app.services.deleted_customer_cleanup as _deleted_customer_cleanup
+    monkeypatch.setattr(_deleted_customer_cleanup, "async_session", factory)
 
     try:
         yield eng
@@ -240,6 +243,31 @@ def reset_expiry_cleanup_router_memo():
     mikrotik_background._expiry_cleanup_backoff_hydrated = False
     ops_health_problem_routers.reset_cache()
     router_diagnosis.reset()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_presence_probe(monkeypatch):
+    """Reconnect's live device-presence probe talks to RouterOS. Default it to
+    "could not tell" so no test dials a router; presence tests patch it."""
+    from app.services import device_entitlements
+
+    async def _unknown(_router_info, _macs):
+        return None
+
+    monkeypatch.setattr(device_entitlements, "probe_online_macs", _unknown)
+
+
+@pytest.fixture(autouse=True)
+def _no_deleted_customer_router_cleanup(monkeypatch):
+    """Deleting a hotspot customer cleans its router. Default that to "removed"
+    so no delete test dials a router; the cleanup tests patch it."""
+    from app.services import deleted_customer_cleanup
+
+    def _removed(_router_info, customers_data):
+        return {"removed": [{"id": c["id"]} for c in customers_data], "failed": [], "connected": True}
+
+    monkeypatch.setattr(deleted_customer_cleanup, "_cleanup_on_router", _removed)
+    deleted_customer_cleanup._router_failed_at.clear()
 
 
 @pytest.fixture(autouse=True)

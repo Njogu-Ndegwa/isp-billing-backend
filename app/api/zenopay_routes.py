@@ -125,6 +125,9 @@ async def zenopay_webhook(
         logger.info("[ZENOPAY WEBHOOK] Payment CONFIRMED for customer %s", customer.id)
 
         # Resolve the plan (check pending_update_data for plan changes)
+        from app.services.pppoe_expired_guards import drop_unpaid_page_plan
+
+        drop_unpaid_page_plan(customer, txn.amount)
         pending_data = None
         if customer.pending_update_data:
             try:
@@ -207,6 +210,13 @@ async def zenopay_webhook(
                 }
 
         await db.commit()
+
+        if customer.plan and customer.router and customer.plan.connection_type == ConnectionType.STATIC_IP:
+            # Static IP: re-enable the binding/queue (fire-and-forget after commit;
+            # the static-IP enforcement job re-applies if the router was unreachable).
+            from app.services.static_ip import schedule_static_provision
+
+            schedule_static_provision(customer.id)
 
         if pppoe_payload:
             from app.services.pppoe_provisioning import call_pppoe_provision

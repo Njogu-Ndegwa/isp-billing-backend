@@ -19,6 +19,8 @@ from typing import Optional
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
+from app.core.local_time import to_local, to_utc
 from app.db.models import (
     ConnectionType,
     Customer,
@@ -397,11 +399,258 @@ async def pooled_period_usage_bytes(
     return own_bytes + int(others or 0)
 
 
+# Periods opened after this were opened with the right plan (reseller_payments fix).
+STALE_CAP_REPAIR_BEFORE = datetime(2026, 11, 6)
+
+
+async def repair_stale_cap_snapshots(db: AsyncSession, *, now: Optional[datetime] = None) -> list[dict]:
+    """Give customers the cap of the plan they paid for, where a renewal missed it.
+
+    Until Nov 2026 a voucher bought in a session that had already loaded the
+    customer's previous plan opened the new usage period with that previous
+    plan's cap: an owner who paid for 200 GB was throttled at 2 GB.
+
+    Only ever loosens, and only when the record proves it: the open period was
+    opened by the latest payment, that payment is for the customer's current
+    plan, and the snapshot equals the previous payment's plan cap. A snapshot
+    that differs for any other reason is a reseller's later plan edit, which is
+    kept on purpose (see ``fup_cap_mb``). Shared devices still holding the same
+    stale cap move with their owner. The cap sampler then lifts any throttle no
+    longer over the cap. Idempotent; the caller commits.
+    """
+    from app.db.models import Customer, CustomerPayment, CustomerStatus
+
+    now = now or datetime.utcnow()
+    rows = (
+        await db.execute(
+            select(CustomerUsagePeriod, Customer, Plan)
+            .join(Customer, Customer.id == CustomerUsagePeriod.customer_id)
+            .join(Plan, Plan.id == Customer.plan_id)
+            .where(
+                CustomerUsagePeriod.closed_at.is_(None),
+                CustomerUsagePeriod.cap_mb_snapshot.isnot(None),
+                CustomerUsagePeriod.period_start < STALE_CAP_REPAIR_BEFORE,
+                Customer.status == CustomerStatus.ACTIVE,
+                Customer.expiry > now,
+                Customer.subscription_owner_id.is_(None),
+                or_(
+                    Plan.data_cap_mb.is_(None),
+                    CustomerUsagePeriod.cap_mb_snapshot < Plan.data_cap_mb,
+                ),
+            )
+        )
+    ).all()
+
+    repaired: list[dict] = []
+    for period, customer, plan in rows:
+        payments = (
+            await db.execute(
+                select(CustomerPayment.plan_id, CustomerPayment.payment_date)
+                .where(CustomerPayment.customer_id == customer.id)
+                .order_by(CustomerPayment.id.desc())
+                .limit(2)
+            )
+        ).all()
+        if len(payments) < 2:
+            continue
+        (last_plan_id, last_date), (previous_plan_id, _previous_date) = payments
+        if (
+            last_plan_id != customer.plan_id
+            or previous_plan_id is None
+            or previous_plan_id == customer.plan_id
+            or last_date is None
+            or abs((period.period_start - last_date).total_seconds()) >= 5
+        ):
+            continue
+        previous_cap = (
+            await db.execute(select(Plan.data_cap_mb).where(Plan.id == previous_plan_id))
+        ).scalar_one_or_none()
+        if previous_cap != period.cap_mb_snapshot:
+            continue
+
+        stale_cap = period.cap_mb_snapshot
+        members = (
+            await db.execute(
+                select(CustomerUsagePeriod)
+                .join(Customer, Customer.id == CustomerUsagePeriod.customer_id)
+                .where(
+                    Customer.subscription_owner_id == customer.id,
+                    CustomerUsagePeriod.closed_at.is_(None),
+                    CustomerUsagePeriod.cap_mb_snapshot == stale_cap,
+                )
+            )
+        ).scalars().all()
+        for row in [period, *members]:
+            row.cap_mb_snapshot = plan.data_cap_mb
+            row.fup_action_snapshot = plan.fup_action
+        repaired.append(
+            {
+                "customer_id": customer.id,
+                "router_id": customer.router_id,
+                "plan_id": plan.id,
+                "from_cap_mb": stale_cap,
+                "to_cap_mb": plan.data_cap_mb,
+                "periods": 1 + len(members),
+            }
+        )
+    return repaired
+
+
+# --------------------------- FUP window (plan vs daily) ---------------------------
+
+FUP_PERIOD_PLAN = "plan"
+FUP_PERIOD_DAILY = "daily"
+FUP_PERIODS = (FUP_PERIOD_PLAN, FUP_PERIOD_DAILY)
+
+
+def plan_fup_period(plan: Optional[Plan]) -> str:
+    """The plan's FUP window. Anything unknown or missing means "plan"."""
+    value = str(getattr(plan, "fup_period", None) or FUP_PERIOD_PLAN).strip().lower()
+    return value if value in FUP_PERIODS else FUP_PERIOD_PLAN
+
+
+def fup_cap_mb(
+    period: Optional[CustomerUsagePeriod], plan: Optional[Plan]
+) -> Optional[int]:
+    """The data cap (MB) FUP enforces for this period, or None/<=0 for no cap.
+
+    A "plan" window uses the cap snapshotted when the period opened, so a
+    reseller lowering a plan's cap does not move the line under a customer
+    mid-period (raising or removing it is carried over by the plan route).
+
+    A daily window uses the plan's cap as it is now. Each day is a fresh
+    window, and the snapshot can belong to a different setup: a reseller who
+    turns a 70 GB monthly plan into a 5 GB daily one leaves every customer
+    already inside their month with a 70 GB snapshot, which then served as
+    their *daily* cap until they renewed -- up to a month of heavy users
+    never being throttled (seen on prod 2026-10-30).
+    """
+    if plan is not None and plan_fup_period(plan) == FUP_PERIOD_DAILY:
+        return plan.data_cap_mb
+    if period is not None and period.cap_mb_snapshot is not None:
+        return period.cap_mb_snapshot
+    return plan.data_cap_mb if plan is not None else None
+
+
+def daily_fup_reset_utc(now: datetime) -> datetime:
+    """UTC instant of the most recent daily FUP reset at or before ``now``.
+
+    The reset is local time (EAT) at ``settings.FUP_DAILY_RESET_HOUR``. EAT is a
+    whole-hour offset, so the boundary always falls on an hourly
+    ``customer_usage_buckets`` edge and the daily sum needs no partial bucket.
+    """
+    hour = int(settings.FUP_DAILY_RESET_HOUR or 0) % 24
+    local = to_local(now)
+    reset_local = datetime(local.year, local.month, local.day, hour)
+    if local < reset_local:
+        reset_local -= timedelta(days=1)
+    return to_utc(reset_local)
+
+
+def fup_window_start(
+    period: CustomerUsagePeriod, plan: Optional[Plan], now: datetime
+) -> Optional[datetime]:
+    """Start of the window the cap is measured over, or None for a "plan" window.
+
+    For a daily plan this is the later of today's reset and the start of the
+    current paid period, so a renewal still hands out a fresh allowance the way
+    it always has.
+    """
+    if plan_fup_period(plan) != FUP_PERIOD_DAILY:
+        return None
+    reset = daily_fup_reset_utc(now)
+    if period.period_start and period.period_start > reset:
+        return period.period_start
+    return reset
+
+
+async def _pooled_bucket_usage_since(
+    db: AsyncSession, customer: Customer, since: datetime
+) -> int:
+    """Bytes the customer's whole subscription used since ``since`` (hourly ledger).
+
+    Same membership rules as :func:`pooled_period_usage_bytes`: the owner, every
+    current shared device, and devices removed from the plan up to their removal.
+    """
+    # Credits made earlier in this transaction live on pending bucket rows.
+    await db.flush()
+    owner_id = customer.subscription_owner_id or customer.id
+    current_ids = set(
+        (
+            await db.execute(
+                select(Customer.id).where(
+                    or_(Customer.id == owner_id, Customer.subscription_owner_id == owner_id)
+                )
+            )
+        ).scalars().all()
+    )
+    current_ids.add(customer.id)
+    filters = [CustomerUsageBucket.customer_id.in_(current_ids)]
+    removed = (
+        await db.execute(
+            select(DevicePairing.customer_id, func.max(DevicePairing.expires_at))
+            .where(
+                DevicePairing.subscription_owner_customer_id == owner_id,
+                DevicePairing.is_subscription_share == True,  # noqa: E712
+                DevicePairing.customer_id.notin_(current_ids),
+            )
+            .group_by(DevicePairing.customer_id)
+        )
+    ).all()
+    for removed_customer_id, removed_at in removed:
+        if removed_at is not None and removed_at <= since:
+            continue
+        cond = CustomerUsageBucket.customer_id == removed_customer_id
+        if removed_at is not None:
+            cond = and_(cond, CustomerUsageBucket.bucket_start < removed_at)
+        filters.append(cond)
+
+    total = (
+        await db.execute(
+            select(
+                func.coalesce(
+                    func.sum(CustomerUsageBucket.upload_bytes + CustomerUsageBucket.download_bytes), 0
+                )
+            ).where(CustomerUsageBucket.bucket_start >= since, or_(*filters))
+        )
+    ).scalar_one()
+    return int(total or 0)
+
+
+async def fup_usage_bytes(
+    db: AsyncSession,
+    customer: Customer,
+    period: CustomerUsagePeriod,
+    plan: Optional[Plan] = None,
+    now: Optional[datetime] = None,
+    cap_bytes: Optional[int] = None,
+) -> int:
+    """Bytes the FUP cap is enforced against, for the plan's FUP window.
+
+    * ``plan`` window (default): the open period's usage, pooled across a shared
+      subscription -- exactly the pre-daily-FUP figure. When ``cap_bytes`` is
+      given and the device alone is already over it, the pooled query is skipped.
+    * ``daily`` window: usage since today's reset (see :func:`fup_window_start`).
+      A period that began after the reset is the window itself, so its own
+      totals are used; otherwise the hourly per-customer ledger is summed.
+    """
+    plan = plan if plan is not None else customer.plan
+    now = now or datetime.utcnow()
+    window = fup_window_start(period, plan, now)
+    if window is not None and not (period.period_start and window == period.period_start):
+        return await _pooled_bucket_usage_since(db, customer, window)
+    own = int(period.total_bytes or 0)
+    if cap_bytes is not None and own >= cap_bytes:
+        return own
+    return await pooled_period_usage_bytes(db, customer, period)
+
+
 async def on_renewal(
     db: AsyncSession,
     customer: Customer,
     plan: Optional[Plan] = None,
     now: Optional[datetime] = None,
+    defer_router_io: bool = False,
 ) -> Optional[CustomerUsagePeriod]:
     """Renewal hook: close current period, open a new one, and lift any FUP.
 
@@ -419,18 +668,23 @@ async def on_renewal(
     try:
         previous = await close_open_period(db, customer.id, now=now)
     except Exception as e:
+        if defer_router_io:
+            raise
         logger.error(f"[USAGE] close_open_period failed for customer {customer.id}: {e}")
         previous = None
 
     try:
         from app.services.fup import revert as fup_revert
 
-        await fup_revert(db, customer, plan=plan, period=previous, now=now)
+        if not defer_router_io:
+            await fup_revert(db, customer, plan=plan, period=previous, now=now)
     except Exception as e:
         logger.error(f"[USAGE] FUP revert failed for customer {customer.id}: {e}")
 
     try:
         return await get_or_open_current_period(db, customer, plan=plan, now=now)
     except Exception as e:
+        if defer_router_io:
+            raise
         logger.error(f"[USAGE] open new period failed for customer {customer.id}: {e}")
         return None

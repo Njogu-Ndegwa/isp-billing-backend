@@ -2,7 +2,7 @@
 
 The platform bills resellers a SaaS subscription — this is real money:
   * 3% of hotspot revenue collected in the billing period
-  * KES 25 per ACTIVE PPPoE user whose access is unexpired at invoice time
+  * KES 25 per ACTIVE PPPoE/static-IP user unexpired at invoice time
   * KES 500 minimum monthly charge
 
 Pins:
@@ -48,6 +48,7 @@ from app.services.subscription import (
     MAX_INVOICE_PERIOD_MONTHS,
     cap_invoice_period_start,
     calculate_reseller_charges,
+    first_invoice_fallback_start,
     generate_catchup_invoices,
     generate_invoice_for_reseller,
     generate_monthly_invoices,
@@ -145,12 +146,13 @@ async def test_charges_minimum_charge_floor(db):
     assert charges["final_charge"] == MINIMUM_CHARGE
 
 
-async def test_charges_exclude_non_qualifying_payments(db):
+@pytest.mark.parametrize("connection_type", [ConnectionType.PPPOE, ConnectionType.STATIC_IP])
+async def test_charges_exclude_non_qualifying_payments(db, connection_type):
     """Hotspot revenue counts only COMPLETED + counts_as_revenue payments made
     inside [period_start, period_end) by customers whose plan is HOTSPOT."""
     reseller = await make_reseller(db)
     hotspot_plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
-    pppoe_plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
+    pppoe_plan = await make_plan(db, reseller, connection_type=connection_type)
     hot_cust = await make_customer(db, reseller, hotspot_plan)
     ppp_cust = await make_customer(db, reseller, pppoe_plan)
 
@@ -171,9 +173,10 @@ async def test_charges_exclude_non_qualifying_payments(db):
     assert charges["hotspot_charge"] == 300.0
 
 
-async def test_charges_pppoe_counts_only_active_unexpired_customers_at_cutoff(db):
+@pytest.mark.parametrize("connection_type", [ConnectionType.PPPOE, ConnectionType.STATIC_IP])
+async def test_charges_pppoe_counts_only_active_unexpired_customers_at_cutoff(db, connection_type):
     reseller = await make_reseller(db)
-    pppoe_plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
+    pppoe_plan = await make_plan(db, reseller, connection_type=connection_type)
     hotspot_plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
 
     await make_customer(
@@ -220,6 +223,51 @@ async def test_charges_pppoe_counts_only_active_unexpired_customers_at_cutoff(db
 
     assert charges["pppoe_user_count"] == 1
     assert charges["pppoe_charge"] == PPPOE_PER_USER
+    assert charges["final_charge"] == MINIMUM_CHARGE
+
+
+async def test_charges_combine_pppoe_and_static_customers_for_only_this_reseller(db):
+    reseller = await make_reseller(db)
+    other = await make_reseller(db)
+    for owner, connection_type, count in [
+        (reseller, ConnectionType.PPPOE, 12),
+        (reseller, ConnectionType.STATIC_IP, 11),
+        (other, ConnectionType.STATIC_IP, 3),
+    ]:
+        plan = await make_plan(db, owner, connection_type=connection_type)
+        for _ in range(count):
+            await make_customer(db, owner, plan, status=CustomerStatus.ACTIVE,
+                                expiry=PERIOD_END + timedelta(days=1))
+
+    charges = await calculate_reseller_charges(db, reseller.id, PERIOD_START, PERIOD_END)
+
+    assert charges["pppoe_user_count"] == 23
+    assert charges["pppoe_charge"] == 575.0
+    assert charges["hotspot_charge"] == 0.0
+    assert charges["final_charge"] == 575.0
+
+
+async def test_first_invoice_for_73_static_customers_is_1825_kes(db):
+    reseller = await make_reseller(db, subscription_status=SubscriptionStatus.TRIAL)
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.STATIC_IP)
+    for index in range(73):
+        customer = await make_customer(
+            db, reseller, plan, status=CustomerStatus.ACTIVE,
+            static_ip=f"172.172.10.{index + 2}", expiry=PERIOD_END + timedelta(days=1),
+        )
+        customer.mac_address = None  # Static subscribers do not have hotspot MAC accounts.
+    await db.commit()
+
+    invoice = await generate_invoice_for_reseller(db, reseller.id, PERIOD_START, PERIOD_END)
+    await db.commit()
+
+    assert invoice.pppoe_user_count == 73
+    assert invoice.pppoe_charge == 1825.0
+    assert invoice.hotspot_charge == 0.0
+    assert invoice.final_charge == 1825.0
+    assert invoice.currency == "KES"
+    assert invoice.status == InvoiceStatus.PENDING
+    assert await _invoice_count(db, reseller.id) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +753,100 @@ async def test_pre_expiry_drops_sales_older_than_one_calendar_month(db):
         <= invoice.period_start
         <= invoice_calendar_month_start(after)
     )
+
+
+# ---------------------------------------------------------------------------
+# First invoice: the period never starts before the account existed
+# ---------------------------------------------------------------------------
+
+async def _pending_invoice(db, user_id):
+    return (
+        await db.execute(
+            select(SubscriptionInvoice).where(
+                SubscriptionInvoice.user_id == user_id,
+                SubscriptionInvoice.status == InvoiceStatus.PENDING,
+            )
+        )
+    ).scalar_one()
+
+
+async def test_pre_expiry_first_invoice_starts_at_signup_not_before(db):
+    """A trial reseller with no subscriptions row used to get a first period
+    of expiry - 30 days, i.e. ~3 weeks before they signed up."""
+    now = datetime.utcnow()
+    signed_up = now - timedelta(days=6)
+    reseller = await make_reseller(
+        db,
+        subscription_status=SubscriptionStatus.TRIAL,
+        created_at=signed_up,
+        subscription_expires_at=signed_up + timedelta(days=7),
+    )
+    hotspot_plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
+    customer = await make_customer(db, reseller, hotspot_plan)
+    await _add_payment(db, reseller, customer, 4000.0, created_at=now - timedelta(days=3))
+
+    result = await generate_pre_expiry_invoices(db)
+
+    assert result["created"] == 1
+    invoice = await _pending_invoice(db, reseller.id)
+    assert invoice.period_start == signed_up
+    assert invoice.period_start >= reseller.created_at
+
+    # Amounts are what the old, earlier start would have produced.
+    old_start = reseller.subscription_expires_at - timedelta(days=30)
+    old = await calculate_reseller_charges(db, reseller.id, old_start, invoice.period_end)
+    assert invoice.hotspot_revenue == old["hotspot_revenue"] == 4000.0
+    assert invoice.final_charge == old["final_charge"]
+
+
+async def test_pre_expiry_first_invoice_for_older_account_keeps_30_day_start(db):
+    now = datetime.utcnow()
+    reseller = await make_reseller(
+        db,
+        subscription_status=SubscriptionStatus.ACTIVE,
+        created_at=now - timedelta(days=120),
+        subscription_expires_at=now + timedelta(days=3),
+    )
+
+    result = await generate_pre_expiry_invoices(db)
+
+    assert result["created"] == 1
+    invoice = await _pending_invoice(db, reseller.id)
+    expected = cap_invoice_period_start(
+        reseller.subscription_expires_at - timedelta(days=30), invoice.period_end
+    )
+    assert invoice.period_start == expected
+
+
+async def test_catchup_first_invoice_without_created_at_uses_30_day_start(db):
+    now = datetime.utcnow()
+    reseller = await make_reseller(
+        db,
+        subscription_status=SubscriptionStatus.ACTIVE,
+        subscription_expires_at=now - timedelta(days=2),
+    )
+    reseller.created_at = None
+    await db.commit()
+
+    result = await generate_catchup_invoices(db)
+
+    assert result["created"] == 1
+    invoice = await _pending_invoice(db, reseller.id)
+    expected = cap_invoice_period_start(
+        reseller.subscription_expires_at - timedelta(days=30), invoice.period_end
+    )
+    assert invoice.period_start == expected
+
+
+def test_first_invoice_fallback_start_clamps_to_created_at():
+    expires = datetime(2026, 10, 20)
+    new = SimpleNamespace(subscription_expires_at=expires, created_at=datetime(2026, 10, 13))
+    old = SimpleNamespace(subscription_expires_at=expires, created_at=datetime(2026, 1, 1))
+    unknown = SimpleNamespace(subscription_expires_at=expires, created_at=None)
+
+    assert first_invoice_fallback_start(new) == datetime(2026, 10, 13)
+    assert first_invoice_fallback_start(old) == expires - timedelta(days=30)
+    assert first_invoice_fallback_start(unknown) == expires - timedelta(days=30)
 
 
 async def test_request_invoice_rejects_premature_invoice_after_renewal(db, monkeypatch):

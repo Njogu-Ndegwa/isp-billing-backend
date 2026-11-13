@@ -7,7 +7,16 @@ Run from the repo root of the code whose output should become the baseline:
 The goldens were first captured from origin/main before
 PROVISION_MGMT_TO_HETZNER existed, and deliberately regenerated once when the
 LAN-port move + WiFi access-point steps were added (feat/provision-standard-
-config: both are hotspot fixes that apply with the flag on or off).
+config: both are hotspot fixes that apply with the flag on or off), and
+again when the anti-tunnel step (STEP 4b lift + STEP 9b HTTP Injector rules)
+was added (fix/provision-anti-tunnel: a hotspot security fix for every token),
+and when STEP 10 moved the reboot into an :execute job (an inline reboot
+waits for a y/N prompt and hung a terminal import on router 689), and when
+STEP 8b made anti-tethering the default for new routers (feat/anti-
+tethering-default: same raw rules as MikroTikAPI.enable_anti_tethering),
+and when STEP 8 became add-or-set for the bitwave-api account (fix/setup-
+api-user-idempotent: a bare add kept the OLD password on a router set up
+twice, router 714 on 2026-11-12).
 tests/test_provisioning_hetzner.py asserts the flag-off output -- and the
 output for legacy tokens with the flag on -- is byte-for-byte identical to
 them. Only regenerate on purpose, and explain the diff in the PR.

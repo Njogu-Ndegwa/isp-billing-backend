@@ -88,6 +88,7 @@ async def test_expiry_settings_default_and_update(db, client, monkeypatch):
         "enabled": False,
         "reminder_offsets_minutes": [1440],
         "send_at_expiry": True,
+        "expiry_include_hotspot": True,
     }
 
     updated = await client.put("/api/messaging/expiry-settings", json={
@@ -100,10 +101,35 @@ async def test_expiry_settings_default_and_update(db, client, monkeypatch):
         "enabled": True,
         "reminder_offsets_minutes": [1440, 120],
         "send_at_expiry": False,
+        "expiry_include_hotspot": True,
     }
     row = await db.get(CustomerExpirySmsSettings, reseller.id)
     await db.refresh(row)
     assert row.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_expiry_settings_include_hotspot_toggle(db, client, monkeypatch):
+    reseller = await make_reseller(db)
+    _auth_as(monkeypatch, reseller)
+    body = {
+        "enabled": True,
+        "reminder_offsets_minutes": [1440],
+        "send_at_expiry": True,
+    }
+
+    off = await client.put("/api/messaging/expiry-settings",
+                           json={**body, "expiry_include_hotspot": False})
+    assert off.status_code == 200
+    assert off.json()["expiry_include_hotspot"] is False
+
+    # An older dashboard that does not send the field leaves it alone.
+    unchanged = await client.put("/api/messaging/expiry-settings", json=body)
+    assert unchanged.json()["expiry_include_hotspot"] is False
+
+    on = await client.put("/api/messaging/expiry-settings",
+                          json={**body, "expiry_include_hotspot": True})
+    assert on.json()["expiry_include_hotspot"] is True
 
 
 @pytest.mark.asyncio
@@ -326,6 +352,7 @@ async def test_customer_event_settings_default_update_and_preview(db, client, mo
         "payment_receipt": None, "welcome": None, "reminder": None, "expiry": None,
     }
     assert "{amount}" in body["defaults"]["payment_receipt"]
+    assert "{plan}" not in body["defaults"]["payment_receipt"]
     assert "password" in body["placeholders"]["welcome"]
     # A GET never creates the settings row.
     assert await db.get(CustomerExpirySmsSettings, reseller.id) is None
@@ -354,6 +381,12 @@ async def test_customer_event_settings_default_update_and_preview(db, client, mo
         # paybill (600980 in tests) is what customers would be told.
         "paybill": "600980", "paybill_note": None,
     }
+
+    receipt_preview = await client.post("/api/messaging/customer-events/preview", json={
+        "event": "payment_receipt",
+    })
+    assert "Your internet is active" in receipt_preview.json()["text"]
+    assert "10Mbps" not in receipt_preview.json()["text"]
 
     default_preview = await client.post("/api/messaging/customer-events/preview", json={
         "event": "welcome",

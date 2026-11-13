@@ -478,6 +478,75 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
 _WAN_RE = re.compile(r"^[A-Za-z0-9._\[\]-]{1,32}$")  # "Ether1[WAN]" exists in the fleet
 
 
+def _row_map_reads(template: str) -> str:
+    """Collapse validated v3 field reads, retaining their fields and guards."""
+    groups = [
+        ("queue simple", "q", "qrow"), ("ip hotspot host", "h", "hrow"),
+        ("ppp active", "a", "arow"), ("interface", "i", "irow"),
+        ("interface bridge host", "b", "brow"),
+        ("ip hotspot ip-binding", "g", "grow"),
+        ("ip dhcp-server lease", "l", "lrow"), ("ip neighbor", "n", "nrow"),
+        ("interface bridge port", "p", "prow"),
+    ]
+    for path, item, row in groups:
+        pattern = re.compile(r"(?m)^([ \t]*):local (\w+) (\[:tostr )?\[/" + re.escape(path)
+                             + r" get \$" + item + r" ([a-z0-9-]+)\](\])?$")
+        count = 0
+        def replace(match):
+            nonlocal count
+            indent, name, string_value, field, _ = match.groups()
+            prefix = indent + f":local {row} [/{path} get ${item}]\n" if count == 0 else ""
+            count += 1
+            value = f'(${row}->"{field}")'
+            if string_value:
+                value = "[:tostr " + value + "]"
+            return prefix + indent + f":local {name} " + value
+        template = pattern.sub(replace, template)
+        if count == 0:
+            raise ValueError("row-map reads: incompatible reporter template")
+    template = template.replace(
+        "    # An entry can vanish between find and get",
+        "    # One get returns a property map. Avoid an IPC round trip per field on\n"
+        "    # small CPUs. Unlike print as-value, get also works when run via the API.\n"
+        "    # An entry can vanish between find and get", 1,
+    )
+    return template.replace(':foreach q in=[/queue simple find] do={',
+                            ':foreach q in=[/queue simple find where name~"^(plan_|<pppoe-)"] do={', 1)
+
+
+def _native_port_json(template: str) -> str:
+    """Use RouterOS 7's encoder; keep the v3 reads, guards and wire fields.
+
+    This deliberately changes only formatting. In particular, it does not
+    change host accounting counters or depend on print-as-value/API context.
+    """
+    start = template.index("    # v3: physical ports every report")
+    end = template.index("    # v3: long lists every", start)
+    block = template[start:end]
+    block = block.replace(
+        '    :set body ($body . ",\\\"ports\\\":[")\n    :local ifirst true\n',
+        '    # bw-native-ports-json v1\n    :local portRows [:toarray ""]\n',
+    )
+    begin = block.index("            :if (!$ifirst)")
+    finish = block.index("        } on-error={}", begin)
+    fields = {
+        "name": '("" . [:tostr $inm])', "running": "$iru", "disabled": "$idi",
+        "rx_bytes": "$irx", "tx_bytes": "$itx", "link_downs": "$ild",
+        "rx_packets": "$irp", "tx_packets": "$itp", "rx_errors": "$ire",
+        "tx_errors": "$ite", "last_link_up": '("" . $ilu)',
+    }
+    values = ";".join(f'"{key}"={value}' for key, value in fields.items())
+    block = block[:begin] + "            :set portRows ($portRows, {{" + values + "}})\n" + block[finish:]
+    block = block.replace('    :set body ($body . "]")\n', r'''
+    :if ([:len $portRows] > 0) do={
+        :set body ($body . ",\"ports\":" . [:serialize to=json options=json.no-string-conversion value=$portRows])
+    } else={ :set body ($body . ",\"ports\":[]") }
+''')
+    if ":local ifirst" in block or "bw-native-ports-json v1" not in block:
+        raise ValueError("native port JSON: incompatible reporter template")
+    return template[:start] + block + template[end:]
+
+
 def render_realtime_push_script(
     *,
     identity: str,
@@ -485,6 +554,7 @@ def render_realtime_push_script(
     interval_seconds: int = 10,
     wan_interface: str = "ether1",
     lists_every: int = 5,
+    native_ports: bool = False,
 ) -> str:
     """Render the v2 (real-time pilot) reporter. See the block comment above.
 
@@ -499,8 +569,9 @@ def render_realtime_push_script(
         raise ValueError("usage-push script: interval must be 5..3600 seconds")
     if not (2 <= int(lists_every) <= 15):
         raise ValueError("usage-push script: lists_every must be 2..15")
+    template = _native_port_json(_row_map_reads(_REALTIME_TEMPLATE)) if native_ports else _REALTIME_TEMPLATE
     return gate_rsc_body(SCRIPT_NAME, (
-        _REALTIME_TEMPLATE
+        template
         .replace("__SCRIPT__", SCRIPT_NAME)
         .replace("__LOGOUT__", LOGOUT_SCRIPT_NAME)
         .replace("__SCHED__", SCHEDULER_NAME)

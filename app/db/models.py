@@ -1,6 +1,7 @@
-from sqlalchemy import Column, Integer, String, Text, Enum, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint, CheckConstraint, text
+from sqlalchemy import Column, Integer, String, Text, Enum, Date, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint, CheckConstraint, text
 from sqlalchemy.ext.asyncio import AsyncAttrs
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import Session, relationship
+from sqlalchemy import event
 from datetime import datetime
 import enum
 from sqlalchemy import JSON
@@ -157,6 +158,10 @@ class User(Base):
         server_default="trial"
     )
     subscription_expires_at = Column(DateTime, nullable=True)
+    # End of an admin "Free setup time" window (SubscriptionFreeSetupGrant has
+    # who pressed it). Until then the invoice, reminder and suspension jobs leave
+    # this account alone; afterwards normal billing resumes. NULL = never granted.
+    free_setup_until = Column(DateTime, nullable=True)
     # Country market (app/services/markets.py): fixes the reseller's operating
     # currency (plan prices, customer payments, revenue), how the platform
     # bills them and how they pay, plus language/timezone defaults. Plain
@@ -186,6 +191,12 @@ class User(Base):
     # (they opt in from the Account Statement); new signups default to
     # 'direct'. Plain string, not a Postgres enum.
     settlement_mode = Column(String(20), nullable=False, default="direct", server_default="direct")
+    # Bumped whenever this account's existing sessions must stop working (a
+    # password change or reset). Login tokens carry it as the "tv" claim and
+    # app/services/staff_access.py rejects a token whose tv is behind. Tokens
+    # issued before this column existed carry no tv and count as 0, so nobody
+    # is logged out by the deploy itself.
+    token_version = Column(Integer, nullable=False, default=0, server_default="0")
 
 class PasswordResetToken(Base):
     __tablename__ = "password_reset_tokens"
@@ -196,6 +207,10 @@ class PasswordResetToken(Base):
         nullable=False,
         index=True,
     )
+    # A staff/admin login has its own recovery identity within the owner account.
+    staff_id = Column(Integer, ForeignKey("reseller_staff.id", ondelete="CASCADE"), nullable=True)
+    staff_token_version = Column(Integer, nullable=True)
+    identity_email = Column(String(255), nullable=True)
     # sha256 hex of the raw token; the raw token only ever lives in the email link
     token_hash = Column(String(64), unique=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -215,6 +230,12 @@ class Customer(Base):
     pppoe_username = Column(String)
     pppoe_password = Column(String)
     static_ip = Column(String)
+    # Static-IP customers only: the device MAC the static IP is pinned to. The
+    # router drops forwarded traffic from the IP with any other MAC, so a
+    # neighbour who types in a paying customer's IP gets nothing. Deliberately
+    # NOT mac_address — that column is the hotspot identity and drives hotspot
+    # bindings, the bypass safety net and expiry cleanup.
+    static_mac = Column(String(50), nullable=True)
     status = Column(Enum(CustomerStatus), nullable=False, default=CustomerStatus.INACTIVE)
     expiry = Column(DateTime)
     plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"))
@@ -236,6 +257,44 @@ class Customer(Base):
     # top up. Replaced (not incremented) by the C2B handler. CHECK >= 0 at
     # DB level (see migrations/add_customer_wallet_credit.py).
     wallet_credit_kes = Column(Integer, nullable=False, default=0, server_default="0")
+    # Standing grace period set by the reseller: access is cut at
+    # expiry + grace instead of at expiry, without moving the paid expiry.
+    # See app/services/customer_grace.py.
+    grace_period_minutes = Column(Integer, nullable=False, default=0, server_default="0")
+    # Per-customer override of the plan's device allowance (Plan.max_shared_users,
+    # total devices including the owner's). NULL = use the plan's value.
+    # See app/services/subscription_sharing.py max_devices_for_customer.
+    max_devices_override = Column(Integer, nullable=True)
+    # Pause / resume (app/services/customer_pause.py). While paused the
+    # customer is INACTIVE, `expiry` is frozen at the pause moment (so nothing
+    # reads it as paid time) and the unused paid time waits in
+    # paused_remaining_seconds; resume sets expiry = now + that. NULL paused_at
+    # means not paused. pause_resume_at is an optional auto-resume time.
+    paused_at = Column(DateTime, nullable=True)
+    paused_remaining_seconds = Column(Integer, nullable=True)
+    pause_resume_at = Column(DateTime, nullable=True)
+    # PPPoE device lock (app/services/pppoe_device_lock.py): when on, the PPP
+    # secret carries caller-id=<pppoe_bound_mac> so the login only works from
+    # the customer's own CPE. The MAC is learned from the first session that
+    # starts after pppoe_lock_learn_after (NULL = any session). Off by default.
+    # pppoe_lock_applied_mac is what we last wrote to the router's caller-id
+    # (NULL = nothing of ours there), so a lock we turned off gets cleared even
+    # if the router was unreachable at the time.
+    pppoe_device_lock = Column(Boolean, nullable=False, default=False, server_default="false")
+    pppoe_bound_mac = Column(String(17), nullable=True)
+    pppoe_bound_at = Column(DateTime, nullable=True)
+    pppoe_lock_learn_after = Column(DateTime, nullable=True)
+    pppoe_lock_applied_mac = Column(String(17), nullable=True)
+    # Customer register details the reseller fills in (all optional). See
+    # app/services/customer_profile.py. national_id is personal data: lists
+    # and exports carry it masked, it is never logged.
+    national_id = Column(String(32), nullable=True)
+    email = Column(String(254), nullable=True)
+    alt_phone = Column(String(32), nullable=True)
+    address_line = Column(String(200), nullable=True)  # house / unit
+    building = Column(String(120), nullable=True)  # building / estate
+    installation_date = Column(Date, nullable=True)
+    notes = Column(Text, nullable=True)
     # Nullable self-reference used by managed companion devices that share the
     # paying customer's subscription/expiry instead of buying their own plan.
     subscription_owner_id = Column(
@@ -249,6 +308,30 @@ class Customer(Base):
         remote_side=[id],
         backref="shared_subscription_customers",
     )
+
+@event.listens_for(Session, "before_flush")
+def _active_customers_are_never_paused(session, _flush_context, _instances):
+    """Invariant: an ACTIVE customer is not paused.
+
+    Pause/resume (app/services/customer_pause.py) keep this themselves. Any
+    other path that makes a paused customer ACTIVE -- in practice a payment
+    (M-Pesa, paybill, voucher, cash activation) while paused -- ends the pause
+    here and adds the paused paid time on top of the new expiry, so the
+    customer never loses time they already paid for and the pause can never
+    be left behind on a paying customer (which would deny them access).
+    """
+    for obj in list(session.new) + list(session.dirty):
+        # status first: it is what was just changed (already loaded), so
+        # paused_at is only read for customers turning ACTIVE.
+        if (
+            isinstance(obj, Customer)
+            and obj.status == CustomerStatus.ACTIVE
+            and obj.paused_at is not None
+        ):
+            from app.services.customer_pause import end_pause_on_activation
+
+            end_pause_on_activation(obj)
+
 
 class CustomerRating(Base):
     """Customer ratings/feedback after purchase - identified by phone number"""
@@ -296,6 +379,11 @@ class Plan(Base):
         nullable=True,
     )
     fup_throttle_profile = Column(String(100), nullable=True)
+    # Window the data cap applies to: "plan" = the whole paid period (resets on
+    # renewal; the original behaviour and the default for every existing plan),
+    # "daily" = usage since the last local daily reset (settings.FUP_DAILY_RESET_HOUR),
+    # with throttled/blocked customers restored at the reset.
+    fup_period = Column(String(16), nullable=False, default="plan", server_default="plan")
     # Total customers/devices allowed on one paid subscription. 1 = no sharing.
     max_shared_users = Column(Integer, nullable=False, default=1, server_default="1")
     # Routers this plan is offered on, e.g. [12, 47]. NULL means "every router the
@@ -526,7 +614,11 @@ class Router(Base):
     availability_successes = Column(Integer, nullable=False, default=0, server_default="0")
     emergency_active = Column(Boolean, nullable=False, default=False, server_default="false")
     emergency_message = Column(String(500), nullable=True)
-    hotspot_sharing_blocked = Column(Boolean, nullable=False, default=False, server_default="false")
+    # Anti-tethering. New routers default to ON (provisioning installs the
+    # rules in the setup script). server_default stays "false" so existing
+    # rows and raw-SQL inserts are unchanged -- no migration. A router added
+    # by hand (POST /api/routers/create) gets no rules and sets False itself.
+    hotspot_sharing_blocked = Column(Boolean, nullable=False, default=True, server_default="false")
     # Opt-in per router: when true, paid-user provisioning that can't be pushed over
     # the WireGuard tunnel is queued for the router to PULL over an outbound HTTPS
     # check-in instead. Intended only for flaky/Starlink-fed routers. Default false
@@ -599,6 +691,16 @@ class Router(Base):
     snmp_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
     cpu_load = Column(Integer, nullable=True)
     cpu_checked_at = Column(DateTime, nullable=True)
+    # Expired PPPoE customers stay connected in a walled state and every web
+    # page redirects to the payment portal (app/services/pppoe_expired_redirect.py).
+    # Off by default; toggled per router by the owner, which applies or removes
+    # the RouterOS side. _config holds what was applied (pool, proxy port, the
+    # proxy-access syntax this RouterOS accepts, whether we enabled /ip proxy).
+    pppoe_expired_redirect = Column(Boolean, nullable=False, default=False, server_default="false")
+    pppoe_expired_redirect_config = Column(JSON, nullable=True)
+    # New PPPoE customers registered on this router start with the device lock
+    # on (Customer.pppoe_device_lock). Existing customers are never changed.
+    pppoe_lock_new_customers = Column(Boolean, nullable=False, default=False, server_default="false")
     payment_method_id = Column(Integer, ForeignKey("reseller_payment_methods.id"), nullable=True)
     assigned_payment_method = relationship("ResellerPaymentMethod", back_populates="routers")
 
@@ -1040,10 +1142,12 @@ class Advertiser(Base):
 class Ad(Base):
     __tablename__ = "ads"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    advertiser_id = Column(Integer, ForeignKey("advertisers.id"), nullable=False)
+    # Optional since hero ads (2026-10): a reseller's own promo has no advertiser.
+    advertiser_id = Column(Integer, ForeignKey("advertisers.id"), nullable=True)
     title = Column(String(150), nullable=False)
     description = Column(String(500), nullable=True)
-    image_url = Column(String(500), nullable=False)
+    # Optional for a video ad, whose still frame is poster_url.
+    image_url = Column(String(500), nullable=True)
     seller_name = Column(String(100), nullable=False)
     seller_location = Column(String(200), nullable=True)
     phone_number = Column(String(20), nullable=False)
@@ -1059,7 +1163,171 @@ class Ad(Base):
     clicks_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     expires_at = Column(DateTime, nullable=True, index=True)
+
+    # --- hero ads (2026-10): see app/services/ad_serving.py ---------------
+    # placement: "hero" (rotates in the portal's photo hero, plays on the
+    # M-Pesa wait and success screens) or "local" (the shops row / legacy
+    # showcase). Values are plain strings, not PG enums, so adding one later
+    # needs no type migration.
+    placement = Column(String(20), nullable=False, default="local", server_default="local")
+    media_type = Column(String(10), nullable=False, default="image", server_default="image")
+    video_url = Column(String(500), nullable=True)
+    poster_url = Column(String(500), nullable=True)
+    image_fit = Column(String(10), nullable=False, default="cover", server_default="cover")
+    bg_color = Column(String(9), nullable=True)
+    # slot: "platform" (Bitwave sells it, network-wide or targeted),
+    # "reseller" (a reseller sold it on their own routers), "house" (the
+    # reseller's own free promo).
+    slot = Column(String(10), nullable=False, default="platform", server_default="platform")
+    # NULL owner = Bitwave. A reseller only ever sees and edits their own.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    # NULL = every router of the owner (every router in the network for a
+    # Bitwave ad); otherwise only these router ids.
+    router_ids = Column(JSON, nullable=True)
+    # pending -> approved | rejected. Nothing reaches a portal unapproved.
+    # server_default "approved" only backfills ads that predate approval;
+    # every new ad is written with an explicit status.
+    status = Column(String(12), nullable=False, default="pending", server_default="approved", index=True)
+    review_note = Column(String(300), nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+    reviewed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    starts_at = Column(DateTime, nullable=True)
+
     advertiser = relationship("Advertiser", back_populates="ads")
+
+
+class AdEvent(Base):
+    """One row per ad per placement per device per day: an impression or a tap.
+
+    Append-only and de-duplicated by the unique key below (inserted with ON
+    CONFLICT DO NOTHING), so a portal load never updates a shared ads row —
+    the old views_count/clicks_count increments did, on every load, which is
+    the hot-row pattern behind the pool lock convoys. It also stops one phone
+    refreshing the portal from inflating what an advertiser is billed for.
+    """
+    __tablename__ = "ad_events"
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    ad_id = Column(Integer, nullable=False, index=True)
+    event_type = Column(String(12), nullable=False)          # impression | click
+    click_type = Column(String(20), nullable=False, default="", server_default="")
+    placement = Column(String(20), nullable=False)           # hero | wait_screen | success_page | local
+    device_key = Column(String(64), nullable=False)          # MAC when known, else the portal's device id
+    router_identity = Column(String(100), nullable=True, index=True)
+    day = Column(String(10), nullable=False)                  # UTC date, YYYY-MM-DD
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    __table_args__ = (
+        UniqueConstraint(
+            "ad_id", "event_type", "click_type", "placement", "device_key", "day",
+            name="uq_ad_event_daily",
+        ),
+        Index("ix_ad_events_day", "day"),
+    )
+
+
+class AdSale(Base):
+    """An ad a reseller sold to a local business, paid through Bitwave.
+
+    One row per sold ad (slot "reseller"). The business pays Bitwave's own
+    paybill by STK push; Bitwave keeps 20% and the reseller's 80% joins their
+    normal payout balance once the paid weeks start running. See
+    app/services/ad_sales.py.
+
+    ad_id has no foreign key on purpose (like ad_events): money records must
+    outlive an ad that is later deleted.
+    """
+    __tablename__ = "ad_sales"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ad_id = Column(Integer, nullable=False, unique=True, index=True)
+    reseller_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    business_name = Column(String(150), nullable=False)
+    # Normalised 2547XXXXXXXX / 2541XXXXXXXX: who gets the M-Pesa prompt.
+    business_phone = Column(String(20), nullable=False)
+    price_per_week = Column(Integer, nullable=False)       # whole KES
+    weeks = Column(Integer, nullable=False)                # weeks in the first order
+    # Paid weeks that have not started running yet (paid before approval).
+    weeks_banked = Column(Integer, nullable=False, default=0, server_default="0")
+    # When the running paid period last stopped showing (paused, Show Ads off, or
+    # an old pending status). NULL = the clock is running. Coming back moves
+    # ads.expires_at out by the time it was off (app/services/ad_sales.py).
+    off_since = Column(DateTime, nullable=True)
+    # Total time given back so far, in seconds.
+    off_seconds_total = Column(Integer, nullable=False, default=0, server_default="0")
+    # The shop's read-only link: report, and the pay button while a payment is due.
+    share_token = Column(String(48), nullable=False, unique=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AdSalePayment(Base):
+    """One M-Pesa prompt for a sold ad, and the money it brought in.
+
+    Prompts for the same order (the first sale, or one renewal) share
+    order_key: resending a prompt adds a row with the same key. The first
+    paid row of an order is the payment; a later paid row on the same key is
+    a duplicate and is flagged for refund, never credited.
+
+    Money is whole KES. bitwave_fee = floor(amount * 20 / 100) and
+    reseller_share = amount - bitwave_fee (the remainder goes to the reseller).
+    credited_at is set when the paid weeks start running; only then does
+    reseller_share count towards the reseller's payout balance and
+    bitwave_fee towards Bitwave's earnings.
+    """
+    __tablename__ = "ad_sale_payments"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sale_id = Column(Integer, ForeignKey("ad_sales.id"), nullable=False, index=True)
+    ad_id = Column(Integer, nullable=False, index=True)
+    reseller_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    kind = Column(String(10), nullable=False)               # initial | renewal
+    order_key = Column(String(40), nullable=False, index=True)
+    weeks = Column(Integer, nullable=False)
+    price_per_week = Column(Integer, nullable=False)
+    amount = Column(Integer, nullable=False)
+    bitwave_fee = Column(Integer, nullable=False)
+    reseller_share = Column(Integer, nullable=False)
+    phone = Column(String(20), nullable=False)
+    # awaiting_payment -> paid | failed | timed_out (a late success callback
+    # still turns failed/timed_out into paid: the money is real).
+    status = Column(String(20), nullable=False, default="awaiting_payment", index=True)
+    checkout_request_id = Column(String(128), nullable=True, unique=True)
+    merchant_request_id = Column(String(128), nullable=True)
+    mpesa_receipt = Column(String(64), nullable=True, unique=True)
+    result_desc = Column(String(255), nullable=True)
+    paid_at = Column(DateTime, nullable=True)
+    is_duplicate = Column(Boolean, nullable=False, default=False, server_default="false")
+    credited_at = Column(DateTime, nullable=True, index=True)
+    # None | due | refunded. Never automatic: an admin refunds by hand and
+    # records it here.
+    refund_status = Column(String(10), nullable=True, index=True)
+    refund_reason = Column(String(300), nullable=True)
+    # What the shop gets back. NULL = the whole amount (a payment that never ran).
+    # Otherwise refund_amount = reseller_recovery + bitwave_refund_part, set once
+    # when an ad that has run is stopped with whole days unused.
+    refund_amount = Column(Integer, nullable=True)
+    refund_unused_days = Column(Integer, nullable=True)
+    reseller_recovery = Column(Integer, nullable=True)
+    bitwave_refund_part = Column(Integer, nullable=True)
+    # The reseller_transaction_charges row that recovers reseller_recovery. No
+    # foreign key, like ad_id: money records outlive what they point at.
+    recovery_charge_id = Column(Integer, nullable=True)
+    refunded_at = Column(DateTime, nullable=True)
+    refunded_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    requested_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AdReviewEvent(Base):
+    """Append-only history of an ad's status: approve, reject, auto_approve,
+    takedown. Remembers takedowns so an edit can't put an ad back live."""
+    __tablename__ = "ad_review_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ad_id = Column(Integer, nullable=False, index=True)
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    slot = Column(String(10), nullable=False)
+    action = Column(String(20), nullable=False)
+    actor_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    note = Column(String(300), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 class AdClick(Base):
     __tablename__ = "ad_clicks"
@@ -1178,6 +1446,29 @@ class RouterAvailabilityCheck(Base):
     source = Column(String(50), nullable=False, default="unknown")
 
     router = relationship("Router")
+
+
+class RouterPublicContact(Base):
+    """A router reaching us over the public internet instead of its tunnel.
+
+    Router scripts call through the management tunnel first and fall back to
+    public HTTPS only when it fails, so a call here proves the site was online
+    while its tunnel was not (2026-10-12: routers 448 and 351 kept calling for
+    75 minutes while every tunnel check failed). Kept apart from
+    router_availability_checks on purpose: those rows mean "we could manage
+    the router", and a dozen readers treat a success there that way.
+    """
+    __tablename__ = "router_public_contacts"
+    __table_args__ = (
+        Index("idx_router_public_contacts_router_at", "router_id", "contacted_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # No FK: rows are pruned with availability history and must never block
+    # deleting a router.
+    router_id = Column(Integer, nullable=False)
+    contacted_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    source = Column(String(30), nullable=False)
 
 
 # ========================================
@@ -1382,6 +1673,19 @@ class FapshiTransaction(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     confirmed_at = Column(DateTime, nullable=True)
+    # Immutable contract/baseline captured before Direct Pay; NULL legacy rows
+    # require review rather than guessing what a later plan change purchased.
+    purchase_snapshot = Column(JSON, nullable=True)
+    customer_payment_id = Column(Integer, ForeignKey("customer_payments.id"), nullable=True, unique=True)
+    provider_status = Column(String(20), nullable=True)
+    review_reason = Column(String(100), nullable=True)
+    next_check_at = Column(DateTime, nullable=True)
+    check_attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    check_lease_until = Column(DateTime, nullable=True)
+    check_lease_token = Column(String(64), nullable=True)
+    last_check_error = Column(String(100), nullable=True)
+    fulfillment_pending = Column(Boolean, nullable=False, default=False, server_default="false")
+    applied_expiry = Column(DateTime, nullable=True)
 
     customer = relationship("Customer")
     reseller = relationship("User")
@@ -1876,7 +2180,8 @@ class PortalSettings(Base):
 
     # ── Theme ────────────────────────────────────────────────────────────────
     # Preselected options: ocean_blue | emerald_green | sunset_orange |
-    #                      midnight_purple | rose_gold | slate_gray
+    #                      bright_violet | rose_gold | slate_gray
+    # (legacy midnight_purple is still accepted, see portal_routes.LEGACY_THEMES)
     color_theme = Column(String(50), nullable=False, default="slate_gray", server_default="slate_gray")
 
     # ── Header section ───────────────────────────────────────────────────────
@@ -1952,6 +2257,11 @@ class C2BTransactionStatus(str, enum.Enum):
     UNMATCHED = "unmatched"    # Account number unknown / amount too low — needs human attention
     REJECTED = "rejected"      # Paybill shortcode didn't resolve to anyone we know
     DUPLICATE = "duplicate"    # Safaricom retry — same TransID seen before, no-op
+    # Safaricom's C2B copy of an STK push on a paybill that has C2B URLs
+    # registered. The STK callback already credited this receipt, so the C2B
+    # copy is archived for audit only: no payment, no wallet change, never
+    # shown to the reseller as an unmatched payment.
+    STK_ECHO = "stk_echo"
 
 
 class UnmatchedC2BReason(str, enum.Enum):
@@ -2170,6 +2480,11 @@ class CustomerExpirySmsSettings(Base):
     enabled = Column(Boolean, nullable=False, default=False, server_default="false")
     reminder_offsets_minutes = Column(JSON, nullable=False, default=lambda: [1440])
     send_at_expiry = Column(Boolean, nullable=False, default=True, server_default="true")
+    # Expiry reminders and the at-expiry message go to hotspot customers too
+    # unless the reseller turns this off (PPPoE and static always get them).
+    # Defaults on so resellers who never touch it keep the original behaviour.
+    expiry_include_hotspot = Column(Boolean, nullable=False, default=True,
+                                    server_default="true")
     # "Payment received, active until ..." after every recorded payment.
     payment_receipt_enabled = Column(Boolean, nullable=False, default=False,
                                      server_default="false")
@@ -2321,6 +2636,31 @@ class SubscriptionExpiryReminder(Base):
     phone = Column(String(20), nullable=True)
     inbox_sent = Column(Boolean, nullable=False, default=False, server_default="false")
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class SubscriptionFreeSetupGrant(Base):
+    """One row per press of the admin "Free setup time" button: the audit trail.
+
+    Waivers have no other record, so this keeps who pressed it, what the account
+    looked like before, and each invoice waived with its amounts. Also the
+    one-use guard: an account with a row needs a deliberate override to get
+    another window. ``waived_invoices`` is a copy, not a link, so a later change
+    to an invoice never rewrites what was waived.
+    """
+    __tablename__ = "subscription_free_setup_grants"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    granted_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    granted_by_email = Column(String, nullable=False)
+    free_until = Column(DateTime, nullable=False)
+    previous_status = Column(String(20), nullable=False)
+    new_status = Column(String(20), nullable=False)
+    previous_expires_at = Column(DateTime, nullable=True)
+    new_expires_at = Column(DateTime, nullable=False)
+    waived_invoices = Column(JSON, nullable=False, default=list)
+    is_override = Column(Boolean, nullable=False, default=False, server_default="false")
+    override_reason = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 class FeedbackKind(str, enum.Enum):
@@ -2651,6 +2991,13 @@ class OvesHealthSnapshot(Base):
     overall_status = Column(String(16), nullable=False, default="unknown")
     payload = Column(JSON, nullable=True)
     metrics = Column(JSON, nullable=True)
+    # The counters history charts SUM over every row, as plain columns: pulling
+    # them out of the JSON blob cost ~0.3 ms/row (about 6 s for 14 days).
+    codes_ok = Column(Integer, nullable=True)
+    codes_failed = Column(Integer, nullable=True)
+    codes_failed_system = Column(Integer, nullable=True)
+    index_failures = Column(Integer, nullable=True)
+    db_errors = Column(Integer, nullable=True)
 
 
 class AppInstanceHeartbeat(Base):
@@ -2714,3 +3061,263 @@ class CustomerEvent(Base):
     details = Column(JSON, nullable=True)
     dedup_key = Column(String(64), nullable=True, unique=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ImpersonationSession(Base):
+    """Audit row for one admin "View as reseller" session.
+
+    The admin gets a short-lived, read-only token carrying ``imp_sid`` (this
+    row's id). ``enforce_impersonation_read_only`` in main.py checks the row on
+    every request that carries such a token, so ending the session here
+    (``ended_at``) revokes the token before it expires.
+
+    end_reason: "exit" (admin pressed exit) | "expired" (TTL ran out).
+    Startup migration: ImpersonationSession.__table__.create in main.py.
+    """
+    __tablename__ = "impersonation_sessions"
+    __table_args__ = (
+        Index("ix_impersonation_sessions_admin_started", "admin_id", "started_at"),
+        Index("ix_impersonation_sessions_reseller_started", "reseller_id", "started_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    admin_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    reseller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    reason = Column(Text, nullable=False)
+    started_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    ended_at = Column(DateTime, nullable=True)
+    end_reason = Column(String(20), nullable=True)
+    ip_address = Column(String(64), nullable=True)
+    user_agent = Column(String(300), nullable=True)
+    request_count = Column(Integer, nullable=False, default=0, server_default="0")
+
+
+class ResellerStaff(Base):
+    """A staff login that works inside one reseller's account.
+
+    The owner (``parent_reseller_id``) creates it and grants named permissions
+    (app/services/staff_permissions.py). A staff member logs in through the
+    normal /api/auth/login with their own email and password and gets a token
+    whose identity is the OWNER's -- so every existing endpoint scopes data to
+    the owner exactly as before -- plus ``staff_id``/``stv`` claims that
+    ``enforce_staff_access`` (app/services/staff_access.py) checks on every
+    request: the row must be active, not removed, ``token_version`` must match
+    ``stv``, and the route must be allowed by ``permissions``.
+
+    Any change that must end the staff member's sessions (permissions edited,
+    deactivated, removed, password reset) bumps ``token_version``.
+
+    Removal is soft (``deleted_at``) so the activity log keeps a name for old
+    rows; a removed row can never log in again. Emails are unique across live
+    staff and ``users``: a partial unique index enforces live staff emails,
+    and the account APIs also check across the two tables. Removed staff keep
+    their email for history and do not block reuse.
+
+    Startup migration: run_staff_migrations() in main.py.
+    """
+    __tablename__ = "reseller_staff"
+    __table_args__ = (
+        Index("ix_reseller_staff_email", "email"),
+        Index("uq_reseller_staff_live_email", "email", unique=True,
+              postgresql_where=text("deleted_at IS NULL"),
+              sqlite_where=text("deleted_at IS NULL")),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    parent_reseller_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name = Column(String(120), nullable=False)
+    email = Column(String(255), nullable=False)
+    phone = Column(String(20), nullable=True)
+    password_hash = Column(String, nullable=False)
+    is_account_admin = Column(Boolean, nullable=False, default=False, server_default="false")
+    # List of permission keys, e.g. ["customers.view", "routers.view"].
+    permissions = Column(JSON, nullable=False, default=list)
+    is_active = Column(Boolean, nullable=False, default=True, server_default="true")
+    token_version = Column(Integer, nullable=False, default=0, server_default="0")
+    permissions_updated_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=True)
+    last_login_at = Column(DateTime, nullable=True)
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class StaffActivityLog(Base):
+    """Who did what in a reseller account: staff actions and owner money/settings changes.
+
+    Written by ``enforce_staff_access`` after the request finishes, in its own
+    short session. ``owner_id``/``staff_id`` are plain ints, not FKs, so the
+    history outlives a removed staff member and never blocks a delete.
+    ``staff_id`` NULL means the owner did it. Request bodies are never stored
+    (they can hold API keys and passwords) -- only the route, result and a
+    human summary.
+
+    Startup migration: run_staff_migrations() in main.py.
+    """
+    __tablename__ = "staff_activity_log"
+    __table_args__ = (
+        Index("ix_staff_activity_owner_created", "owner_id", "created_at"),
+        Index("ix_staff_activity_staff_created", "staff_id", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_id = Column(Integer, nullable=False)
+    staff_id = Column(Integer, nullable=True)
+    actor_label = Column(String(160), nullable=True)
+    action = Column(String(80), nullable=False)
+    permission = Column(String(40), nullable=True)
+    method = Column(String(10), nullable=False)
+    path = Column(String(300), nullable=False)
+    status_code = Column(Integer, nullable=True)
+    summary = Column(String(300), nullable=True)
+    ip_address = Column(String(64), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class SupportDeskSnapshot(Base):
+    """Latest WhatsApp support dashboard snapshot pushed from Dennis's laptop.
+
+    One row only (id=1), overwritten on every push to
+    POST /api/admin/support-desk/snapshot and read by the platform-admin-only
+    GET /api/admin/support-desk. ``payload`` is already privacy-masked on the
+    laptop and masked again on ingest (app/services/support_desk.py), so the
+    table never holds phone numbers, emails or WhatsApp JIDs.
+    """
+    __tablename__ = "support_desk_snapshots"
+    id = Column(Integer, primary_key=True)
+    payload = Column(JSON, nullable=False)
+    received_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    size_bytes = Column(Integer, nullable=False, default=0)
+    sha256 = Column(String(64), nullable=False)
+    masked_count = Column(Integer, nullable=False, default=0)
+
+
+class SupportDeskDecision(Base):
+    """Dennis's decision on a "Waiting on Dennis" support desk item.
+
+    Written by the platform admin from the Support desk page
+    (POST /api/admin/support-desk/decisions): ``go`` tells the support agent
+    to start on the item, ``close`` closes it as not relevant. Dennis's laptop
+    pulls unconsumed rows with the support desk machine token and stamps
+    ``consumed_at`` once it has handed them to the inbox agent.
+
+    ``item_id`` is the stable work-log entry id from the snapshot
+    ("wl-" + 12 letters, optional "-N" suffix). ``note`` is masked like the
+    snapshot (no phone numbers, emails or WhatsApp JIDs).
+    """
+    __tablename__ = "support_desk_decisions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    item_id = Column(String(64), nullable=False, index=True)
+    action = Column(String(8), nullable=False)
+    note = Column(String(500), nullable=True)
+    decided_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    consumed_at = Column(DateTime, nullable=True, index=True)
+
+
+class RouterApCredential(Base):
+    """Web admin login for an access point (a Tenda) behind a router.
+
+    The reseller types the AP's admin password once on the router's
+    Diagnostics page; it is stored Fernet-encrypted with the same helper as
+    the M-Pesa keys (``app.services.payment_gateway.encrypt_credential``) and
+    is never returned by the API or written to logs. Used only for on-demand
+    actions run from the MikroTik with ``/tool fetch``
+    (``app/services/ap_control.py``): status, reboot, "make it a safe AP".
+
+    ``router_id`` is a plain int, not an FK, like ``customer_events``: a stale
+    row must never block deleting a router. One row per (router, AP MAC).
+
+    Lockout: ``failed_login_count`` counts consecutive failed logins; at
+    ``ap_control.MAX_FAILED_LOGINS`` no further login is attempted until the
+    password is replaced, so a wrong password is never retried blindly (and
+    the AP's own lockout is never triggered by us).
+
+    ``last_status`` is the last status read (mode, DHCP, IP, firmware...) with
+    no secrets; the detector uses it to flag router-mode / DHCP-on APs.
+    Startup migration: run_router_ap_credential_migrations() in main.py.
+    """
+    __tablename__ = "router_ap_credentials"
+    __table_args__ = (
+        UniqueConstraint("router_id", "ap_mac", name="uq_router_ap_credentials_router_mac"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    router_id = Column(Integer, nullable=False, index=True)
+    ap_mac = Column(String(17), nullable=False)
+    vendor = Column(String(30), nullable=False, default="Tenda", server_default="Tenda")
+    model = Column(String(40), nullable=True)
+    username = Column(String(64), nullable=False, default="admin", server_default="admin")
+    password_encrypted = Column(Text, nullable=False)
+    # base64 | md5 | plain, as detected from the AP's login page on last use
+    login_method = Column(String(16), nullable=True)
+    last_login_ok = Column(Boolean, nullable=True)
+    failed_login_count = Column(Integer, nullable=False, default=0, server_default="0")
+    last_error = Column(String(255), nullable=True)
+    last_ip = Column(String(45), nullable=True)
+    last_status = Column(JSON, nullable=True)
+    last_status_at = Column(DateTime, nullable=True)
+    last_action = Column(String(32), nullable=True)
+    last_action_at = Column(DateTime, nullable=True)
+    last_reboot_at = Column(DateTime, nullable=True)
+    updated_by_user_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class CustomerCpeCredential(Base):
+    """Web-admin login for a PPPoE customer's own router / CPE (a Tenda).
+
+    Sibling of :class:`RouterApCredential`, but keyed by the PPPoE **customer**,
+    not by a MAC on a router port. The device dials the reseller's PPPoE server
+    (WAN = PPPoE) and sits at the customer's home behind APs/fibre; it is reached
+    by resolving the customer's active PPPoE session on the MikroTik
+    (``/ppp active`` -> ``address``) and ``/tool fetch`` to that IP on the
+    device's remote-management port. The on-demand actions live in
+    ``app/services/cpe_control.py``: status, reboot, and the "disconnect session"
+    fallback (which reuses the existing reset-session path).
+
+    The admin password is stored Fernet-encrypted with the same helper as the
+    M-Pesa keys (``app.services.payment_gateway.encrypt_credential``) and is
+    never returned by the API or written to logs.
+
+    ``customer_id`` is a plain int, not an FK, like ``router_ap_credentials``: a
+    stale row must never block deleting a customer. One row per customer.
+
+    ``port`` is the device's web-admin port (80 on the LAN; the Tenda remote
+    web-management port -- often 8080/8888 -- on the WAN). ``last_ip`` is only
+    the last session address seen, kept for display; it is NEVER the identity
+    and is re-resolved live on every action.
+
+    Startup migration: run_customer_cpe_credential_migrations() in main.py.
+    """
+    __tablename__ = "customer_cpe_credentials"
+    __table_args__ = (
+        UniqueConstraint("customer_id", name="uq_customer_cpe_credentials_customer"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    customer_id = Column(Integer, nullable=False, index=True)
+    vendor = Column(String(30), nullable=False, default="Tenda", server_default="Tenda")
+    model = Column(String(40), nullable=True)
+    username = Column(String(64), nullable=False, default="admin", server_default="admin")
+    password_encrypted = Column(Text, nullable=False)
+    port = Column(Integer, nullable=False, default=80, server_default="80")
+    # Optional device MAC, for display only (the identity is the PPPoE customer).
+    device_mac = Column(String(17), nullable=True)
+    # base64 | md5 | plain, as detected from the device on last use
+    login_method = Column(String(16), nullable=True)
+    last_login_ok = Column(Boolean, nullable=True)
+    failed_login_count = Column(Integer, nullable=False, default=0, server_default="0")
+    last_error = Column(String(255), nullable=True)
+    last_ip = Column(String(45), nullable=True)
+    last_status = Column(JSON, nullable=True)
+    last_status_at = Column(DateTime, nullable=True)
+    last_action = Column(String(32), nullable=True)
+    last_action_at = Column(DateTime, nullable=True)
+    last_reboot_at = Column(DateTime, nullable=True)
+    updated_by_user_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)

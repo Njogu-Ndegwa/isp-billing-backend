@@ -69,7 +69,7 @@ Returns the reseller's current settings, plus lists of all valid values for each
     "created_at": "2026-05-05T17:00:00",
     "updated_at": "2026-05-05T17:00:00"
   },
-  "available_themes": ["emerald_green", "midnight_purple", "ocean_blue", "rose_gold", "slate_gray", "sunset_orange"],
+  "available_themes": ["bright_violet", "emerald_green", "ocean_blue", "rose_gold", "slate_gray", "sunset_orange"],
   "available_header_styles": ["compact", "hero", "minimal", "standard"],
   "available_languages": ["en", "fr", "sw"],
   "available_announcement_types": ["info", "success", "warning"],
@@ -137,7 +137,7 @@ Sending an invalid enum value returns:
   "detail": [
     {
       "loc": ["body", "color_theme"],
-      "msg": "Value error, color_theme must be one of: emerald_green, midnight_purple, ocean_blue, rose_gold, slate_gray, sunset_orange",
+      "msg": "Value error, color_theme must be one of: bright_violet, emerald_green, ocean_blue, rose_gold, slate_gray, sunset_orange",
       "type": "value_error"
     }
   ]
@@ -205,9 +205,13 @@ Wipes all customizations and recreates the row with system defaults. Useful as a
 | `ocean_blue` | Deep blue / cyan — cool, professional |
 | `emerald_green` | Green — fresh, modern |
 | `sunset_orange` | Orange / warm — energetic |
-| `midnight_purple` | Dark purple — bold, premium |
+| `bright_violet` | Violet — bold, vibrant |
 | `rose_gold` | Pink / rose — friendly, approachable |
 | `slate_gray` | Neutral gray — minimal, clean |
+
+`midnight_purple` (the old name before the admin app switched to `bright_violet`)
+is still accepted on save so existing settings keep working, but it is no
+longer listed in `available_themes`.
 
 ### Plan Sort Orders
 

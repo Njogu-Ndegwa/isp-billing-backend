@@ -4,6 +4,7 @@ from app.services import checkin_applier_script, expiry_reaper_script, mgmt_watc
 from app.services import router_agent_script, usage_push_script
 from app.services.router_script_gate import (
     GATED_SCRIPTS,
+    GATE_VERSION,
     MAX_WAIT_SECONDS,
     gate_rsc_body,
     has_current_gate,
@@ -43,7 +44,7 @@ def test_gate_balances():
     assert gate.count('"') % 2 == 0
 
 
-def test_gate_fails_open():
+def test_unreadable_job_ids_keep_compatibility_behavior():
     gate = render_gate("bitwave-expiry-reaper")
     # Ids that do not parse leave bwgMe at 0, which skips the wait entirely.
     assert ':if ([:typeof $n] = "num")' in gate
@@ -70,8 +71,15 @@ def test_with_gate_is_idempotent_and_reversible():
 
 
 def test_with_gate_replaces_an_older_gate():
-    old = render_gate("bitwave-checkin").replace("# bw-gate v1:", "# bw-gate v0:").replace("< 20", "< 5")
+    old = render_gate("bitwave-checkin").replace(f"# bw-gate v{GATE_VERSION}:", "# bw-gate v1:").replace("< 20", "< 5")
     assert with_gate("bitwave-checkin", old + BODY) == render_gate("bitwave-checkin") + BODY
+
+
+def test_known_busy_job_defers_body_after_wait_budget():
+    source = with_gate("bitwave-checkin", BODY)
+    stop = ':if ($bwgBusy) do={ :error "bw-gate: deferred while an earlier Bitwave job is still running" }'
+    assert source.count(stop) == 1
+    assert source.index(":while ($bwgBusy") < source.index(stop) < source.index("# bw-gate end") < source.index(BODY)
 
 
 def test_gate_rsc_body_lands_inside_the_source_block():

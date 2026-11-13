@@ -148,8 +148,12 @@ def test_plan_line_rate_parsing():
     assert plan_line_rate_bps(P("3m/3m")) == 3_000_000
     assert plan_line_rate_bps(P("5/2 Mbps")) == 5_000_000
     assert plan_line_rate_bps(P("10M/10")) == 10_000_000
+    # Reseller spellings provisioning reads since 8 Nov 2026.
+    assert plan_line_rate_bps(P("5mps/3mps")) == 5_000_000
+    assert plan_line_rate_bps(P("5mbs")) == 5_000_000
+    assert plan_line_rate_bps(P("5mb/s")) == 5_000_000
     # Unreadable -> guard off, never a guessed-low ceiling.
-    assert plan_line_rate_bps(P("5mps/3mps")) == 0
+    assert plan_line_rate_bps(P("1om/10m")) == 0
     assert plan_line_rate_bps(P("Trial")) == 0
     assert plan_line_rate_bps(P("")) == 0
     assert plan_line_rate_bps(None) == 0

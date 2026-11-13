@@ -124,6 +124,7 @@ from app.db.models import (
 from app.services.mikrotik_api import parse_speed_to_mikrotik
 from app.services.hotspot_mac_login import mac_login_enabled
 from app.services.router_expiry import expiry_second
+from app.services.customer_grace import access_floor, effective_expiry_of
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +206,13 @@ HARD_MAX_LINES_PER_REPLY = 20  # ~1.3 KB; well under any v6 fetch limit
 # --- field whitelists -------------------------------------------------------
 _MAC_RE = re.compile(r"^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$")
 # Raw bps ("10000000/10000000") is a valid push rate too, hence 10 digits.
-_RATE_PART = r"\d{1,10}(?:\.\d{1,3})?[KMG]?"
+# Kilo is lowercase "k": that is how RouterOS spells it and what
+# parse_speed_to_mikrotik emits for fractional speeds ("2M/0.5" -> "500k/2M").
+# Until 2026-11-04 only "K" was accepted, so every customer on a plan with a
+# fractional speed was silently skipped here ("fails whitelist") and the
+# check-in never re-delivered their binding or queue (router 446, plan
+# "Elvis Original TV" 2M/0.5). Lowercase "m" stays out: RouterOS rejects it.
+_RATE_PART = r"\d{1,10}(?:\.\d{1,3})?[kKMG]?"
 _RATE_RE = re.compile(rf"^{_RATE_PART}/{_RATE_PART}$")
 _EPOCH_RE = re.compile(r"^\d{10}$")
 _REF_RE = re.compile(r"^[0-9A-F]{12}$")
@@ -1039,13 +1046,16 @@ async def load_checkin_state(router_id: int, now: datetime) -> CheckinState:
     async with async_session() as db:
         rows = (
             await db.execute(
-                select(Customer.mac_address, Customer.expiry, Plan.speed)
+                select(
+                    Customer.mac_address, Customer.expiry, Plan.speed,
+                    Customer.grace_period_minutes,
+                )
                 .join(Plan, Plan.id == Customer.plan_id)
                 .where(
                     Customer.router_id == router_id,
                     Customer.status == CustomerStatus.ACTIVE,
                     Customer.expiry.is_not(None),
-                    Customer.expiry > now,
+                    Customer.expiry > access_floor(now),
                     Customer.mac_address.is_not(None),
                     Plan.connection_type == ConnectionType.HOTSPOT,
                 )
@@ -1101,8 +1111,13 @@ async def load_checkin_state(router_id: int, now: datetime) -> CheckinState:
     # router, deliver the one that runs longest. The binding's EXP tag comes
     # from this expiry, and the router-side expiry reaper may act on it alone
     # while it cannot reach the server, so it must never be the earlier one.
+    # Expiry here is the effective one (paid expiry + reseller grace): it is
+    # what the router must keep the MAC until.
     latest: dict[str, tuple] = {}
-    for mac, expiry, speed in rows:
+    for mac, paid_expiry, speed, grace in rows:
+        expiry = effective_expiry_of(paid_expiry, grace)
+        if expiry <= now:
+            continue
         key = (mac or "").strip().upper().replace("-", ":")
         if key not in latest or expiry > latest[key][1]:
             latest[key] = (mac, expiry, speed)

@@ -14,6 +14,9 @@ from app.db.models import (
 )
 from app.services.mikrotik_api import MikroTikAPI, validate_mac_address, normalize_mac_address
 from app.services.router_helpers import get_router_by_id
+from app.services.customer_grace import access_floor, effective_expiry, has_access_time
+from app.services.ad_serving import ads_for_router, network_ads
+from app.services.markets import reseller_market
 from app.services.plan_cache import (
     get_plans_cached,
     select_portal_plans,
@@ -796,7 +799,6 @@ async def get_portal_data(
     )
     emergency_active = bool(getattr(router_obj, "emergency_active", False))
     plans = select_portal_plans(visible_plans, all_plans_for_flags, emergency_active)
-    ads_data = await _fetch_active_ads(db)
     portal_settings_result = await db.execute(
         select(PortalSettings).where(PortalSettings.user_id == router_obj.user_id)
     )
@@ -816,6 +818,13 @@ async def get_portal_data(
     ) if any(p.get("plan_type") == "regular" for p in all_plans_for_flags) else False
 
     portal_settings = portal_settings_result.scalar_one_or_none()
+    # This router's ads only (Bitwave's plus its owner's own, approved and
+    # in date), from a cache shared by every portal load. None when the
+    # reseller has ads switched off.
+    ads_data = await ads_for_router(
+        db, router_obj.id, router_obj.user_id,
+        show_ads=bool(getattr(portal_settings, "show_ads", False)),
+    )
 
     # Order the packages the way this reseller asked for. The portal applies the
     # same order client-side; sorting here as well means any client that renders
@@ -836,6 +845,8 @@ async def get_portal_data(
             "business_name": reseller.business_name,
             "payment_methods": getattr(router_obj, 'payment_methods', None) or ["mpesa", "voucher"],
             "payment_provider": collection_gateway,
+            # Plan prices are in the owner's market currency (KES, XAF, ZMW, HTG...).
+            "currency": reseller_market(reseller).currency,
             "support_phone": reseller.support_phone,
         },
         "plans": plans,
@@ -850,36 +861,6 @@ async def get_portal_data(
         },
         "portal_settings": _build_public_response(portal_settings, reseller),
     }
-
-
-async def _fetch_active_ads(db: AsyncSession, limit: int = 20):
-    stmt = (
-        select(Ad)
-        .where(Ad.is_active == True)
-        .where(or_(Ad.expires_at == None, Ad.expires_at > datetime.utcnow()))
-        .order_by(Ad.priority.desc(), Ad.created_at.desc())
-        .limit(limit)
-    )
-    result = await db.execute(stmt)
-    ads = result.scalars().all()
-    return [
-        {
-            "id": ad.id,
-            "title": ad.title,
-            "description": ad.description,
-            "image_url": ad.image_url,
-            "seller_name": ad.seller_name,
-            "seller_location": ad.seller_location,
-            "phone_number": ad.phone_number,
-            "whatsapp_number": ad.whatsapp_number,
-            "price": ad.price,
-            "price_value": ad.price_value,
-            "badge_type": ad.badge_type.value if ad.badge_type else None,
-            "badge_text": ad.badge_text,
-            "category": ad.category,
-        }
-        for ad in ads
-    ]
 
 
 @router.post("/api/public/voucher/redeem")
@@ -1389,7 +1370,7 @@ async def _provision_reconnected_mac_if_current(
                 and current.router_id == router_id
                 and current.status == CustomerStatus.ACTIVE
                 and current.expiry
-                and current.expiry > datetime.utcnow()
+                and has_access_time(current, datetime.utcnow())
                 and normalize_mac_address(current.mac_address or "") == target_mac
             )
             await verify_db.rollback()
@@ -1423,6 +1404,11 @@ async def _provision_reconnected_mac_if_current(
                 "[RECONNECT] Background provisioning error for customer %s: %s",
                 customer_id, exc,
             )
+
+
+# Shown on the reseller's Devices card for a device a customer added by typing
+# a phone number on the portal (no code), so a stranger can be spotted.
+PHONE_ADDED_DEVICE_NAME = "Added by phone"
 
 
 @router.post("/api/public/reconnect")
@@ -1490,14 +1476,18 @@ async def reconnect_self_service(
             Customer.subscription_owner_id.is_(None),
             Customer.status == CustomerStatus.ACTIVE,
             Customer.expiry.isnot(None),
-            Customer.expiry > now,
+            Customer.expiry > access_floor(now),
         )
         .order_by(Customer.expiry.desc())
-        .limit(1)
     )
-    customer = (await db.execute(customer_stmt)).scalar_one_or_none()
+    # Every purchase on this number that still has access (paid time or
+    # grace), latest-expiring first. Each one belongs to its own device.
+    candidates = [
+        c for c in (await db.execute(customer_stmt)).scalars().all()
+        if has_access_time(c, now)
+    ]
 
-    if not customer:
+    if not candidates:
         record_code_failure(request.router_id, normalized_mac)
         db.add(ReconnectionAttempt(
             phone=phone_raw, mac_address=normalized_mac,
@@ -1511,14 +1501,201 @@ async def reconnect_self_service(
             detail="No active subscription found for this phone number on this network",
         )
 
-    return await restore_customer_on_device(
+    # (1) A purchase already bound to this device: restore that one. One number
+    # may hold a plan per device in the house (TV, phones); reconnecting from
+    # the phone must give the phone its own plan back, never the TV's.
+    own = next(
+        (
+            c for c in candidates
+            if c.mac_address and normalize_mac_address(c.mac_address) == normalized_mac
+        ),
+        None,
+    )
+    if own is not None:
+        return await restore_customer_on_device(
+            db,
+            customer=own,
+            router_obj=router_obj,
+            normalized_mac=normalized_mac,
+            lookup_key=phone_raw,
+            background_tasks=background_tasks,
+        )
+
+    # (2) On a plan that covers several devices, a new device reconnecting by
+    # phone is added alongside the customer's other devices instead of taking
+    # the plan away from them (the one-slot swap that dropped TVs). It is
+    # labelled "Added by phone" so the reseller can spot a stranger using a
+    # known phone number. Only for paid time: sharing requires an unexpired
+    # plan, so a customer in grace goes to the move rules below.
+    from app.services.subscription_sharing import sharing_enabled_for_customer
+
+    device_limit_exc: HTTPException | None = None
+    shared = next(
+        (
+            c for c in candidates
+            if c.mac_address
+            and c.plan
+            and c.plan.connection_type == ConnectionType.HOTSPOT
+            and c.expiry > now
+            and sharing_enabled_for_customer(c, c.plan)
+        ),
+        None,
+    )
+    if shared is not None:
+        from app.api.access_code_routes import add_device_to_owner_plan
+
+        shared_id = shared.id
+        try:
+            result = await add_device_to_owner_plan(
+                db,
+                owner=shared,
+                router_id=request.router_id,
+                normalized_mac=normalized_mac,
+                device_name=PHONE_ADDED_DEVICE_NAME,
+            )
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            if exc.status_code != 409 or detail.get("error") != "device_limit_reached":
+                raise
+            # Full: its main device may still move below if it is not in use.
+            # The failed add rolled back, so reload the rows.
+            device_limit_exc = exc
+            candidates = [
+                c for c in (await db.execute(customer_stmt)).scalars().all()
+                if has_access_time(c, datetime.utcnow())
+            ]
+        else:
+            db.add(ReconnectionAttempt(
+                phone=phone_raw, mac_address=normalized_mac,
+                router_id=request.router_id, customer_id=shared_id,
+                success=True, created_at=datetime.utcnow(),
+            ))
+            await db.commit()
+            return result
+
+    # A plan already carrying more devices than its current limit (a group
+    # whose plan was swapped by a single-device voucher) is a FULL multi-device
+    # plan: nothing is added, and its main device may only move under the
+    # rules below (never when online or paired to a TV).
+    if device_limit_exc is None:
+        from app.api.access_code_routes import add_device_to_owner_plan, attached_devices_full_exc
+        from app.api.device_pairing import device_is_attached
+
+        for c in candidates:
+            # A device already holding a slot on such a plan comes back, the
+            # same as on a healthy group.
+            if (
+                c.plan
+                and c.plan.connection_type == ConnectionType.HOTSPOT
+                and c.expiry > now
+                and not sharing_enabled_for_customer(c, c.plan)
+                and await device_is_attached(
+                    db, owner_id=c.id, router_id=request.router_id, normalized_mac=normalized_mac,
+                )
+            ):
+                owner_id = c.id
+                result = await add_device_to_owner_plan(
+                    db, owner=c, router_id=request.router_id, normalized_mac=normalized_mac,
+                )
+                db.add(ReconnectionAttempt(
+                    phone=phone_raw, mac_address=normalized_mac,
+                    router_id=request.router_id, customer_id=owner_id,
+                    success=True, created_at=datetime.utcnow(),
+                ))
+                await db.commit()
+                return result
+
+        for c in candidates:
+            if c.plan and not sharing_enabled_for_customer(c, c.plan):
+                device_limit_exc = await attached_devices_full_exc(
+                    db, owner=c, normalized_mac=normalized_mac,
+                )
+                if device_limit_exc is not None:
+                    break
+
+    # (3) Move a purchase whose device is not in use (a phone whose randomized
+    # MAC rotated, a replaced phone, a plan never bound to a device).
+    # (4) Otherwise refuse: never revoke a device that is in use.
+    return await _move_idle_purchase_or_refuse(
         db,
-        customer=customer,
+        candidates=candidates,
         router_obj=router_obj,
         normalized_mac=normalized_mac,
         lookup_key=phone_raw,
         background_tasks=background_tasks,
+        device_limit_exc=device_limit_exc,
     )
+
+
+async def _move_idle_purchase_or_refuse(
+    db: AsyncSession,
+    *,
+    candidates: list[Customer],
+    router_obj: Router,
+    normalized_mac: str,
+    lookup_key: str,
+    background_tasks: BackgroundTasks,
+    device_limit_exc: HTTPException | None = None,
+) -> dict:
+    """Move the best idle purchase to this device, or raise 409.
+
+    See app/services/device_entitlements.py for what "in use" means. Raises
+    the multi-device ``device_limit_reached`` 409 (with the device list the
+    portal shows) when a full shared plan was the reason, else
+    ``plan_in_use_on_another_device``.
+    """
+    from app.services.device_entitlements import (
+        assess_bound_devices,
+        pick_blocker,
+        pick_movable,
+        plan_in_use_detail,
+        router_probe_info,
+    )
+
+    candidates = [
+        c for c in candidates
+        if not c.mac_address or normalize_mac_address(c.mac_address) != normalized_mac
+    ]
+    if not candidates:
+        raise HTTPException(status_code=404, detail="Active subscription not found")
+
+    uses = await assess_bound_devices(
+        db,
+        candidates,
+        router_id=router_obj.id,
+        router_info=router_probe_info(router_obj),
+    )
+    chosen = pick_movable(candidates, uses, requesting_mac=normalized_mac)
+    if chosen is not None:
+        return await restore_customer_on_device(
+            db,
+            customer=chosen,
+            router_obj=router_obj,
+            normalized_mac=normalized_mac,
+            lookup_key=lookup_key,
+            background_tasks=background_tasks,
+            expected_mac=uses[chosen.id].mac,
+        )
+
+    blocker = pick_blocker(candidates, uses, requesting_mac=normalized_mac)
+    logger.info(
+        "[RECONNECT] Refusing %s on router %s: every purchase is in use (%s)",
+        normalized_mac, router_obj.id,
+        ", ".join(f"{u.customer_id}:{u.mac}:{u.reason}" for u in uses.values()),
+    )
+    db.add(ReconnectionAttempt(
+        phone=lookup_key, mac_address=normalized_mac,
+        router_id=router_obj.id, customer_id=blocker.customer_id,
+        success=False, failure_reason=f"plan_in_use:{blocker.reason}",
+        old_mac_address=blocker.mac, created_at=datetime.utcnow(),
+    ))
+    await db.commit()
+    if device_limit_exc is not None:
+        raise device_limit_exc
+    raise HTTPException(status_code=409, detail=plan_in_use_detail(blocker))
+
+
+_UNCHECKED_MAC = object()
 
 
 async def restore_customer_on_device(
@@ -1529,12 +1706,17 @@ async def restore_customer_on_device(
     normalized_mac: str,
     lookup_key: str,
     background_tasks: BackgroundTasks,
+    expected_mac: Any = _UNCHECKED_MAC,
 ) -> dict:
     """Put a paying customer's plan on ``normalized_mac``.
 
     If the customer's recorded device is a different MAC (new phone, or a
     randomized MAC), direct-API routers revoke and verify the old device before
     the database moves the entitlement to the new one.
+
+    ``expected_mac`` is the device the caller judged idle (or None for "no
+    device"). If the row is bound elsewhere by the time the lock is held, the
+    move is refused rather than revoking a device nobody assessed.
     """
     customer_id = customer.id
     router_id = router_obj.id
@@ -1554,12 +1736,22 @@ async def restore_customer_on_device(
         if not customer or customer.router_id != router_id:
             await db.rollback()
             raise HTTPException(status_code=404, detail="Active subscription not found")
+        if expected_mac is not _UNCHECKED_MAC:
+            bound_now = (
+                normalize_mac_address(customer.mac_address) if customer.mac_address else None
+            )
+            if bound_now not in (expected_mac, normalized_mac):
+                await db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail="This subscription was moved by another request. Please try again.",
+                )
 
         now = datetime.utcnow()
         if (
             customer.status != CustomerStatus.ACTIVE
             or not customer.expiry
-            or customer.expiry <= now
+            or not has_access_time(customer, now)
         ):
             await db.rollback()
             raise HTTPException(status_code=404, detail="Active subscription not found")
@@ -1612,7 +1804,7 @@ async def restore_customer_on_device(
             conflicting
             and conflicting.status == CustomerStatus.ACTIVE
             and conflicting.expiry
-            and conflicting.expiry > now
+            and has_access_time(conflicting, now)
         ):
             db.add(ReconnectionAttempt(
                 phone=lookup_key, mac_address=normalized_mac,
@@ -1683,7 +1875,8 @@ async def restore_customer_on_device(
 
         customer_name = customer.name
         plan_name = customer.plan.name
-        expiry = customer.expiry
+        # Access runs to the effective expiry (paid expiry + reseller grace).
+        expiry = effective_expiry(customer)
         expiry_iso = expiry.isoformat()
         router_name = current_router.name
 
@@ -1782,59 +1975,23 @@ async def get_public_ads(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Fetch active ads for captive portal display (public, no auth required).
-    Returns paginated active ads sorted by priority then created_at.
+    Network-wide Bitwave ads for captive portal display (public, no auth).
+    Router-scoped and reseller ads only reach a portal through
+    /api/public/portal/{identity}, which knows the router.
     """
     try:
+        ads = await network_ads(db, limit=100)
+        if category:
+            ads = [a for a in ads if a.get("category") == category]
+        page, per_page = max(page, 1), min(max(per_page, 1), 50)
+        total = len(ads)
         offset = (page - 1) * per_page
-
-        stmt = (
-            select(Ad)
-            .where(Ad.is_active == True)
-            .where(or_(Ad.expires_at == None, Ad.expires_at > datetime.utcnow()))
-            .order_by(Ad.priority.desc(), Ad.created_at.desc())
-            .offset(offset)
-            .limit(per_page)
-        )
-
-        if category:
-            stmt = stmt.where(Ad.category == category)
-
-        result = await db.execute(stmt)
-        ads = result.scalars().all()
-
-        count_stmt = select(func.count(Ad.id)).where(
-            Ad.is_active == True,
-            or_(Ad.expires_at == None, Ad.expires_at > datetime.utcnow())
-        )
-        if category:
-            count_stmt = count_stmt.where(Ad.category == category)
-        total_result = await db.execute(count_stmt)
-        total = total_result.scalar() or 0
-
         return {
-            "ads": [
-                {
-                    "id": ad.id,
-                    "title": ad.title,
-                    "description": ad.description,
-                    "image_url": ad.image_url,
-                    "seller_name": ad.seller_name,
-                    "seller_location": ad.seller_location,
-                    "phone_number": ad.phone_number,
-                    "whatsapp_number": ad.whatsapp_number,
-                    "price": ad.price,
-                    "price_value": ad.price_value,
-                    "badge_type": ad.badge_type.value if ad.badge_type else None,
-                    "badge_text": ad.badge_text,
-                    "category": ad.category,
-                }
-                for ad in ads
-            ],
+            "ads": ads[offset:offset + per_page],
             "total": total,
             "page": page,
             "per_page": per_page,
-            "pages": (total + per_page - 1) // per_page if per_page > 0 else 0,
+            "pages": (total + per_page - 1) // per_page,
         }
     except Exception as e:
         logger.error(f"Error fetching public ads: {e}")

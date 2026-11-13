@@ -153,10 +153,76 @@ async def test_cameroon_reseller_above_threshold_pays_three_percent_in_usd(db):
     assert charges["final_charge"] == 15.0
 
 
+async def _voucher_revenue(db, reseller, amount, *, counts_as_revenue=True):
+    # Voucher redemptions are recorded as CASH customer payments.
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
+    customer = await make_customer(db, reseller, plan)
+    db.add(CustomerPayment(
+        customer_id=customer.id,
+        reseller_id=reseller.id,
+        amount=amount,
+        payment_method=PaymentMethod.CASH,
+        days_paid_for=7,
+        status=PaymentStatus.COMPLETED,
+        counts_as_revenue=counts_as_revenue,
+        created_at=IN_PERIOD,
+    ))
+    await db.commit()
+
+
 @pytest.mark.asyncio
-async def test_international_pppoe_users_cost_twenty_cents(db):
+async def test_zambia_voucher_reseller_pays_usd_minimum(db):
+    # Fairview Boarding House (prod user 751): ZMW 240 of vouchers in the
+    # first days, plus compensation vouchers that are not revenue.
+    reseller = await make_reseller(db, market_code="ZM")
+    await _voucher_revenue(db, reseller, 240)
+    await _voucher_revenue(db, reseller, 660, counts_as_revenue=False)
+
+    charges = await calculate_reseller_charges(db, reseller.id, PERIOD_START, PERIOD_END)
+
+    assert charges["currency"] == "USD"
+    assert charges["pricing_rule"]["fx_rate"] == 20.32
+    assert charges["pricing_rule"]["revenue_currency"] == "ZMW"
+    assert charges["pricing_rule"]["hotspot_revenue_local"] == 240
+    assert charges["hotspot_revenue"] == 11.81
+    assert charges["hotspot_charge"] == 0.35
+    assert charges["final_charge"] == 10.0
+
+
+@pytest.mark.asyncio
+async def test_zambia_reseller_above_threshold_pays_three_percent_in_usd(db):
+    reseller = await make_reseller(db, market_code="ZM")
+    await _voucher_revenue(db, reseller, 500 * 20.32)  # USD 500 of ZMW revenue
+
+    charges = await calculate_reseller_charges(db, reseller.id, PERIOD_START, PERIOD_END)
+
+    assert charges["hotspot_revenue"] == 500.0
+    assert charges["final_charge"] == 15.0
+
+
+@pytest.mark.asyncio
+async def test_haiti_voucher_reseller_pays_usd_minimum(db):
+    # A new Haitian voucher reseller: HTG 3,000 of vouchers in the month is
+    # about USD 23, so 3% is far under the USD 10 minimum.
+    reseller = await make_reseller(db, market_code="HT")
+    await _voucher_revenue(db, reseller, 3000)
+    await _voucher_revenue(db, reseller, 1000, counts_as_revenue=False)
+
+    charges = await calculate_reseller_charges(db, reseller.id, PERIOD_START, PERIOD_END)
+
+    assert charges["currency"] == "USD"
+    assert charges["pricing_rule"]["fx_rate"] == 131.16
+    assert charges["pricing_rule"]["revenue_currency"] == "HTG"
+    assert charges["pricing_rule"]["hotspot_revenue_local"] == 3000
+    assert charges["hotspot_revenue"] == 22.87
+    assert charges["final_charge"] == 10.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connection_type", [ConnectionType.PPPOE, ConnectionType.STATIC_IP])
+async def test_international_pppoe_users_cost_twenty_cents(db, connection_type):
     reseller = await make_reseller(db, market_code="UG")
-    plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
+    plan = await make_plan(db, reseller, connection_type=connection_type)
     for _ in range(60):
         await make_customer(
             db, reseller, plan, status=CustomerStatus.ACTIVE,
@@ -256,9 +322,12 @@ async def test_mpesa_refuses_usd_invoice(db, client, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_card_checkout_then_admin_confirmation_activates(db, client, monkeypatch, session_factory):
+@pytest.mark.parametrize("market_code", ["CM", "ZM", "HT"])
+async def test_card_checkout_then_admin_confirmation_activates(
+    db, client, monkeypatch, session_factory, market_code,
+):
     reseller = await make_reseller(
-        db, market_code="CM", subscription_status=SubscriptionStatus.TRIAL,
+        db, market_code=market_code, subscription_status=SubscriptionStatus.TRIAL,
         subscription_expires_at=datetime.utcnow() + timedelta(days=2),
     )
     invoice = await _invoice(db, reseller, final_charge=10.0, currency="USD")

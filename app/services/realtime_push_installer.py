@@ -115,10 +115,12 @@ def cpu_samples(api, n: int = 3) -> list:
 
 
 def recent_push_log(api) -> list:
+    # Wrapped RouterOS configuration logs may contain script source/tokens.
+    # Return only bounded, plain status messages emitted by the reporter.
     lines = [
         f"{row.get('time', '')} {row.get('message', '')}"
         for row in _data(api.send_command("/log/print"))
-        if (row.get("message") or "").startswith("usage-push")
+        if re.fullmatch(r'usage-push(?: v[0-9]+)?: [^\r\n;"\\]{1,240}', row.get("message") or "")
     ]
     return lines[-4:]
 
@@ -155,6 +157,7 @@ def install_router(
     skip_run: bool = False,
     allow_small: bool = False,
     force_https: bool = False,
+    native_ports: bool = False,
     measure_cpu: bool = False,
     api_factory=MikroTikAPI,
 ) -> dict:
@@ -185,6 +188,12 @@ def install_router(
         if rollback:
             return _rollback(api, result, current)
 
+        version = str(res.get("version", ""))
+        match = re.match(r"^7\.(\d+)(?:\.(\d+))?(?:\s|$)", version)
+        supported = bool(match and tuple(int(x or 0) for x in match.groups()) >= (19, 6))
+        if native_ports and not supported:
+            return {**result, "status": "skipped_unsupported_native_ports"}
+        result["native_ports"] = native_ports
         iface, kind = tunnel_interface(api)
         ping_ok = bool([p for p in _data(c("/ping", {"address": TUNNEL_SERVER_IP, "count": "2"})) if p.get("time")])
         via_tunnel = bool(iface and ping_ok)
@@ -205,7 +214,7 @@ def install_router(
             return {**result, "status": "would_install"}
 
         rendered = render_realtime_push_script(identity=ident, endpoint_url=url, interval_seconds=60,
-                                               wan_interface=wan, lists_every=lists_every)
+                                               wan_interface=wan, lists_every=lists_every, native_ports=native_ports)
         source = rendered[rendered.index("source={\n") + len("source={\n"):
                           rendered.index("\n}\n\n/system scheduler add")]
         if current and result["had_script"] != "v3":

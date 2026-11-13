@@ -22,11 +22,16 @@ from app.db.models import (
     UserRole,
 )
 from app.services import realtime_state
+from app.services.static_ip import normalize_static_ip
 from app.services.auth import verify_token, get_current_user
 from app.services.usage_tracking import (
     CUSTOMER_USAGE_BUCKET_RETENTION_DAYS,
     customer_bucket_start_for,
+    fup_cap_mb,
+    fup_usage_bytes,
+    fup_window_start,
     get_open_period,
+    plan_fup_period,
     pooled_period_usage_bytes,
 )
 
@@ -55,6 +60,11 @@ class PeriodOut(BaseModel):
     # is enforced against. None unless other devices on the plan have used data.
     shared_total_mb: Optional[float] = None
     shared_percent_used: Optional[float] = None
+    # Daily-FUP plans only (single-customer endpoint): the usage the cap is
+    # enforced against -- since today's reset, pooled for a shared plan.
+    fup_window_start: Optional[datetime] = None
+    fup_window_used_mb: Optional[float] = None
+    fup_window_percent_used: Optional[float] = None
 
 
 class LiveOut(BaseModel):
@@ -79,6 +89,8 @@ class UsageOut(BaseModel):
     plan_name: Optional[str]
     plan_data_cap_mb: Optional[int]
     plan_fup_action: Optional[str]
+    # "plan" = cap per paid period, "daily" = cap per day (see PeriodOut.fup_window_*).
+    plan_fup_period: Optional[str] = None
     period: Optional[PeriodOut]
     live: Optional[LiveOut] = None
 
@@ -165,10 +177,22 @@ def _serialize_period(p: CustomerUsagePeriod) -> PeriodOut:
 
 def _live_for(customer: Customer) -> Optional[LiveOut]:
     router_live = realtime_state.get_router_live(customer.router_id) if customer.router_id else None
-    device = (
-        realtime_state.get_device_live(customer.router_id, customer.mac_address)
-        or realtime_state.get_pppoe_live(customer.router_id, customer.pppoe_username)
+    # static_ip alone is not enough (PPPoE uses it as the remote address), and
+    # the plan is only touched when it can matter so it is never lazy-loaded.
+    is_static = (
+        customer.static_ip
+        and not customer.mac_address
+        and not customer.pppoe_username
+        and customer.plan is not None
+        and customer.plan.connection_type == ConnectionType.STATIC_IP
     )
+    if is_static:
+        device = realtime_state.get_static_live(customer.router_id, normalize_static_ip(customer.static_ip))
+    else:
+        device = (
+            realtime_state.get_device_live(customer.router_id, customer.mac_address)
+            or realtime_state.get_pppoe_live(customer.router_id, customer.pppoe_username)
+        )
     if router_live is None or device is None:
         return None
     return LiveOut(
@@ -190,6 +214,12 @@ def _serialize_usage(
     open_period: Optional[CustomerUsagePeriod],
 ) -> UsageOut:
     plan = customer.plan
+    period = _serialize_period(open_period) if open_period else None
+    if period is not None:
+        # Show the cap FUP actually enforces (a daily plan uses its current
+        # cap; a period opened before the plan had a cap has no snapshot).
+        period.cap_mb = fup_cap_mb(open_period, plan)
+        period.percent_used = _percent(open_period.total_bytes or 0, period.cap_mb)
     return UsageOut(
         customer_id=customer.id,
         connection_type=plan.connection_type.value if (plan and plan.connection_type) else None,
@@ -197,7 +227,8 @@ def _serialize_usage(
         plan_name=plan.name if plan else None,
         plan_data_cap_mb=plan.data_cap_mb if plan else None,
         plan_fup_action=plan.fup_action.value if (plan and plan.fup_action) else None,
-        period=_serialize_period(open_period) if open_period else None,
+        plan_fup_period=plan_fup_period(plan) if plan else None,
+        period=period,
         live=_live_for(customer),
     )
 
@@ -239,7 +270,14 @@ async def get_customer_usage(
         pooled = await pooled_period_usage_bytes(db, customer, open_period)
         if pooled != int(open_period.total_bytes or 0):
             usage.period.shared_total_mb = _bytes_to_mb(pooled)
-            usage.period.shared_percent_used = _percent(pooled, open_period.cap_mb_snapshot)
+            usage.period.shared_percent_used = _percent(pooled, usage.period.cap_mb)
+        now = datetime.utcnow()
+        window_start = fup_window_start(open_period, customer.plan, now)
+        if window_start is not None:
+            window_used = await fup_usage_bytes(db, customer, open_period, plan=customer.plan, now=now)
+            usage.period.fup_window_start = window_start
+            usage.period.fup_window_used_mb = _bytes_to_mb(window_used)
+            usage.period.fup_window_percent_used = _percent(window_used, usage.period.cap_mb)
     return usage
 
 
@@ -431,10 +469,12 @@ async def get_top_usage_for_reseller(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Top customers by current-period bandwidth (hotspot + PPPoE)."""
+    """Top customers by current-period bandwidth (hotspot, PPPoE and static IP)."""
     user = await get_current_user(token, db)
 
-    customer_filter = [Plan.connection_type.in_([ConnectionType.HOTSPOT, ConnectionType.PPPOE])]
+    customer_filter = [Plan.connection_type.in_(
+        [ConnectionType.HOTSPOT, ConnectionType.PPPOE, ConnectionType.STATIC_IP]
+    )]
     if user.role != UserRole.ADMIN:
         customer_filter.append(Customer.user_id == user.id)
 
@@ -444,6 +484,7 @@ async def get_top_usage_for_reseller(
             Customer.name.label("customer_name"),
             Customer.mac_address.label("mac_address"),
             Customer.pppoe_username.label("pppoe_username"),
+            Customer.static_ip.label("static_ip"),
             Plan.connection_type.label("connection_type"),
             Plan.name.label("plan_name"),
             CustomerUsagePeriod.cap_mb_snapshot.label("cap_mb"),
@@ -471,7 +512,11 @@ async def get_top_usage_for_reseller(
             if hasattr(r.connection_type, "value")
             else r.connection_type
         )
-        identifier = r.pppoe_username if connection_type == "pppoe" else r.mac_address
+        identifier = (
+            r.pppoe_username if connection_type == "pppoe"
+            else r.static_ip if connection_type == "static_ip"
+            else r.mac_address
+        )
         out.append(
             TopUsageItem(
                 customer_id=r.customer_id,
@@ -632,13 +677,8 @@ async def get_router_live(
     )
 
 
-@router.get("/api/realtime/routers", response_model=list[int])
-async def list_live_router_ids(
-    db: AsyncSession = Depends(get_db),
-    token: str = Depends(verify_token),
-):
-    """Ids of the caller's routers that are reporting live right now."""
-    user = await get_current_user(token, db)
+async def _live_router_ids_for(db: AsyncSession, user) -> list[int]:
+    """The caller's routers that have sent a real-time report in the last 5 min."""
     ids = [
         rid for rid in realtime_state.pilot_router_ids()
         if (state := realtime_state.get_router_live(rid)) is not None
@@ -650,3 +690,54 @@ async def list_live_router_ids(
     if user.role != UserRole.ADMIN:
         stmt = stmt.where(Router.user_id == user.id)
     return sorted((await db.execute(stmt)).scalars().all())
+
+
+@router.get("/api/realtime/routers", response_model=list[int])
+async def list_live_router_ids(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Ids of the caller's routers that are reporting live right now."""
+    user = await get_current_user(token, db)
+    return await _live_router_ids_for(db, user)
+
+
+class RealtimeOnlineOut(BaseModel):
+    router_ids: list[int]
+    online_customer_ids: list[int]
+
+
+@router.get("/api/realtime/customers/online", response_model=RealtimeOnlineOut)
+async def list_realtime_online_customers(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Which of the caller's customers are online right now on live routers.
+
+    Feeds the Online / Offline filter on the Customers page. Only routers on
+    real-time push are covered (``router_ids``, the same set as
+    ``/api/realtime/routers``); a customer on one of them who is not in
+    ``online_customer_ids`` is offline. Customers on other routers are left to
+    the per-router hotspot / PPPoE monitor endpoints.
+
+    Answered from the push state in memory plus one customer query: no RouterOS
+    calls, however many customers the reseller has. Scoped to the caller's own
+    customers, like ``/api/customers``.
+    """
+    user = await get_current_user(token, db)
+    router_ids = await _live_router_ids_for(db, user)
+    if not router_ids:
+        return RealtimeOnlineOut(router_ids=[], online_customer_ids=[])
+
+    customers = (
+        await db.execute(
+            select(Customer)
+            .options(selectinload(Customer.plan))
+            .where(Customer.user_id == user.id, Customer.router_id.in_(router_ids))
+        )
+    ).scalars().all()
+    online_ids = sorted(
+        c.id for c in customers
+        if (live := _live_for(c)) is not None and live.online
+    )
+    return RealtimeOnlineOut(router_ids=router_ids, online_customer_ids=online_ids)

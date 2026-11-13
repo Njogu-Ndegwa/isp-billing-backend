@@ -11,7 +11,7 @@ import math
 from datetime import datetime, timedelta, date
 from typing import Any
 
-from sqlalchemy import select, func, text, and_, or_, case
+from sqlalchemy import select, func, text, and_, or_, not_, case
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -24,6 +24,7 @@ from app.db.models import (
     GrowthTarget,
 )
 from app.services.app_settings import get_setting, set_setting
+from app.services.subscription import FREE_SETUP_DAYS
 from app.services.markets import (
     PAY_CARD,
     PAYSTACK_PROCESSING_FEE_RATE,
@@ -204,6 +205,20 @@ def _aligned_previous_window(
     return prev_start, min(prev_start + elapsed, prev_end)
 
 
+def _not_just_free_setup(now: datetime):
+    """False for a reseller whose only cover is an admin Free setup window.
+
+    That window is help, not a sale or a trial starting, so pressing the button
+    must not move a paying, trial or conversion figure. A reseller who has paid
+    past the window has an end date after it and counts as normal.
+    """
+    return or_(
+        User.free_setup_until.is_(None),
+        User.free_setup_until <= now,
+        User.subscription_expires_at > User.free_setup_until,
+    )
+
+
 def _paid_before(moment: datetime):
     """EXISTS clause: this reseller completed a subscription payment before `moment`."""
     return (
@@ -247,6 +262,13 @@ async def _subscribers_at(
         or_(
             User.subscription_status.notin_(_LAPSED_STATUSES),
             User.subscription_expires_at < now,
+        ),
+        # Free setup days are never cover: only moments before the press count,
+        # and for those the old expiry is the evidence, as above.
+        or_(
+            User.free_setup_until.is_(None),
+            User.subscription_expires_at > User.free_setup_until,
+            User.free_setup_until > moment + timedelta(days=FREE_SETUP_DAYS),
         ),
     ]
     if paying_only:
@@ -405,6 +427,7 @@ async def compute_mrr(db: AsyncSession) -> dict[str, Any]:
             User.subscription_status.in_([
                 SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL,
             ]),
+            _not_just_free_setup(datetime.utcnow()),
         )
         .group_by(User.subscription_status)
     )).all()
@@ -849,6 +872,11 @@ async def compute_arpu(db: AsyncSession) -> dict[str, Any]:
             .where(
                 ResellerTransactionCharge.created_at >= start,
                 ResellerTransactionCharge.created_at < end,
+                # Taking back an ad refund isn't revenue (app/services/ad_sales.py).
+                or_(
+                    ResellerTransactionCharge.reference.is_(None),
+                    ~ResellerTransactionCharge.reference.startswith("ad-refund:"),
+                ),
             )
         )).scalar())
 
@@ -919,6 +947,7 @@ async def compute_trial_conversion(db: AsyncSession) -> dict[str, Any]:
                     User.created_at < month_start,
                 ),
             ),
+            _not_just_free_setup(now),
         )
     )).scalar() or 0
 
@@ -967,6 +996,7 @@ async def compute_trial_conversion(db: AsyncSession) -> dict[str, Any]:
         select(func.count(User.id)).where(
             User.role == UserRole.RESELLER,
             User.subscription_status == SubscriptionStatus.TRIAL,
+            _not_just_free_setup(now),
         )
     )).scalar() or 0
 
@@ -983,13 +1013,20 @@ async def compute_trial_conversion(db: AsyncSession) -> dict[str, Any]:
         select(func.count(User.id)).where(
             User.role == UserRole.RESELLER,
             or_(
-                User.subscription_status == SubscriptionStatus.TRIAL,
                 and_(
-                    User.subscription_status.in_([
-                        SubscriptionStatus.ACTIVE,
-                        SubscriptionStatus.INACTIVE,
-                        SubscriptionStatus.SUSPENDED,
-                    ]),
+                    User.subscription_status == SubscriptionStatus.TRIAL,
+                    _not_just_free_setup(now),
+                ),
+                and_(
+                    or_(
+                        User.subscription_status.in_([
+                            SubscriptionStatus.ACTIVE,
+                            SubscriptionStatus.INACTIVE,
+                            SubscriptionStatus.SUSPENDED,
+                        ]),
+                        # Counted as the lapsed account it was before the press.
+                        not_(_not_just_free_setup(now)),
+                    ),
                     User.created_at < prev_end,
                 ),
             ),
@@ -1041,7 +1078,7 @@ async def compute_activation_funnel(db: AsyncSession) -> dict[str, Any]:
         {"stage": "signed_up", "label": "Signed Up", "count": signed_up, "percent": 100 if signed_up else 0},
         {"stage": "added_router", "label": "Added Router", "count": added_router, "percent": _pct(added_router)},
         {"stage": "first_customer", "label": "First Customer", "count": first_customer, "percent": _pct(first_customer)},
-        {"stage": "first_revenue", "label": "First Revenue", "count": first_revenue, "percent": _pct(first_revenue)},
+        {"stage": "first_revenue", "label": "First Payment", "count": first_revenue, "percent": _pct(first_revenue)},
     ]
 
     signup_to_router = _safe_div(added_router * 100, signed_up)
@@ -1154,8 +1191,8 @@ async def compute_smart_alerts(db: AsyncSession) -> dict[str, Any]:
                 "id": f"milestone_rev_{milestone}",
                 "type": "milestone",
                 "severity": "success",
-                "title": "Revenue Milestone",
-                "message": f"Platform revenue crossed KES {milestone:,.0f} this month!",
+                "title": "Transaction Volume Milestone",
+                "message": f"Transaction volume through Bitwave crossed KES {milestone:,.0f} this month!",
                 "timestamp": now.isoformat(),
                 "dismissed": False,
             })
@@ -1476,6 +1513,7 @@ async def _compute_target_current(db: AsyncSession, target_id: str) -> float:
                 User.subscription_status.in_([
                     SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL,
                 ]),
+                _not_just_free_setup(datetime.utcnow()),
             )
         )).scalar()
         return float(val or 0)
@@ -1524,8 +1562,8 @@ def _earnings_cache_key(period: str, own_ids: list[int]) -> str:
 # Ordered as they stack in the chart, ground up.
 EARNING_STREAMS: list[dict[str, str]] = [
     {"key": "saas_hotspot", "label": "Hotspot commission", "group": "system"},
-    {"key": "saas_pppoe", "label": "PPPoE user fees", "group": "system"},
-    {"key": "saas_other", "label": "Other system charges", "group": "system"},
+    {"key": "saas_pppoe", "label": "PPPoE / static per-user fees", "group": "system"},
+    {"key": "saas_other", "label": "Subscription payments without an invoice", "group": "system"},
     {"key": "reseller", "label": "My reseller collections", "group": "reseller"},
 ]
 _SYSTEM_KEYS = ("saas_hotspot", "saas_pppoe", "saas_other")
@@ -1635,7 +1673,11 @@ def _earnings_windows(period: str) -> tuple[date, date, date, date]:
         )
 
     elapsed = (cur_end - cur_start).days
-    return prev_start, prev_start + timedelta(days=elapsed), cur_start, cur_end
+    # Never past the current window's start: on the 31st, 31 elapsed days from
+    # the 1st of a 28/30-day month would run into this month and count its
+    # first days in both windows.
+    prev_end = min(prev_start + timedelta(days=elapsed), cur_start)
+    return prev_start, prev_end, cur_start, cur_end
 
 
 def _earnings_granularity(period: str) -> str:

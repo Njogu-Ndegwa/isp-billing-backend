@@ -63,6 +63,8 @@ class WebFigProxySession:
     expires_at: datetime
     webfig_scheme: str = "http"
     webfig_port: int = 80
+    staff_id: int | None = None
+    staff_token_version: int | None = None
 
     def as_public_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +98,8 @@ def create_webfig_proxy_session(
     ttl_minutes: int | None = None,
     webfig_scheme: str = "http",
     webfig_port: int | str | None = None,
+    staff_id: int | None = None,
+    staff_token_version: int | None = None,
 ) -> WebFigProxySession:
     _prune_expired_webfig_sessions()
     ttl = max(1, int(ttl_minutes or settings.ROUTER_WEBFIG_SESSION_MINUTES))
@@ -107,6 +111,8 @@ def create_webfig_proxy_session(
         router_ip=router_ip,
         created_by_user_id=created_by_user_id,
         expires_at=datetime.utcnow() + timedelta(minutes=ttl),
+        staff_id=staff_id,
+        staff_token_version=staff_token_version,
         webfig_scheme=scheme,
         webfig_port=_coerce_service_port(
             webfig_port,

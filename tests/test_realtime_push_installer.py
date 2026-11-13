@@ -17,7 +17,7 @@ class FakeRouterOS:
 
     def __init__(self, *, arch="mipsbe", board="RB951Ui-2HnD", identity="Router-0001",
                  tunnel="wg-hz", ping=True, reachable=True, existing_script=None,
-                 default_gw="192.168.1.1%ether1"):
+                 default_gw="192.168.1.1%ether1", version="7.20.7"):
         self.arch, self.board, self.identity = arch, board, identity
         self.tunnel, self.ping, self.reachable = tunnel, ping, reachable
         self.scripts = {}
@@ -25,6 +25,7 @@ class FakeRouterOS:
             self.scripts["bitwave-usage-push"] = existing_script
         self.schedulers = {}
         self.default_gw = default_gw
+        self.version = version
         self.writes = []
 
     def __call__(self, *a, **k):        # used as api_factory
@@ -42,7 +43,7 @@ class FakeRouterOS:
             return {"data": [{"name": self.identity}]}
         if path == "/system/resource/print":
             return {"data": [{"architecture-name": self.arch, "board-name": self.board,
-                              "version": "7.20.7", "free-hdd-space": "110000000", "cpu-load": "9"}]}
+                              "version": self.version, "free-hdd-space": "110000000", "cpu-load": "9"}]}
         if path == "/ip/route/print":
             rows = [{"dst-address": "0.0.0.0/0", "active": "true", "immediate-gw": self.default_gw}]
             if self.tunnel:
@@ -205,3 +206,36 @@ async def test_startup_catch_up_requeues_recent_routers_that_are_not_pushing(db,
 
 def test_setup_retries_span_hours_not_minutes():
     assert sum(rpi.SETUP_RETRY_DELAYS_SECONDS) + rpi.SETUP_FIRST_DELAY_SECONDS >= 6 * 3600
+
+
+def test_install_status_never_echoes_wrapped_router_source():
+    class Logs:
+        def send_command(self, path):
+            return {'data': [
+                {'time': '1', 'message': 'usage-push: interval now 60s'},
+                {'time': '2', 'message': 'usage-push" or script="other"]; :local tok "private"'},
+                {'time': '3', 'message': 'usage-push: deferred"; :local tok "private"'},
+                {'time': '4', 'message': 'usage-push v2: installed for Router-0001'},
+            ]}
+    assert rpi.recent_push_log(Logs()) == [
+        '1 usage-push: interval now 60s', '4 usage-push v2: installed for Router-0001']
+
+
+@pytest.mark.parametrize("version", ["6.49.19", "7.19.5", "8.0.1", "unknown"])
+def test_native_ports_refuses_unvalidated_versions_before_writes(version):
+    api = FakeRouterOS(version=version)
+    result = rpi.install_router(ROUTER, native_ports=True, api_factory=api)
+    assert result["status"] == "skipped_unsupported_native_ports"
+    assert api.writes == []
+
+
+def test_native_ports_is_explicit_and_uses_existing_tunnel_and_scheduler():
+    regular = FakeRouterOS()
+    rpi.install_router(ROUTER, skip_run=True, api_factory=regular)
+    assert "bw-native-ports-json" not in regular.scripts["bitwave-usage-push"]
+    selected = FakeRouterOS(version="7.19.6 (stable)")
+    result = rpi.install_router(ROUTER, native_ports=True, skip_run=True, api_factory=selected)
+    assert result["status"] == "installed" and result["native_ports"] is True
+    assert "bw-native-ports-json v1" in selected.scripts["bitwave-usage-push"]
+    assert result["url"] == settings.REALTIME_TUNNEL_PUSH_URL
+    assert selected.schedulers["bitwave-usage-push"]["interval"] == "60s"

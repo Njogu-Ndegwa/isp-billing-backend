@@ -711,3 +711,150 @@ async def test_campaign_summary_names_the_paybill_customers_were_told(
 
     assert "555111" in campaign.body
     assert PLATFORM_PAYBILL not in campaign.body
+
+
+
+# ---- "Include hotspot customers" on expiry messages ------------------------
+
+async def _mixed_reseller(db, *, include_hotspot, status, expiry, offsets=(120,)):
+    """One reseller with a hotspot and a PPPoE customer, both due."""
+    reseller = await make_reseller(db, organization_name="Mixed ISP")
+    await make_sms_account(db, reseller, balance=10)
+    if await db.get(MessagingSettings, 1) is None:
+        db.add(MessagingSettings(id=1, enabled=True))
+    prefs = CustomerExpirySmsSettings(
+        user_id=reseller.id,
+        enabled=True,
+        reminder_offsets_minutes=list(offsets),
+        send_at_expiry=True,
+    )
+    if include_hotspot is not None:
+        prefs.expiry_include_hotspot = include_hotspot
+    db.add(prefs)
+    await db.commit()
+    hotspot_plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
+    pppoe_plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
+    hotspot = await make_customer(
+        db, reseller, hotspot_plan, status=status, expiry=expiry,
+        phone="254700000301",
+    )
+    pppoe = await make_customer(
+        db, reseller, pppoe_plan, status=status, expiry=expiry,
+        pppoe_username="pppoe-mixed", phone="254700000302",
+    )
+    return reseller, hotspot, pppoe
+
+
+async def _messaged_customer_ids(db):
+    return sorted(
+        (await db.execute(select(SmsMessage.customer_id))).scalars().all()
+    )
+
+
+async def test_expiry_include_hotspot_defaults_on(db, session_factory):
+    reseller, _, _ = await _mixed_reseller(
+        db, include_hotspot=None, status=CustomerStatus.ACTIVE,
+        expiry=datetime.utcnow() + timedelta(minutes=90),
+    )
+    row = await db.get(CustomerExpirySmsSettings, reseller.id)
+    await db.refresh(row)
+    assert row.expiry_include_hotspot is True
+
+
+async def test_reminders_skip_hotspot_when_include_hotspot_off(db, session_factory):
+    now = datetime.utcnow().replace(microsecond=0)
+    reseller, hotspot, pppoe = await _mixed_reseller(
+        db, include_hotspot=False, status=CustomerStatus.ACTIVE,
+        expiry=now + timedelta(minutes=90),
+    )
+
+    groups = await customer_expiry_notifications.collect_due_reminder_groups(
+        session_factory=session_factory, now=now,
+    )
+    assert groups == {(reseller.id, 120): [pppoe.id]}
+
+    # The queue step filters too, even if it is handed a hotspot customer.
+    campaign_id = await customer_expiry_notifications._queue_reseller_reminder_campaign(
+        reseller.id, 120, [hotspot.id, pppoe.id],
+        session_factory=session_factory, now=now,
+    )
+    assert campaign_id is not None
+    assert await _messaged_customer_ids(db) == [pppoe.id]
+
+
+async def test_reminders_include_hotspot_by_default(db, session_factory):
+    now = datetime.utcnow().replace(microsecond=0)
+    reseller, hotspot, pppoe = await _mixed_reseller(
+        db, include_hotspot=None, status=CustomerStatus.ACTIVE,
+        expiry=now + timedelta(minutes=90),
+    )
+
+    groups = await customer_expiry_notifications.collect_due_reminder_groups(
+        session_factory=session_factory, now=now,
+    )
+    assert groups == {(reseller.id, 120): sorted([hotspot.id, pppoe.id])}
+
+    await customer_expiry_notifications._queue_reseller_reminder_campaign(
+        reseller.id, 120, [hotspot.id, pppoe.id],
+        session_factory=session_factory, now=now,
+    )
+    assert await _messaged_customer_ids(db) == sorted([hotspot.id, pppoe.id])
+
+
+async def test_at_expiry_message_skips_hotspot_when_include_hotspot_off(
+    db, session_factory,
+):
+    _, hotspot, pppoe = await _mixed_reseller(
+        db, include_hotspot=False, status=CustomerStatus.INACTIVE,
+        expiry=datetime.utcnow() - timedelta(minutes=1),
+    )
+
+    campaigns = await customer_expiry_notifications.queue_customer_expiry_notifications(
+        [hotspot.id, pppoe.id], session_factory=session_factory
+    )
+
+    assert len(campaigns) == 1
+    assert await _messaged_customer_ids(db) == [pppoe.id]
+
+
+async def test_at_expiry_message_reaches_both_by_default(db, session_factory):
+    _, hotspot, pppoe = await _mixed_reseller(
+        db, include_hotspot=None, status=CustomerStatus.INACTIVE,
+        expiry=datetime.utcnow() - timedelta(minutes=1),
+    )
+
+    await customer_expiry_notifications.queue_customer_expiry_notifications(
+        [hotspot.id, pppoe.id], session_factory=session_factory
+    )
+
+    assert await _messaged_customer_ids(db) == sorted([hotspot.id, pppoe.id])
+
+
+async def test_hotspot_only_reseller_with_include_off_queues_nothing(
+    db, session_factory,
+):
+    reseller = await make_reseller(db, organization_name="Hotspot Only")
+    await make_sms_account(db, reseller, balance=5)
+    db.add(MessagingSettings(id=1, enabled=True))
+    db.add(CustomerExpirySmsSettings(
+        user_id=reseller.id, enabled=True, reminder_offsets_minutes=[1440],
+        send_at_expiry=True, expiry_include_hotspot=False,
+    ))
+    await db.commit()
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
+    customer = await make_customer(
+        db, reseller, plan, status=CustomerStatus.INACTIVE,
+        expiry=datetime.utcnow() - timedelta(minutes=1), phone="254700000303",
+    )
+
+    campaigns = await customer_expiry_notifications.queue_customer_expiry_notifications(
+        [customer.id], session_factory=session_factory
+    )
+
+    assert campaigns == []
+    credits = (
+        await db.execute(
+            select(SmsCreditAccount).where(SmsCreditAccount.user_id == reseller.id)
+        )
+    ).scalar_one()
+    assert credits.balance == 5

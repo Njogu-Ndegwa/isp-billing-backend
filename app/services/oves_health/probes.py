@@ -112,9 +112,14 @@ REGISTRY: list[Probe] = [
       "https://keycloak.omnivoltaic.com/realms/master/.well-known/openid-configuration",
       "Prod client signup (signUpClient rolls back on failure), SSO",
       expect_text="issuer", critical=True),
+    # Since 2026-11-02 this host fronts elasticsearch-prod (Tencent), which has
+    # xpack security on, so an unauthenticated health call gets a 401. The
+    # security_exception body comes from the ES node itself (not nginx, which
+    # answers 502/503 when the pod is gone), so it still proves ES is up.
     P("elasticsearch", "Elasticsearch", "oves_dev", "http",
       "https://elasticsearch.omnivoltaic.com/_cluster/health",
-      "Prod agent + asset-account search, code-event index", expect_text='"timed_out":false'),
+      "Prod agent + asset-account search, code-event index",
+      expect_status=(401,), expect_text="security_exception"),
     P("influxdb", "InfluxDB (fluxdb)", "oves_dev", "http", "https://fluxdb.omnivoltaic.com/health",
       "Prod createItemFleet (bucket per fleet), aaas-dashboard", expect_text="pass"),
     P("vault", "Vault", "oves_dev", "http", "https://vault.omnivoltaic.com/v1/sys/health",
@@ -347,9 +352,21 @@ async def run_probe(client: httpx.AsyncClient, probe: Probe, timeout: float) -> 
         return _result(probe, "down", None, f"{type(exc).__name__}: {exc}"[:200])
 
 
+_TLS = None
+
+
+def shared_tls():
+    """One verified TLS context for every outbound probe / API call: building
+    one loads the CA bundle (~20-40 ms of CPU) and they are thread-safe."""
+    global _TLS
+    if _TLS is None:
+        _TLS = httpx.create_ssl_context()
+    return _TLS
+
+
 async def run_all(probes: list[Probe], timeout: float, concurrency: int = 12) -> list[dict]:
     sem = asyncio.Semaphore(concurrency)
-    async with httpx.AsyncClient(follow_redirects=False,
+    async with httpx.AsyncClient(follow_redirects=False, verify=shared_tls(),
                                  headers={"User-Agent": "bitwave-oves-health/1"}) as client:
         async def one(p: Probe) -> dict:
             async with sem:

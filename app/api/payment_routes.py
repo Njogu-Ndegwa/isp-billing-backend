@@ -11,7 +11,7 @@ from app.db.models import (
     CustomerStatus, CustomerPayment, CollectionMode, ConnectionType, User, PaymentMethod,
     ProvisioningAttemptEntrypoint, ProvisioningAttemptSource,
     C2BTransaction, C2BTransactionStatus,
-    OutageCompensation, OutageCompensationItem, PaymentStatus,
+    OutageCompensation, OutageCompensationItem, PaymentStatus, UserRole,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
@@ -200,6 +200,9 @@ async def _finalize_pending_mobile_money_transaction(
         resolve_mpesa_collection_mode,
     )
 
+    from app.services.pppoe_expired_guards import drop_unpaid_page_plan
+
+    drop_unpaid_page_plan(customer, tx.amount)
     plan, duration_value, duration_unit = await _resolve_customer_payment_plan(db, customer)
     if not plan:
         raise HTTPException(status_code=400, detail="Customer has no plan assigned")
@@ -430,6 +433,9 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
             from app.db.models import PaymentMethod
             
             # Check for pending plan change (customer paying for a different plan)
+            from app.services.pppoe_expired_guards import drop_unpaid_page_plan
+
+            drop_unpaid_page_plan(customer, mpesa_txn.amount)
             pending_data = None
             if customer.pending_update_data:
                 try:
@@ -501,6 +507,11 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                         customer.router_id,
                         customer.pppoe_username,
                     )
+            elif customer.plan and customer.plan.connection_type == ConnectionType.STATIC_IP:
+                from app.services.static_ip import schedule_static_provision
+
+                await db.commit()
+                schedule_static_provision(customer.id)
             elif customer.mac_address and customer.router:
                 router_obj = customer.router
                 hotspot_payload = build_hotspot_payload(
@@ -547,7 +558,17 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                     customer.router_id,
                     customer.mac_address,
                 )
-            
+
+            # A paybill with C2B URLs registered also sends a C2B copy of this
+            # receipt; if it beat this callback it sits in the reseller's
+            # unmatched list. Retire it (own session, never raises).
+            from app.services.c2b_handler import mark_stk_echo_after_stk_payment
+            await mark_stk_echo_after_stk_payment(
+                receipt_number,
+                customer_id=customer.id,
+                reseller_id=customer.user_id,
+            )
+
             return {"ResultCode": 0, "ResultDesc": "Payment processed successfully"}
         
         else:
@@ -606,6 +627,22 @@ async def initiate_mpesa_payment_api(
         customer = result.scalar_one_or_none()
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
+        # Tenant check: a reseller may only prompt their own customers (this
+        # route always needs a login; the captive portal pays through the
+        # public /api/hotspot/register-and-pay instead). Checked before any
+        # side effect: no STK, no transaction row, no status change.
+        # A staff token carries its owner's user_id, so current_user is the
+        # owner here and staff pass for the owner's customers. Keep comparing
+        # against current_user.id, never a staff id.
+        if current_user.role != UserRole.ADMIN and customer.user_id != current_user.id:
+            logger.warning(
+                "Refused initiate-payment: user %s is not the owner of customer %s",
+                current_user.id, customer.id,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="You can only send a payment request to your own customers",
+            )
 
         # Snapshot the plan being paid for now — customer.plan_id gets
         # overwritten by later purchases, and the session may roll back
@@ -1139,16 +1176,18 @@ async def get_payment_status(
         ):
             from app.api.device_pairing import _format_share_code, get_or_create_access_code
             from app.services.subscription_sharing import (
-                max_shared_users_for_plan,
-                sharing_enabled_for_plan,
+                max_devices_for_customer,
+                sharing_enabled_for_customer,
             )
 
-            if sharing_enabled_for_plan(customer.plan):
+            if sharing_enabled_for_customer(customer, customer.plan):
                 code_row = await get_or_create_access_code(db, customer)
                 access_code = _format_share_code(code_row.code)
-                max_devices = max_shared_users_for_plan(customer.plan)
+                max_devices = max_devices_for_customer(customer, customer.plan)
                 await db.commit()
 
+        from app.api.fapshi_routes import customer_payment_flags
+        confirmation = await customer_payment_flags(db, customer.id)
         return {
             "customer_id": customer.id,
             "status": customer.status.value,
@@ -1156,6 +1195,7 @@ async def get_payment_status(
             "plan_id": customer.plan_id,
             "plan_name": customer.plan.name if customer.plan else None,
             "delivery": serialize_delivery_attempt(attempt),
+            **confirmation,
             "access_code": access_code,
             "max_devices": max_devices,
         }
@@ -1570,6 +1610,9 @@ async def get_mpesa_transactions(
                 ))
                 .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
                 .where(C2BTransaction.matched_reseller_id == user.id)
+                # An STK echo is the C2B copy of an STK payment that Query 1
+                # already lists; showing it again would double the sale.
+                .where(C2BTransaction.status != C2BTransactionStatus.STK_ECHO)
             )
             if router_id:
                 c2b_stmt = c2b_stmt.where(Router.id == router_id)
@@ -1971,8 +2014,9 @@ async def get_mpesa_transactions_summary(
     """
     Get transactions summary with statistics.
 
-    Uses the same two-query merge as the main transactions endpoint so
-    numbers stay consistent.
+    Uses the same sources as the main transactions endpoint so numbers stay
+    consistent: STK (mpesa_transactions), processed paybill payments
+    (c2b_transactions) and the non-M-Pesa customer_payments rows.
 
     Query Parameters:
     - router_id, payment_method, date, start_date, end_date (same as /transactions)
@@ -2036,6 +2080,51 @@ async def get_mpesa_transactions_summary(
                     "status": tx_status.value,
                     "method": "mobile_money",
                     "settlement": _settlement_of_mpesa(collection_mode),
+                    "router_name": router_name,
+                    "router_id": router_pk,
+                    "counts_as_revenue": True,
+                    "connection_type": connection_type.value if connection_type else None,
+                })
+
+            # Paybill (C2B) payments. Their customer_payments twin is skipped
+            # by _cp_ledger_condition, so without this they vanish from every
+            # tile. Only processed rows count: STK echoes duplicate a row
+            # above, and unmatched/rejected paybill money is not a sale.
+            c2b_stmt = (
+                select(
+                    C2BTransaction.trans_amount,
+                    C2BTransaction.business_shortcode,
+                    Router.name,
+                    Router.id,
+                    Plan.connection_type,
+                )
+                .outerjoin(Customer, C2BTransaction.matched_customer_id == Customer.id)
+                .outerjoin(Router, Customer.router_id == Router.id)
+                .outerjoin(CustomerPayment, and_(
+                    CustomerPayment.payment_reference == C2BTransaction.trans_id,
+                    CustomerPayment.customer_id == C2BTransaction.matched_customer_id,
+                ))
+                .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
+                .where(
+                    C2BTransaction.matched_reseller_id == user.id,
+                    C2BTransaction.status == C2BTransactionStatus.PROCESSED,
+                )
+            )
+            if router_id:
+                c2b_stmt = c2b_stmt.where(Router.id == router_id)
+            if date_start:
+                c2b_stmt = c2b_stmt.where(C2BTransaction.received_at >= date_start)
+            if date_end:
+                c2b_stmt = c2b_stmt.where(C2BTransaction.received_at <= date_end)
+
+            for amount, shortcode, router_name, router_pk, connection_type in (
+                await db.execute(c2b_stmt)
+            ).all():
+                rows.append({
+                    "amount": float(amount),
+                    "status": "completed",
+                    "method": "mobile_money",
+                    "settlement": _settlement_of_c2b(shortcode),
                     "router_name": router_name,
                     "router_id": router_pk,
                     "counts_as_revenue": True,

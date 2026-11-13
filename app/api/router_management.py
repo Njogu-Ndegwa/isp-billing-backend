@@ -31,10 +31,13 @@ from app.db.models import (
     VoucherStatus,
 )
 from app.services.auth import verify_token, get_current_user
+from app.services.markets import get_market
 from app.services.subscription import enforce_active_subscription
 from app.services.router_availability import (
     build_router_status,
+    public_contact_times,
     record_router_availability,
+    split_tunnel_outages,
     summarize_router_flaps,
     uptime_outages,
     time_based_uptime,
@@ -87,7 +90,7 @@ import logging
 import asyncio
 import time
 import re
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -581,6 +584,8 @@ async def open_router_webfig(
         router_name=router_name,
         router_ip=router_ip,
         created_by_user_id=user.id,
+        staff_id=token.get("staff_id"),
+        staff_token_version=token.get("stv"),
         webfig_scheme=webfig_scheme,
         webfig_port=webfig_port,
     )
@@ -741,6 +746,7 @@ async def proxy_router_webfig_root_escape(
         escaped_path,
         session,
         refresh_access_cookies=False,
+        shared_url=True,
     )
 
 
@@ -779,6 +785,7 @@ async def proxy_router_webfig_jsproxy_escape(
         escaped_path,
         session,
         refresh_access_cookies=False,
+        shared_url=True,
     )
 
 
@@ -828,8 +835,19 @@ async def _proxy_webfig_request(
     proxy_path: str,
     session,
     refresh_access_cookies: bool,
+    shared_url: bool = False,
 ) -> Response:
-    """Proxy a request to RouterOS WebFig using an already validated session."""
+    """Proxy a request to RouterOS WebFig using an already validated session.
+
+    ``shared_url`` is True for the root-escape routes (/webfig, /jsproxy). Those URLs are
+    the same for every router, so a router-specific rewritten body served there must never
+    be cached by the browser (see _WEBFIG_CACHE_HEADERS).
+    """
+
+    if getattr(session, "staff_id", None) is not None:
+        from app.services.staff_access import webfig_staff_session_valid
+        if not await webfig_staff_session_valid(session):
+            return _webfig_expired_response()
 
     query = _forward_webfig_query(request)
     target_url = _build_webfig_upstream_url(session, proxy_path)
@@ -891,7 +909,25 @@ async def _proxy_webfig_request(
     content = upstream.content
     content_type = upstream.headers.get("content-type", "")
     if _should_rewrite_webfig_content(content_type):
-        content = _rewrite_webfig_content(content, content_type, router_id)
+        content = _rewrite_webfig_content(
+            content,
+            content_type,
+            router_id,
+            upstream_path=proxy_path,
+        )
+        if shared_url:
+            # RouterOS serves WebFig's scripts with max-age=31536000. Once the proxy
+            # has baked "/api/admin/routers/<id>/webfig" into such a body, caching it
+            # at a router-agnostic URL like /webfig/master-<hash>.js pins that router
+            # id in the browser for a year: every other router on the same RouterOS
+            # build then fetches the wrong router's path, gets 403 (which also clears
+            # the root cookie) and WebFig hangs on "Connecting...".
+            response_headers = {
+                key: value
+                for key, value in response_headers.items()
+                if key.lower() not in _WEBFIG_CACHE_HEADERS
+            }
+            response_headers["cache-control"] = "no-store"
 
     response = Response(
         content=content,
@@ -915,6 +951,8 @@ _WEBFIG_HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+
+_WEBFIG_CACHE_HEADERS = {"cache-control", "expires", "etag", "last-modified"}
 
 _WEBFIG_DROP_RESPONSE_HEADERS = _WEBFIG_HOP_BY_HOP_HEADERS | {
     "content-encoding",
@@ -1137,6 +1175,15 @@ def _rewrite_webfig_set_cookie(cookie: str, router_id: int) -> str:
     return "; ".join(rewritten)
 
 
+def _is_relative_webfig_ref(url: str) -> bool:
+    url = (url or "").strip()
+    if not url or url[0] in "/#?":
+        return False
+    # Anything with a scheme (https:, data:, javascript:, mailto:) is not a path.
+    first_sep = min((i for i in (url.find("/"), url.find("?"), url.find("#")) if i >= 0), default=len(url))
+    return ":" not in url[:first_sep]
+
+
 def _should_rewrite_webfig_content(content_type: str) -> bool:
     content_type = (content_type or "").lower()
     return any(
@@ -1145,7 +1192,12 @@ def _should_rewrite_webfig_content(content_type: str) -> bool:
     )
 
 
-def _rewrite_webfig_content(content: bytes, content_type: str, router_id: int) -> bytes:
+def _rewrite_webfig_content(
+    content: bytes,
+    content_type: str,
+    router_id: int,
+    upstream_path: str | None = None,
+) -> bytes:
     encoding = "utf-8"
     lower = (content_type or "").lower()
     if "charset=" in lower:
@@ -1173,6 +1225,26 @@ def _rewrite_webfig_content(content: bytes, content_type: str, router_id: int) -
         lambda m: f"{m.group('lead')}{m.group('quote')}{rewrite(m.group('url'))}{m.group('quote')}",
         text,
     )
+
+    if upstream_path is not None and "text/html" in lower:
+        # RouterOS /webfig/ loads its engine with relative paths
+        # (<script src="master-<hash>.js">). When that page is reached through the
+        # root-escape route the browser resolves them to /webfig/master-<hash>.js, a URL
+        # shared by every router. Anchor relative src/href to the router-scoped proxy
+        # prefix instead, so each router's rewritten scripts live at their own URL.
+        base = "/" + upstream_path.lstrip("/")
+
+        def anchor_relative(m: re.Match) -> str:
+            url = m.group("url")
+            if not _is_relative_webfig_ref(url):
+                return m.group(0)
+            resolved = urljoin(base, url)
+            return f"{m.group('lead')}{m.group('quote')}{prefix}{resolved}{m.group('quote')}"
+
+        relative_attr = re.compile(
+            r"(?i)(?P<lead>\b(?:href|src)\s*=\s*)(?P<quote>[\"'])(?P<url>[^\"']+)(?P=quote)"
+        )
+        text = relative_attr.sub(anchor_relative, text)
 
     unquoted_attr = re.compile(
         r"(?i)(?P<lead>\b(?:href|src|action|data-url)\s*=\s*)"
@@ -1316,6 +1388,10 @@ async def get_routers(
             "emergency_message": getattr(router_obj, "emergency_message", None),
             "hotspot_sharing_blocked": getattr(router_obj, "hotspot_sharing_blocked", False),
             "status_alerts_enabled": getattr(router_obj, "status_alerts_enabled", False),
+            "pppoe_expired_redirect": bool(getattr(router_obj, "pppoe_expired_redirect", False)),
+            "pppoe_lock_new_customers": bool(getattr(router_obj, "pppoe_lock_new_customers", False)),
+            "lb_enabled": bool(router_obj.lb_enabled),
+            "lb_config": router_obj.lb_config,
         }
         if is_admin:
             token_obj = token_by_router.get(router_obj.id)
@@ -1661,6 +1737,7 @@ async def get_router_uptime(
             .order_by(RouterAvailabilityCheck.checked_at, RouterAvailabilityCheck.id)
         )
     ).all()
+    contacts = await public_contact_times(db, router_id, since=min(since, overall_since), until=now)
     await db.commit()
 
     all_checks = [
@@ -1668,26 +1745,33 @@ async def get_router_uptime(
     ]
     window_checks = [c for c in all_checks if c["checked_at"] >= since]
 
-    judged = uptime_outages(all_checks, now=now)
+    # Outages during which the router kept calling us over the public
+    # internet were its management tunnel, not the site: listed apart and not
+    # counted against uptime.
+    judged = split_tunnel_outages(uptime_outages(all_checks, now=now), contacts, now=now)
     outages = judged["outages"]
+    tunnel_outages = judged["tunnel_outages"]
     first_any = judged["first_data_at"]
     first_window = window_checks[0]["checked_at"] if window_checks else None
 
     window_stats = time_based_uptime(outages, start=since, end=now, first_data_at=first_any, now=now)
     overall_stats = time_based_uptime(outages, start=overall_since, end=now, first_data_at=first_any, now=now)
 
-    def in_outage(at: datetime) -> bool:
-        for outage in outages:
+    def in_outage(at: datetime, among: list) -> bool:
+        for outage in among:
             started = datetime.fromisoformat(outage["started_at"])
             ended = datetime.fromisoformat(outage["ended_at"]) if outage.get("ended_at") else now
             if started <= at <= ended:
                 return True
         return False
 
-    window_outages = [
-        o for o in outages
-        if (datetime.fromisoformat(o["ended_at"]) if o.get("ended_at") else now) > since
-    ]
+    def in_window(among: list) -> list:
+        return [
+            o for o in among
+            if (datetime.fromisoformat(o["ended_at"]) if o.get("ended_at") else now) > since
+        ]
+
+    window_outages = in_window(outages)
     flap_summary = summarize_router_flaps(window_checks, now=now)
 
     return {
@@ -1714,6 +1798,7 @@ async def get_router_uptime(
             **window_stats,
         },
         "outages": window_outages[-50:],
+        "tunnel_outages": in_window(tunnel_outages)[-50:],
         "timeline": uptime_timeline(
             outages, start=since, end=now, first_data_at=first_any,
             buckets=min(84, max(12, hours)), now=now,
@@ -1729,7 +1814,8 @@ async def get_router_uptime(
                 "source": check["source"],
                 # A failed check outside any outage was our connection failing
                 # while the router was demonstrably up; it costs no uptime.
-                "counted_as_outage": (not check["is_online"]) and in_outage(check["checked_at"]),
+                "counted_as_outage": (not check["is_online"]) and in_outage(check["checked_at"], outages),
+                "in_tunnel_outage": (not check["is_online"]) and in_outage(check["checked_at"], tunnel_outages),
             }
             for check in window_checks[-recent_checks:][::-1]
         ],
@@ -1764,8 +1850,11 @@ async def create_router_api(
             password=request.password,
             port=request.port,
             payment_methods=request.payment_methods or ["mpesa", "voucher"],
+            # A hand-added router is an existing box: nothing pushes the
+            # anti-tethering rules to it, so the flag must not claim it's on.
+            hotspot_sharing_blocked=False,
         )
-        
+
         db.add(router_obj)
         await db.commit()
         await db.refresh(router_obj)
@@ -1814,7 +1903,7 @@ async def get_router_by_identity(
 ):
     """Lookup router by MikroTik system identity (for frontend captive portal)"""
     stmt = (
-        select(Router, User.business_name)
+        select(Router, User.business_name, User.market_code)
         .join(User, Router.user_id == User.id)
         .where(Router.identity == identity)
     )
@@ -1824,7 +1913,7 @@ async def get_router_by_identity(
     if not row:
         raise HTTPException(status_code=404, detail=f"Router with identity '{identity}' not found")
     
-    router_obj, business_name = row
+    router_obj, business_name, market_code = row
     await db.refresh(router_obj, ["assigned_payment_method"])
     pm = router_obj.assigned_payment_method
     assigned_method_type = (
@@ -1846,6 +1935,8 @@ async def get_router_by_identity(
         "business_name": business_name,
         "payment_methods": getattr(router_obj, 'payment_methods', None) or ["mpesa", "voucher"],
         "payment_provider": payment_provider,
+        # Plan prices are in the owner's market currency.
+        "currency": get_market(market_code).currency,
         "payment_method_id": router_obj.payment_method_id,
         "assigned_payment_method": {
             "id": pm.id,
@@ -1920,6 +2011,8 @@ async def update_router(
         if request.password is not None:
             router_obj.password = request.password
         if request.payment_methods is not None:
+            from app.services.staff_access import require_permission
+            require_permission("payment_methods.manage")
             router_obj.payment_methods = request.payment_methods
         if request.emergency_active is not None:
             router_obj.emergency_active = request.emergency_active
@@ -1949,6 +2042,8 @@ async def update_router(
             "emergency_message": router_obj.emergency_message,
             "hotspot_sharing_blocked": getattr(router_obj, "hotspot_sharing_blocked", False),
             "status_alerts_enabled": getattr(router_obj, "status_alerts_enabled", False),
+            "pppoe_expired_redirect": bool(getattr(router_obj, "pppoe_expired_redirect", False)),
+            "pppoe_lock_new_customers": bool(getattr(router_obj, "pppoe_lock_new_customers", False)),
             "updated_at": datetime.utcnow().isoformat()
         }
         

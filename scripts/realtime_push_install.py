@@ -16,6 +16,7 @@ install that runs when a new router finishes setup). Flags:
     SKIP_RUN=1     don't run the first report over the API (the scheduler's first tick does)
     ALLOW_SMALL=1  also hAP lite/mini (Dennis 2026-09-26: they stay on polling - don't)
     FORCE_HTTPS=1  install even without a working encrypted tunnel (heavy on small boards)
+    NATIVE_PORTS=1 opt-in compatible v3 row-map reads and native port JSON (ROS 7.19.6+)
 
 Installing the v3 script is what puts a router on real-time push: the server
 enrols any router sending v3 reports and hands it back to the poller ~15 min
@@ -74,6 +75,7 @@ if __name__ == "__main__":
             skip_run=os.environ.get("SKIP_RUN") == "1",
             allow_small=os.environ.get("ALLOW_SMALL") == "1",
             force_https=os.environ.get("FORCE_HTTPS") == "1",
+            native_ports=os.environ.get("NATIVE_PORTS") == "1",
             measure_cpu=not APPLY and not ROLLBACK,
         )
         print(_line(result), flush=True)

@@ -13,7 +13,7 @@ from app.db.models import (
     ResellerTransactionCharge,
     PaymentMethod, Payment, ProvisioningToken, Voucher,
     Subscription, SubscriptionStatus, SubscriptionInvoice, SubscriptionPayment,
-    SubscriptionExpiryReminder,
+    SubscriptionExpiryReminder, SubscriptionFreeSetupGrant,
     CustomerRating, UserBandwidthUsage, FreeTrialClaim,
     MpesaTransaction, ProvisioningLog, BandwidthSnapshot,
     RouterLogEntry, RouterAvailabilityCheck,
@@ -27,7 +27,7 @@ from app.db.models import (
     SubscriptionShareCode, C2BTransaction, UnmatchedC2BPayment,
     SmsCreditAccount, SmsCreditTransaction, SmsCreditOrder, MessageTemplate,
     SmsCampaign, SmsMessage, ResellerInboxMessage,
-    CollectionMode, PaymentStatus,
+    CollectionMode, PaymentStatus, ImpersonationSession,
 )
 from app.services.auth import verify_token, get_current_user, pwd_context
 from app.services.provisioning import remove_wireguard_peer, remove_l2tp_peer, remove_sstp_peer
@@ -126,6 +126,7 @@ async def admin_reset_user_password(
         raise HTTPException(status_code=404, detail="User not found")
 
     target.password_hash = await asyncio.to_thread(pwd_context.hash, request.new_password)
+    target.token_version = int(target.token_version or 0) + 1
     await db.commit()
 
     return {
@@ -1211,6 +1212,18 @@ async def get_reseller_routers(
 # ---------------------------------------------------------------------------
 # 5. GET /api/admin/dashboard -- Aggregate Admin Dashboard
 # ---------------------------------------------------------------------------
+@router.get("/api/admin/expired-online-audit")
+async def admin_expired_online_audit(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Cached live RouterOS check; starts a bounded scan when stale."""
+    await _require_admin(token, db)
+    from app.services.expired_online_monitor import get_snapshot
+
+    return get_snapshot()
+
+
 @router.get("/api/admin/dashboard")
 async def admin_dashboard(
     db: AsyncSession = Depends(get_db),
@@ -1333,7 +1346,13 @@ async def admin_dashboard(
             CustomerPayment.collection_mode == CollectionMode.DIRECT,
         )
     )).scalar()), 2)
-    total_unpaid = round(platform_collected_revenue - total_payouts - total_charges, 2)
+    # Resellers' 80% of ads sold through Bitwave is owed like collected money
+    # (and is part of every payout), so it belongs on the owed side too.
+    from app.services.ad_sales import all_ad_credits_total
+    total_ad_credits = await all_ad_credits_total(db)
+    total_unpaid = round(
+        platform_collected_revenue + total_ad_credits - total_payouts - total_charges, 2
+    )
 
     # B2B payout totals
     b2b_total_sent = float((await db.execute(
@@ -2189,6 +2208,10 @@ async def delete_reseller(
     await db.execute(delete(SubscriptionExpiryReminder).where(
         SubscriptionExpiryReminder.user_id == reseller_id))
 
+    # 21d3. Free setup time log (FK to users)
+    await db.execute(delete(SubscriptionFreeSetupGrant).where(
+        SubscriptionFreeSetupGrant.user_id == reseller_id))
+
     # 21e. Subscriptions
     await db.execute(delete(Subscription).where(Subscription.user_id == reseller_id))
 
@@ -2215,6 +2238,11 @@ async def delete_reseller(
 
     # 23. Null out created_by references from other users
     await db.execute(update(User).where(User.created_by == reseller_id).values(created_by=None))
+
+    # 23b. View-as audit rows reference this reseller (users.id FK)
+    await db.execute(
+        delete(ImpersonationSession).where(ImpersonationSession.reseller_id == reseller_id)
+    )
 
     # 24. Delete the user row
     await db.execute(delete(User).where(User.id == reseller_id))
@@ -2413,7 +2441,15 @@ async def _compute_repair(db: AsyncSession, reseller_id: int) -> dict:
         )).scalar()
     )
 
-    true_unpaid = max(0.0, round(payments_since - charges_since, 2))
+    # Ad money (the reseller's 80% of ads sold through Bitwave) is a term of
+    # get_unpaid_balance and is paid out with everything else, so the repair
+    # must count it on both sides or a payout that included it would look
+    # like lost revenue and be "corrected" into an overpayment.
+    from app.services.ad_sales import ad_credit_total
+    ad_since = await ad_credit_total(db, reseller_id, start=last_payout_date)
+    ad_all_time = await ad_credit_total(db, reseller_id)
+
+    true_unpaid = max(0.0, round(payments_since + ad_since - charges_since, 2))
 
     # Raw balance: canonical revenue minus total payouts minus total charges
     # (no correction term — this is what the correction gets computed against)
@@ -2435,7 +2471,7 @@ async def _compute_repair(db: AsyncSession, reseller_id: int) -> dict:
             .where(ResellerTransactionCharge.reseller_id == reseller_id)
         )).scalar()
     )
-    raw_balance = round(mpesa_rev - total_paid - total_charges, 2)
+    raw_balance = round(mpesa_rev + ad_all_time - total_paid - total_charges, 2)
 
     # Existing correction already applied (to avoid double-applying)
     existing_correction = float(

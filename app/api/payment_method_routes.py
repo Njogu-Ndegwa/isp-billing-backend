@@ -19,6 +19,7 @@ from app.db.models import (
     ResellerPaymentMethodType,
     Router,
 )
+from app.services.payment_numbers import InvalidNumber, normalize_fields
 from app.services.auth import verify_token, get_current_user
 from app.services.payment_gateway import (
     decrypt_credential,
@@ -140,6 +141,16 @@ def _normalize_till_number(raw: Optional[str]) -> str:
     return till
 
 
+def _normalize_numbers(data, fields=None) -> None:
+    """Strip whitespace from paybill/till/account numbers; digits only where
+    the field is numeric (see app/services/payment_numbers.py). 400 on a
+    numeric field that still has other characters."""
+    try:
+        normalize_fields(data, fields)
+    except InvalidNumber as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 def _validate_fields(method_type: ResellerPaymentMethodType, data: PaymentMethodCreate):
     if method_type == ResellerPaymentMethodType.BANK_ACCOUNT:
         if not data.bank_paybill_number or not data.bank_account_number:
@@ -234,6 +245,9 @@ def _serialize_payment_method(pm: ResellerPaymentMethod) -> dict:
         "is_active": pm.is_active,
         "created_at": pm.created_at.isoformat() if pm.created_at else None,
         "updated_at": pm.updated_at.isoformat() if pm.updated_at else None,
+        # Set by POST /api/payment-methods/{id}/register-c2b; the admin "C2B Active" badge and
+        # the reseller-paybill picker read it. Null until URLs are registered.
+        "c2b_registered_at": pm.c2b_registered_at.isoformat() if pm.c2b_registered_at else None,
     }
 
     if method_type_value == ResellerPaymentMethodType.BANK_ACCOUNT.value:
@@ -315,6 +329,7 @@ async def create_payment_method(
             detail=f"Invalid method_type. Must be one of: {', '.join(valid)}",
         )
 
+    _normalize_numbers(request)
     _validate_fields(method_type, request)
 
     pm = ResellerPaymentMethod(
@@ -436,7 +451,8 @@ async def update_payment_method(
     if request.is_active is not None:
         pm.is_active = request.is_active
 
-    # Update plain-text fields
+    # Update plain-text fields (numbers normalised the same way as on create)
+    _normalize_numbers(request)
     if request.bank_paybill_number is not None:
         pm.bank_paybill_number = request.bank_paybill_number
     if request.bank_account_number is not None:

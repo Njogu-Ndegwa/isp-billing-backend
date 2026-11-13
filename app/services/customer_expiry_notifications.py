@@ -99,6 +99,19 @@ def _phone_key(phone: str) -> str:
     return "".join(ch for ch in phone if ch.isdigit())
 
 
+def is_hotspot_customer(connection_type, pppoe_username: str | None) -> bool:
+    """Hotspot by the plan's type; with no plan, a customer without a PPPoE login."""
+    if connection_type is not None:
+        return connection_type == ConnectionType.HOTSPOT
+    return not pppoe_username
+
+
+def includes_hotspot(preferences: CustomerExpirySmsSettings | None) -> bool:
+    """Do expiry messages go to hotspot customers? Unset means yes."""
+    flag = getattr(preferences, "expiry_include_hotspot", None)
+    return True if flag is None else bool(flag)
+
+
 def is_textable_phone(phone: str | None) -> bool:
     """A number an SMS gateway can deliver to (not a MAC or placeholder)."""
     digits = _phone_key(phone or "")
@@ -284,6 +297,7 @@ def _customer_message_columns():
         Customer.account_number,
         Customer.name,
         Customer.router_id,
+        Customer.pppoe_username,
         Plan.connection_type,
         Plan.name.label("plan_name"),
     )
@@ -320,6 +334,13 @@ async def _queue_expiry_style_campaign(
 
     custom = templates.custom_template(preferences.custom_templates, event)
     tz_name = reseller_market(reseller).timezone
+    if not includes_hotspot(preferences):
+        rows = [
+            row for row in rows
+            if not is_hotspot_customer(row.connection_type, row.pppoe_username)
+        ]
+        if not rows:
+            return None
     support_phone = await reseller_support_phone(db, reseller)
     paybills = await resolve_paybills(db, reseller, {row.router_id for row in rows})
 
@@ -421,6 +442,8 @@ async def _queue_reseller_expired_campaign(
                     Customer.id.in_(customer_ids),
                     Customer.user_id == reseller_id,
                     Customer.status == CustomerStatus.INACTIVE,
+                    # Paused customers are INACTIVE with a frozen expiry: not expired.
+                    Customer.paused_at.is_(None),
                     Customer.expiry.isnot(None),
                     Customer.expiry <= now,
                     Customer.phone.isnot(None),
@@ -566,6 +589,7 @@ async def collect_due_reminder_groups(
                 select(
                     CustomerExpirySmsSettings.user_id,
                     CustomerExpirySmsSettings.reminder_offsets_minutes,
+                    CustomerExpirySmsSettings.expiry_include_hotspot,
                 )
                 .outerjoin(
                     SmsCreditAccount,
@@ -579,8 +603,13 @@ async def collect_due_reminder_groups(
         ).all()
         offsets_by_reseller = {
             user_id: offsets
-            for user_id, raw_offsets in preference_rows
+            for user_id, raw_offsets, _ in preference_rows
             if (offsets := _valid_offsets(raw_offsets))
+        }
+        skip_hotspot = {
+            user_id
+            for user_id, _, include_flag in preference_rows
+            if include_flag is False
         }
         if not offsets_by_reseller:
             return {}
@@ -597,6 +626,8 @@ async def collect_due_reminder_groups(
                     Customer.user_id,
                     Customer.phone,
                     Customer.expiry,
+                    Customer.pppoe_username,
+                    Plan.connection_type,
                     Plan.duration_value,
                     Plan.duration_unit,
                 )
@@ -604,6 +635,7 @@ async def collect_due_reminder_groups(
                 .where(
                     Customer.user_id.in_(offsets_by_reseller),
                     Customer.status == CustomerStatus.ACTIVE,
+                    Customer.paused_at.is_(None),
                     Customer.expiry.isnot(None),
                     Customer.expiry > now,
                     Customer.expiry <= now + timedelta(minutes=max_offset),
@@ -632,6 +664,10 @@ async def collect_due_reminder_groups(
     for row in customer_rows:
         phone_key = _phone_key((row.phone or "").strip())
         if not is_textable_phone(row.phone):
+            continue
+        if row.user_id in skip_hotspot and is_hotspot_customer(
+            row.connection_type, row.pppoe_username
+        ):
             continue
         period = plan_duration_minutes(row.duration_value, row.duration_unit)
         for offset_minutes in offsets_by_reseller[row.user_id]:
@@ -688,6 +724,7 @@ async def _queue_reseller_reminder_campaign(
                     Customer.id.in_(customer_ids),
                     Customer.user_id == reseller_id,
                     Customer.status == CustomerStatus.ACTIVE,
+                    Customer.paused_at.is_(None),
                     Customer.expiry.isnot(None),
                     Customer.expiry > now,
                     Customer.expiry <= now + timedelta(minutes=offset_minutes),
