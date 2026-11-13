@@ -161,13 +161,27 @@ def test_refresh_rewrites_only_the_source_of_the_installed_script(kind):
 
     assert wd.refresh_installed_source(fake, "10.0.7.15", apply=True) == {name: "updated"}
     assert [c for c in fake.writes()] == ["/system/script/set"]
-    assert script["source"] == wd.render_watchdog_source(kind, "10.0.7.15")
+    # an old source has no rotation, and the refresh never switches it on
+    assert script["source"] == wd.render_watchdog_source(kind, "10.0.7.15", rotate=False)
     assert script["policy"] == wd.POLICY and script["comment"] == wd.COMMENT
     assert fake.named("/system/scheduler", name) == sched_before
 
     fake.commands.clear()
     assert wd.refresh_installed_source(fake, "10.0.7.15", apply=True) == {name: "unchanged"}
     assert fake.writes() == []
+
+
+def test_refresh_keeps_the_rotation_as_installed():
+    """Only the enrol job's firewall check arms the WG port rotation; the rollout
+    refresh keeps an armed install armed and a disarmed one disarmed."""
+    for armed in (True, False):
+        fake = _fake()
+        wd.install_watchdog(fake, wd.KIND_WG, "10.0.7.15", rotate=armed)
+        script = fake.named("/system/script", wd.SCRIPT_NAME_WG)
+        installed = script["source"]
+        assert wd.refresh_installed_source(fake, "10.0.7.15", apply=True) == {wd.SCRIPT_NAME_WG: "unchanged"}
+        assert script["source"] == installed
+        assert (":set rotate true" in installed) is armed
 
 
 def test_refresh_never_installs_and_leaves_a_paused_scheduler_paused():
