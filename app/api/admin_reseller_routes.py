@@ -35,6 +35,7 @@ from app.services.insurance_wireguard import remove_insurance_peer
 from app.services.admin_metrics import compute_dashboard_v2_extras
 from app.services.mpesa_b2b import (
     PAYOUT_REVENUE_FILTERS,
+    get_unpaid_balances as _canonical_unpaid_balances,
     get_unpaid_balance as _canonical_unpaid_balance,
 )
 from app.config import settings
@@ -322,40 +323,55 @@ async def list_resellers(
     result = await db.execute(stmt)
     resellers = result.scalars().all()
 
-    items = []
-    for r in resellers:
-        fin_result = await db.execute(
-            select(ResellerFinancials).where(ResellerFinancials.user_id == r.id)
+    # One grouped query per figure for all listed resellers, instead of seven
+    # queries per reseller (~5,000 for 730 resellers, 7-15 s on production).
+    ids = [r.id for r in resellers]
+    fin_by_user = {}
+    router_counts, method_counts, revenue_by, mpesa_by, charges_by, unpaid_by = {}, {}, {}, {}, {}, {}
+    if ids:
+        fin_by_user = {
+            f.user_id: f for f in (await db.execute(
+                select(ResellerFinancials).where(ResellerFinancials.user_id.in_(ids))
+            )).scalars().all()
+        }
+
+        async def _grouped(key_col, value, *filters):
+            rows = (await db.execute(
+                select(key_col, value).where(key_col.in_(ids), *filters).group_by(key_col)
+            )).all()
+            return {row[0]: row[1] for row in rows}
+
+        router_counts = await _grouped(Router.user_id, func.count(Router.id))
+        method_counts = await _grouped(
+            ResellerPaymentMethod.user_id, func.count(ResellerPaymentMethod.id),
+            ResellerPaymentMethod.is_active == True,
         )
-        fin = fin_result.scalar_one_or_none()
-
-        router_count = (await db.execute(
-            select(func.count(Router.id)).where(Router.user_id == r.id)
-        )).scalar() or 0
-
-        payment_method_count = (await db.execute(
-            select(func.count(ResellerPaymentMethod.id)).where(
-                ResellerPaymentMethod.user_id == r.id,
-                ResellerPaymentMethod.is_active == True,
-            )
-        )).scalar() or 0
-
         # Revenue in the requested period (all methods, excluding compensation)
-        rev_filters = [CustomerPayment.reseller_id == r.id] + date_filters
-        total_revenue = float((await db.execute(
-            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(
-                *rev_filters, CustomerPayment.counts_as_revenue == True
-            )
-        )).scalar())
-
+        revenue_by = await _grouped(
+            CustomerPayment.reseller_id, func.coalesce(func.sum(CustomerPayment.amount), 0),
+            *date_filters, CustomerPayment.counts_as_revenue == True,
+        )
         # M-Pesa-only revenue in the requested period (what admin collected)
         # MPESA_FILTER already excludes CASH (and therefore compensation), so no extra filter needed
-        mpesa_rev = float((await db.execute(
-            select(func.coalesce(func.sum(CustomerPayment.amount), 0)).where(*rev_filters, MPESA_FILTER)
-        )).scalar())
+        mpesa_by = await _grouped(
+            CustomerPayment.reseller_id, func.coalesce(func.sum(CustomerPayment.amount), 0),
+            *date_filters, MPESA_FILTER,
+        )
+        charges_by = await _grouped(
+            ResellerTransactionCharge.reseller_id,
+            func.coalesce(func.sum(ResellerTransactionCharge.amount), 0),
+        )
+        unpaid_by = await _canonical_unpaid_balances(db, ids)
 
-        unpaid = await _unpaid_balance(db, r.id)
-        charges = await _total_transaction_charges(db, r.id)
+    items = []
+    for r in resellers:
+        fin = fin_by_user.get(r.id)
+        router_count = router_counts.get(r.id) or 0
+        payment_method_count = method_counts.get(r.id) or 0
+        total_revenue = float(revenue_by.get(r.id) or 0)
+        mpesa_rev = float(mpesa_by.get(r.id) or 0)
+        unpaid = unpaid_by.get(r.id, 0.0)
+        charges = float(charges_by.get(r.id) or 0)
 
         sub_status = r.subscription_status
         sub_status_val = sub_status.value if hasattr(sub_status, 'value') else sub_status
