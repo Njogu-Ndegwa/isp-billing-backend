@@ -114,6 +114,10 @@ class Settings(BaseSettings):
     # Explicit transport pilot; this does not enroll routers for check-in.
     CHECKIN_TUNNEL_ROUTER_IDS: str = ""
     CHECKIN_TUNNEL_ENDPOINT_URL: str = "http://10.251.0.1:8088/api/router/checkin"
+    # New check-in installs get applier v3 (router actions: restart, tunnel
+    # repair, access credentials over check-in) plus bitwave-heal-tunnel.
+    # Off until the canary of scripts/checkin_actions_rollout.py has run.
+    CHECKIN_APPLIER_ACTIONS: bool = False
     CHECKIN_MODE: str = "shadow"
     CHECKIN_KILL_SWITCH: bool = False
     CHECKIN_MAX_LINES_PER_REPLY: int = 10

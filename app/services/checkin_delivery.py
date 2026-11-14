@@ -461,7 +461,15 @@ class CheckinReport:
     others: frozenset[str] = frozenset()
     reports_others: bool = False
     # ``v=``: 2 = the applier also reports MAC-login users and understands U lines.
+    # 3 = also runs router actions (R/H/C/D lines, router_checkin_actions).
     version: int = 1
+    # v3: ``u=`` uptime (seconds), ``h=`` heal script installed, and on the
+    # small ack POST (``ack=1``) ``k=``/``f=``: actions done / failed.
+    uptime_seconds: Optional[int] = None
+    heal_available: bool = False
+    acks: tuple = ()
+    fails: tuple = ()
+    ack_only: bool = False
 
     @property
     def count_matches(self) -> bool:
@@ -548,6 +556,9 @@ def parse_checkin_body(raw: bytes) -> CheckinReport:
     others = _mac_set(fields.get("o", ""), MAX_REPORTED_OTHERS) if reports_others else set()
     v_raw = fields.get("v", "")
     version = int(v_raw) if v_raw.isdigit() and len(v_raw) <= 3 else 1
+    from app.services import router_checkin_actions as _actions
+
+    uptime = _actions.parse_uptime(fields.get("u", "")) if "u" in fields else None
     return CheckinReport(
         identity=identity,
         declared_count=declared,
@@ -561,6 +572,11 @@ def parse_checkin_body(raw: bytes) -> CheckinReport:
         others=frozenset(others),
         reports_others=reports_others,
         version=version,
+        uptime_seconds=uptime,
+        heal_available=fields.get("h", "") not in ("", "0"),
+        acks=tuple(_actions.parse_acks(fields.get("k", ""))),
+        fails=tuple(_actions.parse_acks(fields.get("f", ""))),
+        ack_only=fields.get("ack") == "1",
     )
 
 
@@ -620,6 +636,7 @@ def render_frame(
     next_s: int,
     queue_entries: Iterable[DesiredEntry] = (),
     add_kind: str = "A",
+    action_lines: Iterable[str] = (),
 ) -> str:
     """Build the reply. Invalid entries are dropped, never emitted.
 
@@ -641,6 +658,14 @@ def render_frame(
             logger.warning("[CHECKIN] dropped unsafe queue line for %r", entry)
             continue
         lines.append(line)
+    if action_lines:
+        from app.services.router_checkin_actions import valid_action_line
+
+        for line in action_lines:
+            if not valid_action_line(line):
+                logger.warning("[CHECKIN] dropped unsafe action line %r", line[:2])
+                continue
+            lines.append(line)
     seq_s = str(int(seq))
     next_i = max(5, min(3600, int(next_s)))
     if not _DIGITS_RE.match(seq_s):

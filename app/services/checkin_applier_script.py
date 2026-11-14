@@ -62,6 +62,20 @@ such a user (profile ``plan_<rate>`` with that rate-limit, ``T:``/``EXP:`` tags)
 when the MAC has no user yet, drop its tagged bypass binding and kick it so it
 logs in by MAC. The server only sends U lines to MAC-login routers, and never
 sends them (or A lines) to a MAC-login router whose applier is still v1.
+
+Version 3 (``v=3``, 2026-11-14, ``render_checkin_applier_source(actions=True)``)
+adds the router actions of ``app/services/router_checkin_actions.py``: the
+report also carries ``u=`` (uptime) and ``h=`` (1 if ``bitwave-heal-tunnel``
+is installed), and four more line kinds are applied by fixed code here:
+``R,<id>`` restart (refused when up for under 5 min, run last of all, after
+the acks are sent), ``H,<id>`` run ``bitwave-heal-tunnel``, ``C,...`` add or
+update one access-credential hotspot user, ``D,...`` remove one (only a user
+or binding whose comment carries that credential's ``ACCESS_CRED|cred:<id>|``
+tag). Each one's outcome is posted back at once in a second, small POST
+(``ack=1&k=<done>&f=<failed>``), so nothing has to be remembered between
+runs. Server values still reach commands only as variables. v3 needs the
+``reboot`` policy on the script and its scheduler (``POLICY_ACTIONS``).
+The server only sends these lines to a router that reported ``v=3``.
 """
 
 from __future__ import annotations
@@ -75,6 +89,12 @@ from app.services.usage_push_auth import derive_checkin_token
 SCRIPT_NAME = "bitwave-checkin"
 SCHEDULER_NAME = "bitwave-checkin"
 POLICY = "read,write,test,policy"
+# v3 (router actions) may restart the router: /system reboot needs "reboot".
+POLICY_ACTIONS = "read,write,test,policy,reboot"
+HEAL_SCRIPT_NAME = "bitwave-heal-tunnel"
+HEAL_POLICY = "read,write,test"
+VERSION_BASE = 2
+VERSION_ACTIONS = 3
 SCHEDULER_COMMENT = "Bitwave check-in delivery (pilot)"
 INITIAL_INTERVAL_SECONDS = 60
 
@@ -174,7 +194,8 @@ _TEMPLATE = r''':local url "__URL__"
             }
         }
     } on-error={ :set oOk false }
-    :local post ("v=2&id=" . $ident . "&n=" . $n . "&macs=" . $macs)
+    :local post ("v=__VER__&id=" . $ident . "&n=" . $n . "&macs=" . $macs)
+__REPORT_EXTRA__
     :if ($qOk) do={ :set post ($post . "&q=" . $qmacs) }
     :if ($cOk) do={ :set post ($post . "&c=" . $cmacs) }
     :if ($oOk) do={ :set post ($post . "&o=" . $omacs) }
@@ -268,7 +289,7 @@ _TEMPLATE = r''':local url "__URL__"
                         }
                     }
                 }
-                :if ($ok) do={ :set cnt ($cnt + 1) } else={ :set bad true }
+__VALIDATE_EXTRA__                :if ($ok) do={ :set cnt ($cnt + 1) } else={ :set bad true }
             }
         }
         :if ((!$bad) && $done && ($cnt = $want)) do={
@@ -277,7 +298,7 @@ _TEMPLATE = r''':local url "__URL__"
             :log warning "checkin: reply rejected, nothing applied"
         }
     }
-    # Pass 2: apply. Same splitting; only reached when pass 1 accepted it all.
+__DECLARE_EXTRA__    # Pass 2: apply. Same splitting; only reached when pass 1 accepted it all.
     :if ($frameOk && ($want > 0)) do={
         :local rest $body
         :local done false
@@ -298,8 +319,8 @@ _TEMPLATE = r''':local url "__URL__"
             } else={
                 :local ll [:len $ln]
                 :local kind [:pick $ln 0 1]
-                :local mac [:pick $ln 2 19]
-                :local ref [:pick $ln ($ll - 12) $ll]
+__APPLY_EXTRA__                :local mac [:pick $ln 2 19]
+__REF_LINE__
                 :local rate ""
                 :local exp ""
                 :local need false
@@ -419,7 +440,160 @@ _TEMPLATE = r''':local url "__URL__"
             :if ($cur < $minI) do={ /system scheduler set [find name="__SCHED__"] interval=$minI }
         }
     } on-error={}
-}
+__TAIL_EXTRA__}
+'''
+
+_REPORT_EXTRA = r'''    :do { :set post ($post . "&u=" . [:tostr [/system resource get uptime]]) } on-error={}
+    :set post ($post . "&h=" . [:len [/system script find where name="__HEAL__"]])
+'''
+
+_VALIDATE_EXTRA = r'''                # v3 actions: R/H = letter + 12-digit id; C/D = fixed comma counts,
+                # every field before the last one non-empty.
+                :if (($ll = 14) && (([:pick $ln 0 2] = "R,") || ([:pick $ln 0 2] = "H,"))) do={ :set ok true }
+                :local nfw 0
+                :if (([:pick $ln 0 2] = "C,") && ($ll >= 14) && ($ll <= 240)) do={ :set nfw 4 }
+                :if (([:pick $ln 0 2] = "D,") && ($ll >= 9) && ($ll <= 120)) do={ :set nfw 2 }
+                :if ($nfw > 0) do={
+                    :local fr [:pick $ln 2 $ll]
+                    :local nf 0
+                    :local fgo true
+                    :while ($fgo && ($nf < $nfw)) do={
+                        :local fp [:find $fr ","]
+                        :set fgo false
+                        :if ([:typeof $fp] = "num") do={
+                            :if ($fp > 0) do={
+                                :set fr [:pick $fr ($fp + 1) [:len $fr]]
+                                :set nf ($nf + 1)
+                                :set fgo true
+                            }
+                        }
+                    }
+                    :if (($nf = $nfw) && ([:len $fr] > 0)) do={ :set ok true }
+                }
+'''
+
+_DECLARE_EXTRA = r'''    :local acks ""
+    :local fails ""
+    :local rebootId ""
+'''
+
+_APPLY_EXTRA = r'''                :if (($kind = "R") || ($kind = "H") || ($kind = "C") || ($kind = "D")) do={
+                    :local aid ""
+                    :local aok false
+                    :if ($kind = "R") do={
+                        :set aid [:pick $ln 2 14]
+                        :if ([/system resource get uptime] > 5m) do={
+                            :set rebootId $aid
+                            :set aok true
+                        } else={ :log warning "checkin: restart refused, router up for under 5 min" }
+                    }
+                    :if ($kind = "H") do={
+                        :set aid [:pick $ln 2 14]
+                        :do {
+                            :if ([:len [/system script find where name="__HEAL__"]] > 0) do={
+                                /system script run __HEAL__
+                                :set aok true
+                            }
+                        } on-error={ :log warning "checkin: tunnel repair failed" }
+                    }
+                    :if (($kind = "C") || ($kind = "D")) do={
+                        :local fr [:pick $ln 2 $ll]
+                        :local fp [:find $fr ","]
+                        :set aid [:pick $fr 0 $fp]
+                        :set fr [:pick $fr ($fp + 1) [:len $fr]]
+                        :local tag ("ACCESS_CRED|cred:" . $aid . "|")
+                        :if ($kind = "C") do={
+                            :set fp [:find $fr ","]
+                            :local cuid [:pick $fr 0 $fp]
+                            :set fr [:pick $fr ($fp + 1) [:len $fr]]
+                            :set fp [:find $fr ","]
+                            :local crate [:pick $fr 0 $fp]
+                            :set fr [:pick $fr ($fp + 1) [:len $fr]]
+                            :set fp [:find $fr ","]
+                            :local cuser [:pick $fr 0 $fp]
+                            :local cpass [:pick $fr ($fp + 1) [:len $fr]]
+                            :local pn "cred-unlimited"
+                            :if ($crate != "-") do={
+                                :local sl [:find $crate "/"]
+                                :set pn ("cred-" . [:pick $crate 0 $sl] . "_" . [:pick $crate ($sl + 1) [:len $crate]])
+                            }
+                            :local cm ("ACCESS_CRED|cred:" . $aid . "|user:" . $cuid)
+                            :do {
+                                :if ([:len [/ip hotspot user profile find where name=$pn]] = 0) do={
+                                    /ip hotspot user profile add name=$pn shared-users=1
+                                }
+                                :local pf [/ip hotspot user profile find where name=$pn]
+                                :if ($crate = "-") do={
+                                    /ip hotspot user profile set $pf shared-users=1 rate-limit=""
+                                } else={
+                                    /ip hotspot user profile set $pf shared-users=1 rate-limit=$crate
+                                }
+                                :local uf [/ip hotspot user find where name=$cuser]
+                                :if ([:len $uf] = 0) do={
+                                    /ip hotspot user add name=$cuser password=$cpass profile=$pn disabled=no comment=$cm
+                                    :set aok true
+                                } else={
+                                    :local oc [:tostr [/ip hotspot user get [:pick $uf 0] comment]]
+                                    :if ([:pick $oc 0 11] = "ACCESS_CRED") do={
+                                        /ip hotspot user set $uf password=$cpass profile=$pn disabled=no comment=$cm
+                                        :set aok true
+                                    } else={ :log warning ("checkin: hotspot user " . $cuser . " is not ours, left alone") }
+                                }
+                            } on-error={ :log warning ("checkin: credential add failed " . $cuser) }
+                        }
+                        :if ($kind = "D") do={
+                            :set fp [:find $fr ","]
+                            :local dmac [:pick $fr 0 $fp]
+                            :local duser [:pick $fr ($fp + 1) [:len $fr]]
+                            :do {
+                                :local keep false
+                                :foreach u in=[/ip hotspot user find where name=$duser] do={
+                                    :if ([:typeof [:find [:tostr [/ip hotspot user get $u comment]] $tag]] = "num") do={
+                                        /ip hotspot user remove $u
+                                    } else={ :set keep true }
+                                }
+                                :if (!$keep) do={
+                                    :foreach a in=[/ip hotspot active find where user=$duser] do={ /ip hotspot active remove $a }
+                                }
+                                :foreach q in=[/queue simple find where name=("cred_" . $aid)] do={ /queue simple remove $q }
+                                :if ($dmac != "-") do={
+                                    :foreach b in=[/ip hotspot ip-binding find where mac-address=$dmac] do={
+                                        :if ([:typeof [:find [:tostr [/ip hotspot ip-binding get $b comment]] $tag]] = "num") do={
+                                            /ip hotspot ip-binding remove $b
+                                        }
+                                    }
+                                }
+                                :set aok true
+                            } on-error={ :log warning ("checkin: credential remove failed " . $duser) }
+                        }
+                    }
+                    :if ($aok) do={
+                        :if ([:len $acks] > 0) do={ :set acks ($acks . ",") }
+                        :set acks ($acks . $kind . $aid)
+                    } else={
+                        :if ([:len $fails] > 0) do={ :set fails ($fails . ",") }
+                        :set fails ($fails . $kind . $aid)
+                    }
+                    :set kind "-"
+                }
+'''
+
+# Short action lines (D can be 9 chars) must not reach a negative :pick.
+_REF_LINE_ACTIONS = r'''                :local ref ""
+                :if ($ll >= 14) do={ :set ref [:pick $ln ($ll - 12) $ll] }'''
+_REF_LINE_BASE = r'''                :local ref [:pick $ln ($ll - 12) $ll]'''
+
+_TAIL_EXTRA = r'''    # v3: report what ran in one small POST (the reply is ignored), then restart if asked.
+    :if (([:len $acks] > 0) || ([:len $fails] > 0)) do={
+        :do {
+            /tool fetch url=$url http-method=post http-header-field=("Content-Type: text/plain,Authorization: Bearer " . $tok) http-data=("v=__VER__&id=" . $ident . "&ack=1&k=" . $acks . "&f=" . $fails) check-certificate=__CHECKCERT__ output=none
+        } on-error={ :log info "checkin: action ack deferred" }
+    }
+    :if ([:len $rebootId] > 0) do={
+        :log warning "checkin: restarting the router (requested by Bitwave)"
+        :delay 2s
+        /system reboot
+    }
 '''
 
 
@@ -430,12 +604,29 @@ def _require(value: str, rx: re.Pattern, name: str) -> str:
     return v
 
 
+def _template(actions: bool) -> str:
+    parts = {
+        "__REPORT_EXTRA__\n": _REPORT_EXTRA if actions else "",
+        "__VALIDATE_EXTRA__": _VALIDATE_EXTRA if actions else "",
+        "__DECLARE_EXTRA__": _DECLARE_EXTRA if actions else "",
+        "__APPLY_EXTRA__": _APPLY_EXTRA if actions else "",
+        "__REF_LINE__": _REF_LINE_ACTIONS if actions else _REF_LINE_BASE,
+        "__TAIL_EXTRA__": _TAIL_EXTRA if actions else "",
+    }
+    out = _TEMPLATE
+    for key, value in parts.items():
+        assert out.count(key) == 1, key
+        out = out.replace(key, value)
+    return out.replace("__VER__", str(VERSION_ACTIONS if actions else VERSION_BASE))
+
+
 def render_checkin_applier_source(
     *,
     identity: str,
     endpoint_url: str,
     check_certificate: str = "no",
     tunnel_endpoint_url: str | None = None,
+    actions: bool = False,
 ) -> str:
     """Return the ``source`` of the ``bitwave-checkin`` system script.
 
@@ -450,7 +641,8 @@ def render_checkin_applier_source(
         raise ValueError(f"checkin applier: check_certificate must be one of {CHECK_CERTIFICATE_VALUES}")
     token = derive_checkin_token(identity)
     source = with_gate(SCRIPT_NAME, (
-        _TEMPLATE
+        _template(actions)
+        .replace("__HEAL__", HEAL_SCRIPT_NAME)
         .replace("__URL__", endpoint_url)
         .replace("__TOKEN__", token)
         .replace("__IDENT__", identity)
@@ -483,6 +675,13 @@ def _named(api, path: str, name: str) -> list:
     return [r for r in _rows(api, path) if r.get("name") == name]
 
 
+def same_policy(a, b) -> bool:
+    """RouterOS prints policies in its own order: compare as sets."""
+    def norm(v):
+        return frozenset(p.strip() for p in str(v or "").split(",") if p.strip())
+    return norm(a) == norm(b)
+
+
 def install_checkin_applier(
     api,
     *,
@@ -490,6 +689,7 @@ def install_checkin_applier(
     endpoint_url: str,
     check_certificate: str = "no",
     tunnel_endpoint_url: str | None = None,
+    actions: bool = False,
 ) -> dict:
     """Install or update the applier script + scheduler. Idempotent.
 
@@ -502,16 +702,17 @@ def install_checkin_applier(
     """
     source = render_checkin_applier_source(
         identity=identity, endpoint_url=endpoint_url, check_certificate=check_certificate,
-        tunnel_endpoint_url=tunnel_endpoint_url,
+        tunnel_endpoint_url=tunnel_endpoint_url, actions=actions,
     )
+    policy = POLICY_ACTIONS if actions else POLICY
     changed = False
     res: dict = {}
     scripts = _named(api, "/system/script", SCRIPT_NAME)
     if not scripts:
-        res = api.send_command("/system/script/add", {"name": SCRIPT_NAME, "policy": POLICY, "source": source})
+        res = api.send_command("/system/script/add", {"name": SCRIPT_NAME, "policy": policy, "source": source})
         changed = True
-    elif scripts[0].get("source") != source or scripts[0].get("policy") != POLICY:
-        res = api.send_command("/system/script/set", {".id": scripts[0][".id"], "source": source, "policy": POLICY})
+    elif scripts[0].get("source") != source or not same_policy(scripts[0].get("policy"), policy):
+        res = api.send_command("/system/script/set", {".id": scripts[0][".id"], "source": source, "policy": policy})
         changed = True
     if (res or {}).get("error"):
         return {"status": "script_failed", "error": str(res["error"])[:200]}
@@ -520,7 +721,7 @@ def install_checkin_applier(
     if not scheds:
         res = api.send_command("/system/scheduler/add", {
             "name": SCHEDULER_NAME, "interval": f"{INITIAL_INTERVAL_SECONDS}s", "start-time": "startup",
-            "on-event": scheduler_on_event(), "policy": POLICY, "comment": SCHEDULER_COMMENT,
+            "on-event": scheduler_on_event(), "policy": policy, "comment": SCHEDULER_COMMENT,
         })
         if (res or {}).get("error"):
             return {"status": "scheduler_failed", "error": str(res["error"])[:200]}
@@ -528,9 +729,9 @@ def install_checkin_applier(
     sched = scheds[0]
     if sched.get("disabled") == "true":
         return {"status": "scheduler_disabled", "error": ""}
-    if sched.get("on-event") != scheduler_on_event() or sched.get("policy") != POLICY:
+    if sched.get("on-event") != scheduler_on_event() or not same_policy(sched.get("policy"), policy):
         res = api.send_command("/system/scheduler/set", {
-            ".id": sched[".id"], "on-event": scheduler_on_event(), "policy": POLICY,
+            ".id": sched[".id"], "on-event": scheduler_on_event(), "policy": policy,
         })
         if (res or {}).get("error"):
             return {"status": "scheduler_failed", "error": str(res["error"])[:200]}
@@ -545,4 +746,90 @@ def uninstall_checkin_applier(api) -> None:
     for s in _named(api, "/system/scheduler", SCHEDULER_NAME):
         api.send_command("/system/scheduler/remove", {".id": s[".id"]})
     for s in _named(api, "/system/script", SCRIPT_NAME):
+        api.send_command("/system/script/remove", {".id": s[".id"]})
+
+
+# ---------------------------------------------------------------------------
+# bitwave-heal-tunnel: what an ``H`` line runs (applier v3)
+# ---------------------------------------------------------------------------
+#
+# A separate script, one fixed source per tunnel kind, because RouterOS 6 has
+# no /interface wireguard menu and would refuse a whole applier that names it.
+# It is NOT gated (router_script_gate): it only ever runs from inside the
+# applier's own, already gated run, and a gate would make it wait for that
+# run to finish. No scheduler: it runs only when the server asked.
+
+_HEAL_WG = r'''# bitwave-heal-tunnel (wg): asked for by Bitwave over check-in. Never reboots.
+# Re-enables wg-hz if someone switched it off, re-resolves the endpoints and
+# resets the management peers (wg-aws only when its interface is enabled).
+:do { /ip dns cache flush } on-error={}
+:do {
+    :foreach i in=[/interface wireguard find where name="wg-hz" disabled=yes] do={ /interface wireguard enable $i }
+} on-error={}
+:foreach ifn in={"wg-hz";"wg-aws"} do={
+    :if ([:len [/interface wireguard find where name=$ifn disabled=no]] > 0) do={
+        :foreach p in=[/interface wireguard peers find where interface=$ifn] do={
+            :do {
+                :local ep [/interface wireguard peers get $p endpoint-address]
+                :local epp [/interface wireguard peers get $p endpoint-port]
+                :foreach cx in=[/ip firewall connection find where protocol="udp" dst-address=($ep . ":" . $epp)] do={
+                    :do { /ip firewall connection remove $cx } on-error={}
+                }
+            } on-error={}
+            :do { /interface wireguard peers disable $p } on-error={}
+            :delay 2s
+            :do { /interface wireguard peers enable $p } on-error={}
+        }
+    }
+}
+:log warning "bitwave-heal-tunnel: WireGuard management tunnel reset"
+'''
+
+_HEAL_SSTP = r'''# bitwave-heal-tunnel (sstp): asked for by Bitwave over check-in. Never reboots.
+# Enables sstp-hetzner if someone switched it off and redials it (which also
+# re-resolves its server address).
+:do { /ip dns cache flush } on-error={}
+:local id [/interface sstp-client find where name="sstp-hetzner"]
+:if ([:len $id] > 0) do={
+    :do { /interface sstp-client disable $id } on-error={}
+    :delay 3s
+    :do { /interface sstp-client enable $id } on-error={}
+    :log warning "bitwave-heal-tunnel: SSTP management tunnel redialled"
+}
+'''
+
+HEAL_SOURCES = {"wg": _HEAL_WG, "sstp": _HEAL_SSTP}
+
+
+def render_heal_tunnel_source(kind: str) -> str:
+    """Fixed source for ``kind`` (``mgmt_watchdog_script.KIND_WG``/``KIND_SSTP``)."""
+    if kind not in HEAL_SOURCES:
+        raise ValueError(f"heal-tunnel: unknown tunnel kind {kind!r}")
+    return HEAL_SOURCES[kind]
+
+
+def install_heal_tunnel(api, kind: str) -> dict:
+    """Install or update ``bitwave-heal-tunnel`` for ``kind``. Idempotent."""
+    source = render_heal_tunnel_source(kind)
+    scripts = _named(api, "/system/script", HEAL_SCRIPT_NAME)
+    if not scripts:
+        res = api.send_command("/system/script/add", {
+            "name": HEAL_SCRIPT_NAME, "policy": HEAL_POLICY, "source": source,
+            "comment": "Bitwave: run by the check-in when asked to repair the tunnel",
+        })
+        status = "installed"
+    elif scripts[0].get("source") != source or not same_policy(scripts[0].get("policy"), HEAL_POLICY):
+        res = api.send_command("/system/script/set", {
+            ".id": scripts[0][".id"], "source": source, "policy": HEAL_POLICY,
+        })
+        status = "updated"
+    else:
+        return {"status": "unchanged", "error": ""}
+    if (res or {}).get("error"):
+        return {"status": "script_failed", "error": str(res["error"])[:200]}
+    return {"status": status, "error": ""}
+
+
+def uninstall_heal_tunnel(api) -> None:
+    for s in _named(api, "/system/script", HEAL_SCRIPT_NAME):
         api.send_command("/system/script/remove", {".id": s[".id"]})

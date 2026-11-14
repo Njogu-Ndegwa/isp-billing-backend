@@ -53,7 +53,7 @@ from app.config import settings
 from app.db import database
 from app.db.models import Router, RouterAuthMethod, SubscriptionStatus, User
 from app.services import checkin_delivery
-from app.services.checkin_applier_script import install_checkin_applier
+from app.services.checkin_applier_script import install_checkin_applier, install_heal_tunnel
 from app.services.expiry_reaper_enrol import routeros_version_ok
 from app.services.mikrotik_api import LANE_BACKGROUND, MikroTikAPI, api_credentials_rejected
 from app.services.mgmt_watchdog_script import detect_kind, install_watchdog
@@ -264,9 +264,16 @@ def _checkin_sync(api, c: Candidate, identity: str, board: str, arch: str, versi
     transport = {}
     if c.id in _parse_ids(settings.CHECKIN_TUNNEL_ROUTER_IDS):
         transport["tunnel_endpoint_url"] = settings.CHECKIN_TUNNEL_ENDPOINT_URL
-    res = install_checkin_applier(api, identity=identity, endpoint_url=settings.CHECKIN_ENDPOINT_URL, **transport)
+    actions = bool(settings.CHECKIN_APPLIER_ACTIONS)
+    res = install_checkin_applier(api, identity=identity, endpoint_url=settings.CHECKIN_ENDPOINT_URL,
+                                  actions=actions, **transport)
     status = res.get("status")
     if status in _OK_STATUSES:
+        if actions:
+            # Best effort: without it the router just cannot take heal_tunnel.
+            kind, _ = detect_kind(api, version)
+            if kind:
+                install_heal_tunnel(api, kind)
         return Component(True, f"installed ({status})")
     if status == "scheduler_disabled":
         return Component(False, "scheduler disabled on router, left alone")

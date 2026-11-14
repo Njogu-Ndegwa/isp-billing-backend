@@ -423,42 +423,51 @@ def _deprovision_direct_api_sync(router_info: dict, payload: dict) -> dict:
         bound_mac = payload.get("bound_mac_address")
         cred_id = payload["cred_id"]
         removed = {"user": False, "bindings": 0, "queues": 0, "sessions": 0}
+        errors: list[str] = []
 
-        users = api.send_command("/ip/hotspot/user/print")
+        def run(path: str, args: Optional[dict] = None) -> dict:
+            # Every failed print or remove is collected: revoke must not
+            # report success while the login may still be on the router.
+            res = api.send_command(path, args) if args is not None else api.send_command(path)
+            if (res or {}).get("error"):
+                errors.append(f"{path}: {str(res['error'])[:80]}")
+            return res or {}
+
+        users = run("/ip/hotspot/user/print")
         if users.get("success") and users.get("data"):
             for u in users["data"]:
                 if u.get("name", "").lower() == username.lower():
                     user_id = u.get(".id")
                     if user_id:
                         time.sleep(CMD_DELAY)
-                        api.send_command("/ip/hotspot/user/remove", {"numbers": user_id})
+                        run("/ip/hotspot/user/remove", {"numbers": user_id})
                         removed["user"] = True
                     break
 
-        active = api.send_command("/ip/hotspot/active/print")
+        active = run("/ip/hotspot/active/print")
         if active.get("success") and active.get("data"):
             for s in active["data"]:
                 if s.get("user", "").lower() == username.lower():
                     sid = s.get(".id")
                     if sid:
                         time.sleep(CMD_DELAY)
-                        api.send_command("/ip/hotspot/active/remove", {"numbers": sid})
+                        run("/ip/hotspot/active/remove", {"numbers": sid})
                         removed["sessions"] += 1
 
         queue_name = queue_name_for_credential(cred_id)
-        queues = api.send_command("/queue/simple/print")
+        queues = run("/queue/simple/print")
         if queues.get("success") and queues.get("data"):
             for q in queues["data"]:
                 if q.get("name", "") == queue_name:
                     qid = q.get(".id")
                     if qid:
                         time.sleep(CMD_DELAY)
-                        api.send_command("/queue/simple/remove", {"numbers": qid})
+                        run("/queue/simple/remove", {"numbers": qid})
                         removed["queues"] += 1
 
         if bound_mac:
             wanted = normalize_mac_address(bound_mac)
-            bindings = api.send_command("/ip/hotspot/ip-binding/print")
+            bindings = run("/ip/hotspot/ip-binding/print")
             if bindings.get("success") and bindings.get("data"):
                 for b in bindings["data"]:
                     bm = b.get("mac-address", "")
@@ -466,9 +475,15 @@ def _deprovision_direct_api_sync(router_info: dict, payload: dict) -> dict:
                         bid = b.get(".id")
                         if bid:
                             time.sleep(CMD_DELAY)
-                            api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": bid})
+                            run("/ip/hotspot/ip-binding/remove", {"numbers": bid})
                             removed["bindings"] += 1
 
+        if errors:
+            return {
+                "error": "remove_failed",
+                "message": "Router did not confirm the removal: " + "; ".join(errors[:3]),
+                "removed": removed,
+            }
         return {"success": True, "removed": removed}
     finally:
         api.disconnect()
@@ -1034,6 +1049,13 @@ def serialize_credential(
         "created_at": cred.created_at.isoformat() if cred.created_at else None,
         "updated_at": cred.updated_at.isoformat() if cred.updated_at else None,
         "revoked_at": cred.revoked_at.isoformat() if cred.revoked_at else None,
+        # Router change still owed (router unreachable when it was made).
+        "router_sync": getattr(cred, "router_sync", None),
+        "router_sync_since": (
+            cred.router_sync_since.isoformat() if getattr(cred, "router_sync_since", None) else None
+        ),
+        "router_sync_error": getattr(cred, "router_sync_error", None),
+        "router_pending": bool(getattr(cred, "router_sync", None)),
     }
     if include_password:
         data["password"] = cred.password
