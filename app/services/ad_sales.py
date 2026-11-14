@@ -1143,6 +1143,24 @@ async def ad_credit_total(db: AsyncSession, reseller_id: int, *,
     return float((await db.execute(q)).scalar() or 0)
 
 
+async def ad_credit_totals(db: AsyncSession, reseller_ids) -> dict:
+    """ad_credit_total for many resellers in one query: {reseller_id: total}.
+    Same filters; resellers with no credited ads are absent (= 0)."""
+    ids = list({int(i) for i in reseller_ids})
+    if not ids:
+        return {}
+    q = (
+        select(AdSalePayment.reseller_user_id, func.coalesce(func.sum(AdSalePayment.reseller_share), 0))
+        .where(
+            AdSalePayment.reseller_user_id.in_(ids),
+            AdSalePayment.credited_at.is_not(None),
+            AdSalePayment.is_duplicate == False,  # noqa: E712
+        )
+        .group_by(AdSalePayment.reseller_user_id)
+    )
+    return {row[0]: float(row[1] or 0) for row in (await db.execute(q)).all()}
+
+
 async def all_ad_credits_total(db: AsyncSession) -> float:
     return float((await db.execute(
         select(func.coalesce(func.sum(AdSalePayment.reseller_share), 0)).where(
