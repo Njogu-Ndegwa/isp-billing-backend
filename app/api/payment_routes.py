@@ -1310,11 +1310,20 @@ async def get_mpesa_transactions(
     limit: int = 200,
     offset: int = 0,
     settlement: Optional[str] = None,
+    page: Optional[int] = None,
+    per_page: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
     """
     Get all transactions (M-Pesa, voucher, cash, etc.) with filters.
+
+    With both ``page`` and ``per_page`` (what the Transactions page sends) the
+    response is ``{data, page, per_page, total, total_pages}``: one page plus
+    the true row count across all three ledgers. Before, those parameters were
+    ignored, every request returned up to 200 rows (~250 KB) and the page
+    could never show more than 10 pages. ``per_page`` is capped at 500.
+    Without them the response is the plain array, paged by limit/offset.
 
     ``settlement`` ('direct' | 'platform') narrows to M-Pesa money that went
     straight to the reseller's own account vs. collected by the platform;
@@ -1367,8 +1376,20 @@ async def get_mpesa_transactions(
         # source cannot appear in that many newest rows globally, so bounding
         # every source here preserves the response while avoiding an unbounded
         # history load and serialization pass.
+        paged = page is not None and per_page is not None
+        if paged:
+            if page < 1 or per_page < 1:
+                raise HTTPException(status_code=422, detail="page and per_page must be at least 1")
+            per_page = min(per_page, 500)
+            limit, offset = per_page, (page - 1) * per_page
         page_size = max(0, min(limit, 500))
         source_limit = max(0, offset) + page_size
+        total_rows = 0
+
+        async def _count(stmt) -> int:
+            # Same statement, filters and joins as the listed rows, so the
+            # total always matches what paging through would return.
+            return int((await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar() or 0)
 
         results = []
         mpesa_source_ids = []
@@ -1414,6 +1435,8 @@ async def get_mpesa_transactions(
                     MpesaTransaction.collection_mode != CollectionMode.DIRECT,
                 ))
 
+            if paged:
+                total_rows += await _count(mpesa_stmt)
             mpesa_stmt = (
                 mpesa_stmt
                 .order_by(MpesaTransaction.created_at.desc().nulls_last())
@@ -1522,6 +1545,8 @@ async def get_mpesa_transactions(
                     except ValueError:
                         pass
 
+            if paged:
+                total_rows += await _count(cp_stmt)
             cp_stmt = (
                 cp_stmt
                 .order_by(CustomerPayment.created_at.desc().nulls_last())
@@ -1642,6 +1667,8 @@ async def get_mpesa_transactions(
                         C2BTransaction.business_shortcode != platform_sc,
                     ))
 
+            if paged:
+                total_rows += await _count(c2b_stmt)
             c2b_stmt = (
                 c2b_stmt
                 .order_by(C2BTransaction.received_at.desc().nulls_last())
@@ -1719,6 +1746,14 @@ async def get_mpesa_transactions(
         results.sort(key=lambda r: r["created_at"] or "", reverse=True)
         paginated = results[offset: offset + page_size]
 
+        if paged:
+            return {
+                "data": paginated,
+                "page": page,
+                "per_page": per_page,
+                "total": total_rows,
+                "total_pages": max(1, -(-total_rows // per_page)),
+            }
         return paginated
 
     except HTTPException:
