@@ -844,6 +844,41 @@ class RouterCommand(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+class RouterCheckinAction(Base):
+    """One fixed action a router runs when it next checks in (2026-11-14).
+
+    The router's check-in applier (``checkin_applier_script``, v3) runs only
+    the actions it has fixed code for; the server sends an action letter and
+    numbers, never script text. ``action`` is one of
+    ``router_checkin_actions.ACTIONS``. Lifecycle and the exactly-once rules
+    for ``reboot`` live in ``app/services/router_checkin_actions.py``.
+    Startup migration: run_router_checkin_action_migrations() in main.py.
+    """
+
+    __tablename__ = "router_checkin_actions"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_router_checkin_actions_key"),
+        Index("idx_router_checkin_actions_router_state", "router_id", "state"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # No FK: rows are history and must never block deleting a router.
+    router_id = Column(Integer, nullable=False)
+    action = Column(String(32), nullable=False)
+    state = Column(String(20), nullable=False, default="pending", server_default="pending")
+    idempotency_key = Column(String(128), nullable=False)
+    requested_by_user_id = Column(Integer, nullable=True)
+    reason = Column(String(500), nullable=True)
+    delivery_count = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    delivered_at = Column(DateTime, nullable=True)
+    acknowledged_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    last_error = Column(String(255), nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class MpesaTransaction(Base):
     __tablename__ = "mpesa_transactions"
     id = Column(Integer, primary_key=True, index=True)
@@ -2053,6 +2088,19 @@ class AccessCredential(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     revoked_at = Column(DateTime, nullable=True)
+
+    # Router state still owed for this credential (2026-11-14). The API call
+    # that adds or removes the hotspot user can fail while the router is
+    # unreachable; the DB change stands, and the router change is recorded
+    # here until a retry (API back) or the check-in queue delivers it.
+    # NULL = router in step. 'add' = user still to be added/updated on the
+    # router. 'remove' = user (and the binding for router_sync_mac) still to be
+    # removed. 'delete' = remove, then delete this row.
+    # Startup migration: run_router_checkin_action_migrations() in main.py.
+    router_sync = Column(String(10), nullable=True)
+    router_sync_since = Column(DateTime, nullable=True)
+    router_sync_error = Column(String(255), nullable=True)
+    router_sync_mac = Column(String(50), nullable=True)
 
     user = relationship("User", backref="access_credentials")
     router = relationship("Router")

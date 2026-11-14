@@ -30,6 +30,13 @@ Order of work, cheapest first, and never any router I/O:
 Every reply that is not a 400/401 is a well-formed ``BWE1`` frame, so the
 router's validator can treat anything else (Cloudflare error page, captive
 portal, truncation) as "apply nothing".
+
+Router actions (applier v3, ``app/services/router_checkin_actions.py``): a
+``v>=3`` report also settles the router's acks and may get ``R``/``H``/``C``/
+``D`` lines after the delivery lines, also on routers outside the delivery
+allowlist (the actions do not depend on hotspot delivery). The applier's
+small ack POST (``ack=1``) only settles acks and gets an idle frame back.
+Older appliers never get action lines: they would reject the whole frame.
 """
 
 from __future__ import annotations
@@ -44,6 +51,7 @@ from fastapi.responses import PlainTextResponse
 
 from app.db.database import db_pool_snapshot
 from app.services import checkin_delivery as svc
+from app.services import router_checkin_actions as actions
 from app.services.usage_push_auth import verify_checkin_token
 
 logger = logging.getLogger(__name__)
@@ -101,6 +109,24 @@ async def _record_deliveries(router_id: int, candidates: list) -> None:
         logger.exception("[CHECKIN] router %s: recording check-in deliveries failed", router_id)
 
 
+async def _action_lines(router_id: int, report, now: datetime, *, send: bool = True) -> list[str]:
+    """v3 only: settle acks, get this reply's action lines. Never raises."""
+    if report.version < actions.APPLIER_VERSION_ACTIONS:
+        return []
+    if not report.ack_only:
+        actions.note_checkin(router_id, version=report.version, heal=report.heal_available,
+                             uptime_seconds=report.uptime_seconds, now=now)
+    try:
+        return await actions.exchange(
+            router_id, acks=report.acks, fails=report.fails,
+            uptime_seconds=report.uptime_seconds, heal_available=report.heal_available,
+            send=send and not report.ack_only, now=now,
+        )
+    except Exception:  # an action bug must never cost a hotspot delivery
+        logger.exception("[CHECKIN-ACTION] router %s: exchange failed", router_id)
+        return []
+
+
 def _plain(status: int, text: str) -> PlainTextResponse:
     return PlainTextResponse(text + "\n", status_code=status, headers=_HEADERS)
 
@@ -139,10 +165,19 @@ async def router_checkin(
         if router_ref is None:
             # Valid token for an identity with no router: same 401, no enumeration.
             return _plain(401, "unauthorized")
-        if not svc.checkin_router_enrolled(router_ref.id):
-            return _frame(svc.idle_frame())
         now = datetime.utcnow()
+        if report.ack_only:
+            await _action_lines(router_ref.id, report, now, send=False)
+            return _frame(svc.idle_frame(svc.NORMAL_POLL_SECONDS))
+        if not svc.checkin_router_enrolled(router_ref.id):
+            extra = await _action_lines(router_ref.id, report, now)
+            actions.note_next_poll(router_ref.id, svc.NORMAL_POLL_SECONDS if extra else svc.IDLE_POLL_SECONDS)
+            if extra:
+                return _frame(svc.render_frame(svc._seq(), [], svc.NORMAL_POLL_SECONDS,
+                                               action_lines=extra))
+            return _frame(svc.idle_frame())
         state = await svc.load_checkin_state(router_ref.id, now)
+        extra = await _action_lines(router_ref.id, report, now)
 
     decision = svc.decide(
         router=router_ref,
@@ -162,8 +197,9 @@ async def router_checkin(
     if handoffs:
         background = background or BackgroundTasks()
         background.add_task(_hand_off, [p.attempt_id for p in handoffs])
+    actions.note_next_poll(router_ref.id, decision.next_s)
     return _frame(
         svc.render_frame(svc._seq(), decision.lines, decision.next_s, decision.queue_lines,
-                         add_kind=decision.add_kind),
+                         add_kind=decision.add_kind, action_lines=extra),
         background,
     )

@@ -29,6 +29,7 @@ from app.services.access_credentials import (
     serialize_credential,
 )
 from app.services.router_helpers import get_router_by_id
+from app.services import access_credential_sync as cred_sync
 
 import logging
 import re
@@ -82,6 +83,29 @@ async def _own_or_admin(db: AsyncSession, cred_id: int, user) -> AccessCredentia
     if not cred:
         raise HTTPException(status_code=404, detail="Access credential not found")
     return cred
+
+
+async def _settle_router_result(
+    db: AsyncSession, cred: AccessCredential, router_obj: Router, result: dict, kind: str,
+    *, mac: Optional[str] = None,
+) -> Optional[dict]:
+    """Record the outcome of a router call on the credential.
+
+    Success clears any owed change. A failure records the change as pending
+    (``router_sync``) and queues it for the check-in channel; the returned dict
+    holds the response keys that say so. Commits.
+    """
+    if result.get("error"):
+        cred_sync.mark_pending(cred, kind, error=result.get("message") or result["error"], mac=mac)
+        await db.commit()
+        await db.refresh(cred)
+        await cred_sync.queue_checkin_sync(router_obj.id)
+        return cred_sync.pending_response_fields(cred, result.get("message"))
+    if cred.router_sync is not None:
+        cred_sync.clear_pending(cred)
+        await db.commit()
+        await db.refresh(cred)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -172,17 +196,14 @@ async def create_credential(
     await db.commit()
 
     provision_result = await provision_credential(db, cred, router_obj)
-    if provision_result.get("error"):
-        # Soft-fail: keep DB row but flag the error so the reseller can retry.
+    pending = await _settle_router_result(db, cred, router_obj, provision_result, cred_sync.SYNC_ADD)
+    if pending:
+        # Keep the DB row; the router change is retried / sent over check-in.
         logger.warning(
             f"Provision failed for new credential {cred.id} on router {router_obj.id}: "
-            f"{provision_result.get('message')}"
+            f"{provision_result.get('message')}; left pending"
         )
-        return {
-            **serialize_credential(cred, include_password=True),
-            "warning": provision_result.get("message", "Router provisioning failed"),
-            "provisioned": False,
-        }
+        return {**serialize_credential(cred, include_password=True), **pending}
 
     return {
         **serialize_credential(cred, include_password=True),
@@ -314,10 +335,11 @@ async def update_credential(
     if rate_changed and cred.status == AccessCredStatus.ACTIVE:
         await db.commit()
         prov = await provision_credential(db, cred, router_obj)
-        if prov.get("error"):
+        pending = await _settle_router_result(db, cred, router_obj, prov, cred_sync.SYNC_ADD)
+        payload_out = serialize_credential(cred)
+        if pending:
             logger.warning(f"Re-provision after rate change failed for cred {cred.id}: {prov}")
-            payload_out["warning"] = prov.get("message") or "Router provisioning failed"
-            payload_out["provisioned"] = False
+            payload_out.update(pending)
         else:
             payload_out["provisioned"] = True
         # If a MAC is currently bound, refresh its queue too
@@ -345,20 +367,18 @@ async def rotate_password(
     await db.commit()
     await db.refresh(cred)
 
-    warning: Optional[str] = None
-    provisioned = True
+    pending = None
     if cred.status == AccessCredStatus.ACTIVE:
         await db.commit()
         prov = await provision_credential(db, cred, router_obj)
-        if prov.get("error"):
+        pending = await _settle_router_result(db, cred, router_obj, prov, cred_sync.SYNC_ADD)
+        if pending:
             logger.warning(f"Re-provision after password rotation failed for cred {cred.id}: {prov}")
-            warning = prov.get("message") or "Router provisioning failed"
-            provisioned = False
 
     payload = serialize_credential(cred, include_password=True)
-    payload["provisioned"] = provisioned
-    if warning:
-        payload["warning"] = warning
+    payload["provisioned"] = True
+    if pending:
+        payload.update(pending)
     return payload
 
 
@@ -372,18 +392,32 @@ async def revoke_credential(
     enforce_active_subscription(user)
     cred = await _own_or_admin(db, cred_id, user)
     router_obj = await db.get(Router, cred.router_id)
+    bound_mac = cred.bound_mac_address
 
+    result: dict = {"success": True}
     if router_obj:
         await db.commit()
-        await deprovision_credential(db, cred, router_obj)
+        result = await deprovision_credential(db, cred, router_obj)
 
+    # Revoked in the DB either way: our login page refuses it from now on.
     cred.status = AccessCredStatus.REVOKED
     cred.revoked_at = datetime.utcnow()
     cred.bound_mac_address = None
     cred.bound_at = None
     await db.commit()
     await db.refresh(cred)
-    return serialize_credential(cred)
+
+    pending = None
+    if router_obj:
+        # Only claim the router side is done when the router confirmed it.
+        pending = await _settle_router_result(
+            db, cred, router_obj, result, cred_sync.SYNC_REMOVE, mac=bound_mac)
+    payload = serialize_credential(cred)
+    payload["router_removed"] = pending is None
+    if pending:
+        logger.warning(f"Revoke of cred {cred.id}: router removal failed ({result}); left pending")
+        payload.update(pending)
+    return payload
 
 
 @router.post("/{cred_id}/restore")
@@ -406,11 +440,11 @@ async def restore_credential(
     await db.commit()
 
     prov = await provision_credential(db, cred, router_obj)
+    pending = await _settle_router_result(db, cred, router_obj, prov, cred_sync.SYNC_ADD)
     payload = serialize_credential(cred)
-    if prov.get("error"):
+    if pending:
         logger.warning(f"Re-provision on restore failed for cred {cred.id}: {prov}")
-        payload["warning"] = prov.get("message") or "Router provisioning failed"
-        payload["provisioned"] = False
+        payload.update(pending)
     else:
         payload["provisioned"] = True
 
@@ -448,12 +482,12 @@ async def sync_credential(
 
     await db.commit()
     prov = await provision_credential(db, cred, router_obj)
+    pending = await _settle_router_result(db, cred, router_obj, prov, cred_sync.SYNC_ADD)
 
     payload = serialize_credential(cred, include_password=True)
-    if prov.get("error"):
+    if pending:
         logger.warning(f"Sync failed for cred {cred.id} on router {router_obj.id}: {prov}")
-        payload["warning"] = prov.get("message") or "Router provisioning failed"
-        payload["provisioned"] = False
+        payload.update(pending)
     else:
         payload["provisioned"] = True
 
@@ -506,11 +540,26 @@ async def delete_credential(
     enforce_active_subscription(user)
     cred = await _own_or_admin(db, cred_id, user)
     router_obj = await db.get(Router, cred.router_id)
+    bound_mac = cred.bound_mac_address
 
+    result: dict = {"success": True}
     if router_obj:
         await db.commit()
-        await deprovision_credential(db, cred, router_obj)
+        result = await deprovision_credential(db, cred, router_obj)
+
+    if router_obj and result.get("error"):
+        # The login may still be on the router: revoke now, and delete the row
+        # once the router has confirmed the removal (retry or check-in).
+        cred.status = AccessCredStatus.REVOKED
+        cred.revoked_at = cred.revoked_at or datetime.utcnow()
+        cred.bound_mac_address = None
+        cred.bound_at = None
+        await db.commit()
+        pending = await _settle_router_result(
+            db, cred, router_obj, result, cred_sync.SYNC_DELETE, mac=bound_mac)
+        logger.warning(f"Delete of cred {cred_id}: router removal failed ({result}); revoked, delete pending")
+        return {"success": True, "id": cred_id, "deleted": False, "revoked": True, **(pending or {})}
 
     await db.delete(cred)
     await db.commit()
-    return {"success": True, "id": cred_id}
+    return {"success": True, "id": cred_id, "deleted": True}

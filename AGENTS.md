@@ -236,6 +236,17 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   check the router's live `wg-egress` peer endpoint before relying on this note. Don't remove
   the tunnel without checking with Dennis.
 
+## Router Actions Over Check-in (tunnel dead, router still online)
+
+- A router can be restarted, have its tunnel repaired, and get access-credential
+  changes on its next HTTPS check-in (applier v3), with a strict allowlist and no
+  script text from the server. Reboot runs at most once. Credential changes a
+  router could not take are kept as `access_credentials.router_sync` and retried.
+  The current applier cannot fetch a new script, so v3 goes out over the API
+  with `scripts/checkin_actions_rollout.py`. Read
+  [`docs/agent-memory/router-checkin-actions.md`](docs/agent-memory/router-checkin-actions.md)
+  first.
+
 ## Expiry Enforcement (who removes expired customers)
 
 - Most routers remove their own expired hotspot customers: a 1-min RouterOS

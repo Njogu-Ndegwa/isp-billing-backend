@@ -296,6 +296,7 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     # --- routers: read ------------------------------------------------------
     ((R,), "/api/routers/{router_id}/uptime", "routers.view", None),
     ((R,), "/api/routers/{router_id}/live", "routers.view", None),
+    ((R,), "/api/routers/{router_id}/checkin-actions", "routers.view", None),
     ((R,), "/api/routers/{router_id}/bandwidth-check", "routers.view", None),
     ((R,), "/api/routers/{router_id}/diagnose/{mac_address}", "routers.view", None),
     ((R,), "/api/routers/{router_id}/illegal-connections", "routers.view", None),
@@ -365,6 +366,8 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
      "Healed dual mode on router {router_id}"),
     (("POST",), "/api/routers/{router_id}/reboot", "routers.manage",
      "Rebooted router {router_id}"),
+    (("POST",), "/api/routers/{router_id}/checkin-actions", "routers.manage",
+     "Queued a check-in action on router {router_id}"),
     (("POST",), "/api/routers/{router_id}/interfaces/{interface_name}/restart", "routers.manage",
      "Restarted port {interface_name} on router {router_id}"),
     (("PUT",), "/api/routers/{router_id}/access-points/{ap_mac}/credential", "routers.manage",

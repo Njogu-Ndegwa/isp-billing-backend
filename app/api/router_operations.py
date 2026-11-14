@@ -4045,7 +4045,15 @@ async def reboot_router(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Remotely reboot an owned MikroTik router."""
+    """Remotely reboot an owned MikroTik router.
+
+    Over the API when the router answers. When it cannot be reached at all
+    (connect failed: typically a dead management tunnel) but it is still
+    checking in with a v3 applier, the restart is queued for its next check-in
+    instead (``router_checkin_actions``, runs at most once). A timeout is NOT
+    queued: the command may already have reached the router, and a queued
+    second restart would reboot it twice.
+    """
     request = request or RebootRouterRequest()
     if not request.confirm:
         raise HTTPException(status_code=400, detail="Set confirm=true to reboot this router")
@@ -4082,6 +4090,37 @@ async def reboot_router(
         raise HTTPException(status_code=504, detail=result.get("detail", "Router reboot timed out"))
     if result.get("error") == "connect_failed":
         await record_router_availability(db, router_id, False, "router_reboot")
+        from app.services import router_checkin_actions as checkin_actions
+
+        if checkin_actions.router_can_take_actions(router_id):
+            try:
+                queued = await checkin_actions.enqueue(
+                    router_id, checkin_actions.ACTION_REBOOT,
+                    requested_by_user_id=user.id, reason=reason,
+                )
+            except checkin_actions.ActionRefused as exc:
+                raise HTTPException(status_code=409, detail=str(exc))
+            eta = checkin_actions.eta_minutes(router_id)
+            logger.info(
+                "Remote reboot QUEUED over check-in for router %s (id=%s) by user_id=%s, action #%s%s",
+                router_obj.name, router_id, user.id, queued.id,
+                f"; reason={reason}" if reason else "",
+            )
+            return {
+                "success": True,
+                "router_id": router_id,
+                "router_name": router_obj.name,
+                "status": "queued",
+                "queued": True,
+                "action_id": queued.id,
+                "action_state": queued.state,
+                "eta_minutes": eta,
+                "command_sent": False,
+                "connection_closed": False,
+                "message": f"queued: the router will restart on its next check-in (about {eta} min)",
+                "reason": reason,
+                "requested_at": datetime.utcnow().isoformat(),
+            }
         raise HTTPException(
             status_code=503,
             detail=result.get("message", f"Failed to connect to router: {router_obj.name}"),

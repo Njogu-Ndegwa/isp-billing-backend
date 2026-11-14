@@ -151,6 +151,7 @@ from app.api.usage_routes import router as usage_router
 from app.api.usage_push_routes import router as usage_push_router
 from app.api.router_expiry_routes import router as router_expiry_router
 from app.api.router_checkin_routes import router as router_checkin_router
+from app.api.router_checkin_action_routes import router as router_checkin_action_router
 from app.api.router_agent_routes import router as router_agent_router
 from app.api.access_credential_routes import router as access_credential_router
 from app.api.shop_routes import router as shop_router
@@ -211,6 +212,7 @@ app.include_router(usage_router)
 app.include_router(usage_push_router)
 app.include_router(router_expiry_router)
 app.include_router(router_checkin_router)
+app.include_router(router_checkin_action_router)
 app.include_router(router_agent_router)
 app.include_router(access_credential_router)
 app.include_router(shop_router)
@@ -3005,6 +3007,49 @@ async def run_customer_profile_migrations():
     raise last_exc
 
 
+async def run_router_checkin_action_migrations():
+    """Router actions over the check-in channel + owed credential changes (2026-11-14).
+
+    * ``router_checkin_actions`` (new table): reboot / heal_tunnel /
+      sync_access_credentials queued for a router's next check-in
+      (app/services/router_checkin_actions.py).
+    * ``access_credentials.router_sync*`` (four nullable columns, no default:
+      a catalog-only ALTER): the router change a credential still owes
+      (app/services/access_credential_sync.py).
+
+    The ORM selects every mapped column, so if the ALTER never lands every
+    access-credential query fails: retried with a fresh connection, like the
+    check-in delivery migration. Idempotent.
+    """
+    from app.db.models import RouterCheckinAction
+
+    last_exc = None
+    for attempt in range(1, 6):
+        try:
+            async with async_engine.begin() as conn:
+                await conn.run_sync(
+                    lambda c: RouterCheckinAction.__table__.create(c, checkfirst=True)
+                )
+                await conn.execute(sa_text(
+                    "CREATE INDEX IF NOT EXISTS idx_router_checkin_actions_router_state "
+                    "ON router_checkin_actions(router_id, state)"
+                ))
+                await conn.execute(sa_text("""
+                    ALTER TABLE access_credentials
+                    ADD COLUMN IF NOT EXISTS router_sync VARCHAR(10) NULL,
+                    ADD COLUMN IF NOT EXISTS router_sync_since TIMESTAMP NULL,
+                    ADD COLUMN IF NOT EXISTS router_sync_error VARCHAR(255) NULL,
+                    ADD COLUMN IF NOT EXISTS router_sync_mac VARCHAR(50) NULL
+                """))
+            logger.info("Migration: router_checkin_actions + access_credentials.router_sync ready")
+            return
+        except Exception as exc:  # lock_timeout under a busy table: try again
+            last_exc = exc
+            logger.warning("Router check-in action migration attempt %d failed: %s", attempt, exc)
+            await asyncio.sleep(2 * attempt)
+    raise last_exc
+
+
 async def run_standard_runtime_migrations():
     """Add the routers columns the standard-runtime installer records its work
     in (app/services/standard_runtime_enrol.py): check-in applier and
@@ -3732,6 +3777,11 @@ async def startup_event():
         logger.error(f"Access credential migration failed (non-fatal): {e}")
 
     try:
+        await run_router_checkin_action_migrations()
+    except Exception as e:
+        logger.error(f"Router check-in action migration failed (non-fatal): {e}")
+
+    try:
         await run_fup_usage_migrations()
         logger.info("FUP / usage tracking migrations completed successfully")
     except Exception as e:
@@ -4059,6 +4109,28 @@ async def startup_event():
         replace_existing=True,
         max_instances=1
     )
+    # Access-credential changes a router still owes (it was unreachable when
+    # the credential was created / revoked): retried over the API with a
+    # per-router back-off. Routers on applier v3 also get them over check-in.
+    from app.services.access_credential_sync import retry_pending_credentials_background
+    scheduler.add_job(
+        retry_pending_credentials_background,
+        trigger=IntervalTrigger(minutes=3),
+        id='access_credential_router_sync',
+        name='Retry access-credential changes on routers that were unreachable',
+        replace_existing=True,
+        max_instances=1
+    )
+    from app.services.router_checkin_actions import expire_stale as expire_stale_checkin_actions
+    scheduler.add_job(
+        expire_stale_checkin_actions,
+        trigger=IntervalTrigger(minutes=5),
+        id='router_checkin_actions_expiry',
+        name='Expire router check-in actions of routers that stopped checking in',
+        replace_existing=True,
+        max_instances=1
+    )
+
     # Standard router runtime (check-in applier + mgmt-tunnel watchdog):
     # no-op unless STANDARD_RUNTIME_AUTO_INSTALL.
     from app.services.standard_runtime_enrol import standard_runtime_enrol_background
