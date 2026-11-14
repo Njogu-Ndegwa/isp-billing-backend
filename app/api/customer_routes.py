@@ -1765,6 +1765,52 @@ async def national_id_matches(
     return {"customer_ids": [row[0] for row in rows.all()]}
 
 
+def _phone_key(phone: Optional[str]) -> Optional[str]:
+    """Last 9 digits, the same key the admin's customer page matches phones on."""
+    digits = re.sub(r"\D", "", phone or "")
+    return digits[-9:] if len(digits) >= 9 else None
+
+
+@router.get("/api/customers/{customer_id}/related")
+async def get_related_customers(
+    customer_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """The few accounts linked to one customer, for its detail page.
+
+    Returns the subscription owner, the companions it covers, and other
+    accounts with the same phone number (last 9 digits), each as
+    {id, name, mac_address, phone, subscription_owner_id}. The page used to
+    download the whole customer list (2-3 MB for a large reseller) to find
+    these. Scoped exactly like GET /api/customers.
+    """
+    user = await get_current_user(token, db)
+    customer = (await db.execute(
+        select(Customer).where(Customer.id == customer_id, Customer.user_id == user.id)
+    )).scalar_one_or_none()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    rows = (await db.execute(
+        select(Customer.id, Customer.name, Customer.mac_address, Customer.phone, Customer.subscription_owner_id)
+        .where(Customer.user_id == user.id, Customer.id != customer.id)
+        .order_by(Customer.id)
+    )).all()
+    await db.commit()
+
+    key = _phone_key(customer.phone)
+    related = [
+        {"id": r.id, "name": r.name, "mac_address": r.mac_address, "phone": r.phone,
+         "subscription_owner_id": r.subscription_owner_id}
+        for r in rows
+        if r.id == customer.subscription_owner_id
+        or r.subscription_owner_id == customer.id
+        or (key is not None and _phone_key(r.phone) == key)
+    ]
+    return {"customers": related}
+
+
 @router.get("/api/customers/{customer_id}")
 async def get_customer_detail(
     customer_id: int,
