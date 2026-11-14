@@ -441,3 +441,28 @@ def test_teardown_leaves_a_proxy_we_did_not_enable():
     rx.teardown_expired_infra(api, cfg)
 
     assert api.menus["/ip/proxy"][0]["enabled"] == "true"
+
+
+def test_address_list_reuses_routeros_dns_entry_for_same_literal_address():
+    menu = "/ip/firewall/address-list"
+    hostname, address = "api.example.test", "203.0.113.7"
+    api = FakeRouterOS({menu: [{
+        ".id": "*1", "list": rx.ALLOW_LIST, "address": hostname,
+        "comment": rx.COMMENT_ALLOW, "dynamic": "false", "disabled": "false",
+    }, {
+        ".id": "*2", "list": rx.ALLOW_LIST, "address": address,
+        "comment": hostname, "dynamic": "true", "disabled": "false",
+    }]})
+
+    def reject(command, args):
+        if command == menu + "/add" and args.get("address") == address:
+            return "failure: already have such entry"
+        return None
+
+    api.reject = reject
+    assert rx._reconcile_address_list(api, rx.ALLOW_LIST, rx.COMMENT_ALLOW, [hostname, address]) == 0
+    assert len(api.rows(menu, list=rx.ALLOW_LIST)) == 2
+
+    api.menus[menu][1]["comment"] = "unrelated.example.test"
+    with pytest.raises(rx.RedirectError, match="already have such entry"):
+        rx._reconcile_address_list(api, rx.ALLOW_LIST, rx.COMMENT_ALLOW, [hostname, address])

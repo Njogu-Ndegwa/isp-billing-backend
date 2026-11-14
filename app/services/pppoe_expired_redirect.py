@@ -384,9 +384,23 @@ def _reconcile_address_list(api, list_name: str, comment: str, addresses: Iterab
             writes += 1
     for addr in wanted:
         if addr not in have:
-            _write(api, "/ip/firewall/address-list/add",
-                   {"list": list_name, "address": addr, "comment": comment})
-            writes += 1
+            result = api.send_command("/ip/firewall/address-list/add",
+                                      {"list": list_name, "address": addr, "comment": comment})
+            error = result.get("error")
+            if not error:
+                have.add(addr)
+                writes += 1
+                continue
+            # RouterOS can create a dynamic IP entry for a configured hostname
+            # before we add the same IP explicitly. The entry already permits it.
+            rows = _rows(api, "/ip/firewall/address-list") if "already have such entry" in str(error) else ()
+            if not any(
+                r.get("list") == list_name and r.get("address") == addr
+                and _truthy(r.get("dynamic")) and not _truthy(r.get("disabled"))
+                and r.get("comment") in have
+                for r in rows
+            ):
+                raise RedirectError(f"/ip/firewall/address-list/add: {error}")
     return writes
 
 
