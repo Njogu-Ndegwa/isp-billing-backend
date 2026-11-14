@@ -1943,8 +1943,44 @@ async def delete_reseller(
             "dry_run": True,
             "reseller": reseller_info,
             "will_delete": summary,
-            "message": "Add ?confirm=true to actually delete this reseller and all associated data.",
+            "message": "Add ?confirm=true to delete an account with no payment history.",
         }
+
+    # Refuse before touching VPN peers. Historical records require this
+    # reseller identity to remain available for accounting and reconciliation.
+    customer_ids = select(Customer.id).where(Customer.user_id == reseller_id)
+    protected_rows = (
+        select(MpesaTransaction.id).where(or_(
+            MpesaTransaction.reseller_id == reseller_id,
+            MpesaTransaction.customer_id.in_(customer_ids),
+        )),
+        select(CustomerPayment.id).where(or_(
+            CustomerPayment.reseller_id == reseller_id,
+            CustomerPayment.customer_id.in_(customer_ids),
+        )),
+        select(Payment.id).where(Payment.customer_id.in_(customer_ids)),
+        select(ZenoPayTransaction.id).where(or_(
+            ZenoPayTransaction.reseller_id == reseller_id,
+            ZenoPayTransaction.customer_id.in_(customer_ids),
+        )),
+        select(MtnMomoTransaction.id).where(or_(
+            MtnMomoTransaction.reseller_id == reseller_id,
+            MtnMomoTransaction.customer_id.in_(customer_ids),
+        )),
+        select(FapshiTransaction.id).where(or_(
+            FapshiTransaction.reseller_id == reseller_id,
+            FapshiTransaction.customer_id.in_(customer_ids),
+        )),
+        select(C2BTransaction.id).where(C2BTransaction.matched_reseller_id == reseller_id),
+        select(B2BTransaction.id).where(B2BTransaction.reseller_id == reseller_id),
+        select(ResellerPayout.id).where(ResellerPayout.reseller_id == reseller_id),
+        select(SubscriptionPayment.id).where(SubscriptionPayment.user_id == reseller_id),
+    )
+    if (await db.execute(select(or_(*(query.exists() for query in protected_rows))))).scalar_one():
+        raise HTTPException(
+            status_code=409,
+            detail="This reseller has payment history and cannot be deleted. Suspend the account instead.",
+        )
 
     # ── Phase 1: WireGuard cleanup (best-effort) ──
     tokens_result = await db.execute(
@@ -2087,10 +2123,6 @@ async def delete_reseller(
         AccessCredential.user_id == reseller_id,
         AccessCredential.router_id.in_(router_ids),
     )))
-    await db.execute(delete(MtnMomoTransaction).where(MtnMomoTransaction.reseller_id == reseller_id))
-    await db.execute(delete(MtnMomoTransaction).where(MtnMomoTransaction.customer_id.in_(customer_ids)))
-    await db.execute(delete(FapshiTransaction).where(FapshiTransaction.reseller_id == reseller_id))
-    await db.execute(delete(FapshiTransaction).where(FapshiTransaction.customer_id.in_(customer_ids)))
 
     # 4. Customer ratings
     await db.execute(delete(CustomerRating).where(CustomerRating.customer_id.in_(customer_ids)))
@@ -2114,24 +2146,9 @@ async def delete_reseller(
     await db.execute(delete(ProvisioningAttempt).where(ProvisioningAttempt.customer_id.in_(customer_ids)))
     await db.execute(delete(ProvisioningAttempt).where(ProvisioningAttempt.router_id.in_(router_ids)))
 
-    # 7. M-Pesa transactions
-    await db.execute(delete(MpesaTransaction).where(MpesaTransaction.customer_id.in_(customer_ids)))
-
-    # 8. Payments (old table)
-    await db.execute(delete(Payment).where(Payment.customer_id.in_(customer_ids)))
-
     # 8b. Free-trial claims (reference this reseller, its customers, payments,
     #     plans and routers; must go before customer payments)
     await db.execute(delete(FreeTrialClaim).where(FreeTrialClaim.user_id == reseller_id))
-
-    # 9. Customer payments (delete by both reseller_id and customer_id to
-    #    catch cross-reseller references)
-    await db.execute(delete(CustomerPayment).where(CustomerPayment.reseller_id == reseller_id))
-    await db.execute(delete(CustomerPayment).where(CustomerPayment.customer_id.in_(customer_ids)))
-
-    # 9b. ZenoPay transactions (same cross-reference treatment)
-    await db.execute(delete(ZenoPayTransaction).where(ZenoPayTransaction.reseller_id == reseller_id))
-    await db.execute(delete(ZenoPayTransaction).where(ZenoPayTransaction.customer_id.in_(customer_ids)))
 
     # 9c. Device pairings (references customers and routers)
     await db.execute(delete(DevicePairing).where(DevicePairing.customer_id.in_(customer_ids)))
@@ -2194,12 +2211,6 @@ async def delete_reseller(
     # 19. Reseller financials
     await db.execute(delete(ResellerFinancials).where(ResellerFinancials.user_id == reseller_id))
 
-    # 20. B2B transactions (must precede payouts/charges due to FK)
-    await db.execute(delete(B2BTransaction).where(B2BTransaction.reseller_id == reseller_id))
-
-    # 21. Reseller payouts
-    await db.execute(delete(ResellerPayout).where(ResellerPayout.reseller_id == reseller_id))
-
     # 21b. Reseller transaction charges
     created_charge_ids = select(ResellerTransactionCharge.id).where(
         ResellerTransactionCharge.created_by == reseller_id
@@ -2213,9 +2224,6 @@ async def delete_reseller(
         ResellerTransactionCharge.reseller_id == reseller_id,
         ResellerTransactionCharge.created_by == reseller_id,
     )))
-
-    # 21c. Subscription payments (must precede invoices due to FK)
-    await db.execute(delete(SubscriptionPayment).where(SubscriptionPayment.user_id == reseller_id))
 
     # 21d. Subscription invoices
     await db.execute(delete(SubscriptionInvoice).where(SubscriptionInvoice.user_id == reseller_id))

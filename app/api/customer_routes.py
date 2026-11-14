@@ -1269,20 +1269,7 @@ async def _delete_customer_row(customer_id: int, db: AsyncSession, user) -> dict
         )
 
         # -----------------------------------------------------------------
-        # Clean up child rows before deleting the parent.
-        # Rules:
-        #   • Operational rows (RADIUS, bandwidth, usage periods,
-        #     provisioning logs, device pairings, reconnections, ratings)
-        #     — DELETE: no audit value.
-        #   • CustomerPayment — SET customer_id = NULL: this is the
-        #     financial ledger used by balance calculations; preserving
-        #     these rows keeps total_revenue and unpaid_balance correct.
-        #   • MpesaTransaction / ZenoPay / MtnMomo raw event logs — DELETE:
-        #     the transactions list query filters on "customer_id IS NULL"
-        #     which is visible to all users, so nulling these out would
-        #     leak data across resellers. Balance is covered by
-        #     CustomerPayment, so deleting these is safe.
-        #   • Legacy Payment rows — NOT NULL column, deprecated, DELETE.
+        # Remove operational records. Payment records are retained.
         # -----------------------------------------------------------------
         await db.execute(
             update(Voucher).where(Voucher.redeemed_by == customer_id).values(redeemed_by=None)
@@ -1322,21 +1309,28 @@ async def _delete_customer_row(customer_id: int, db: AsyncSession, user) -> dict
         await db.execute(
             update(CustomerPayment)
             .where(CustomerPayment.customer_id == customer_id)
-            .values(customer_id=None)
+            .values(customer_id=None, router_id=func.coalesce(CustomerPayment.router_id, customer.router_id))
         )
 
-        # MpesaTransaction / ZenoPay / MtnMomo: DELETE these raw event-log tables.
-        # Reason: the transactions list query uses "customer_id IS NULL" as a
-        # catch-all that is visible to every authenticated user — setting NULL
-        # would expose this customer's history to other resellers. Financial
-        # accuracy is already fully covered by the CustomerPayment rows above.
-        await db.execute(delete(MpesaTransaction).where(MpesaTransaction.customer_id == customer_id))
-        await db.execute(delete(ZenoPayTransaction).where(ZenoPayTransaction.customer_id == customer_id))
-        await db.execute(delete(MtnMomoTransaction).where(MtnMomoTransaction.customer_id == customer_id))
-        await db.execute(delete(FapshiTransaction).where(FapshiTransaction.customer_id == customer_id))
-
-        # Legacy table — NOT NULL column, table is deprecated, safe to delete
-        await db.execute(delete(Payment).where(Payment.customer_id == customer_id))
+        # M-Pesa attempts need an explicit owner once their live customer is gone.
+        await db.execute(
+            update(MpesaTransaction).where(MpesaTransaction.customer_id == customer_id)
+            .values(
+                customer_id=None,
+                reseller_id=func.coalesce(MpesaTransaction.reseller_id, user.id),
+                router_id=func.coalesce(MpesaTransaction.router_id, customer.router_id),
+                updated_at=MpesaTransaction.updated_at,
+            )
+        )
+        # Other gateways already carry ownership. Detach only the customer link
+        # and keep the original provider timestamps and transaction payload.
+        await db.execute(update(ZenoPayTransaction).where(ZenoPayTransaction.customer_id == customer_id)
+                         .values(customer_id=None, updated_at=ZenoPayTransaction.updated_at))
+        await db.execute(update(MtnMomoTransaction).where(MtnMomoTransaction.customer_id == customer_id)
+                         .values(customer_id=None, updated_at=MtnMomoTransaction.updated_at))
+        await db.execute(update(FapshiTransaction).where(FapshiTransaction.customer_id == customer_id)
+                         .values(customer_id=None, updated_at=FapshiTransaction.updated_at))
+        await db.execute(update(Payment).where(Payment.customer_id == customer_id).values(customer_id=None))
 
         # Delete the customer first, then flush so the upcoming count queries
         # from update_reseller_financials already see N-1 customers.

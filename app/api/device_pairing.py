@@ -1614,6 +1614,8 @@ async def pair_device_and_pay(
                     amount=float(plan.price),
                     reference=reference,
                     customer_id=customer.id,
+                    reseller_id=customer.user_id,
+                    router_id=customer.router_id,
                     plan_id=plan.id,
                     collection_mode=CollectionMode.SYSTEM_COLLECTED,
                     status=MpesaTransactionStatus.pending,

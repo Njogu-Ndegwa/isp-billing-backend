@@ -537,6 +537,7 @@ async def _send_prompt(db, router_obj, reseller, customer, plan, phone, now) -> 
 
     owner_shortcode = reseller.mpesa_shortcode if reseller else None
     customer_id, plan_id = customer.id, plan.id
+    reseller_id, router_id = customer.user_id, router_obj.id
     await db.commit()  # release the connection before Safaricom
     try:
         stk = await initiate_stk_push(
@@ -550,6 +551,7 @@ async def _send_prompt(db, router_obj, reseller, customer, plan, phone, now) -> 
             fdb.add(MpesaTransaction(
                 checkout_request_id=f"FAILED-{reference}", phone_number=phone, amount=amount,
                 reference=reference, customer_id=customer_id, plan_id=plan_id,
+                reseller_id=reseller_id, router_id=router_id,
                 collection_mode=CollectionMode.SYSTEM_COLLECTED,
                 status=MpesaTransactionStatus.failed, failure_source=FailureSource.MPESA_API,
                 result_code="STK_PUSH_FAILED", result_desc=f"STK Push initiation failed: {str(exc)[:450]}",
@@ -564,6 +566,7 @@ async def _send_prompt(db, router_obj, reseller, customer, plan, phone, now) -> 
             merchant_request_id=stk.merchant_request_id,
             phone_number=phone, amount=amount, reference=reference,
             customer_id=customer_id, plan_id=plan_id,
+            reseller_id=reseller_id, router_id=router_id,
             collection_mode=CollectionMode.SYSTEM_COLLECTED,
             status=MpesaTransactionStatus.pending,
         ))

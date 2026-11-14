@@ -268,7 +268,11 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
             return {"ResultCode": 1, "ResultDesc": "Missing CheckoutRequestID"}
         
         # Look up transaction
-        stmt = select(MpesaTransaction).where(MpesaTransaction.checkout_request_id == checkout_request_id)
+        stmt = (
+            select(MpesaTransaction)
+            .where(MpesaTransaction.checkout_request_id == checkout_request_id)
+            .with_for_update()
+        )
         result = await db.execute(stmt)
         mpesa_txn = result.scalar_one_or_none()
         
@@ -330,6 +334,8 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
                         amount=float(cb_amount),
                         reference=f"RECOVERED-{checkout_request_id}",
                         customer_id=orphan_customer.id,
+                        reseller_id=orphan_customer.user_id,
+                        router_id=orphan_customer.router_id,
                         plan_id=orphan_customer.plan_id,
                         collection_mode=None,
                         status=MpesaTransactionStatus.pending,
@@ -405,6 +411,17 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
             logger.warning(f"Transaction {checkout_request_id} failed (client): code={result_code}, desc={result_desc}")
         
         mpesa_txn.updated_at = datetime.utcnow()
+        if mpesa_txn.customer_id is None and mpesa_txn.reseller_id is not None:
+            if status == "completed":
+                from app.services.reseller_payments import record_detached_mpesa_payment
+
+                await record_detached_mpesa_payment(
+                    db, mpesa_txn, amount=float(amount or mpesa_txn.amount),
+                    notes=f"M-Pesa STK Push. TX: {checkout_request_id}",
+                )
+            await db.commit()
+            return {"ResultCode": 0, "ResultDesc": "Payment result recorded"}
+
         await db.commit()
         
         # Get customer via transaction
@@ -418,6 +435,17 @@ async def mpesa_direct_callback(payload: dict, background_tasks: BackgroundTasks
         customer = result.scalar_one_or_none()
         
         if not customer:
+            # Customer deletion may have committed since we saved the result.
+            await db.refresh(mpesa_txn)
+            if status == "completed" and mpesa_txn.customer_id is None and mpesa_txn.reseller_id is not None:
+                from app.services.reseller_payments import record_detached_mpesa_payment
+
+                await record_detached_mpesa_payment(
+                    db, mpesa_txn, amount=float(amount or mpesa_txn.amount),
+                    notes=f"M-Pesa STK Push. TX: {checkout_request_id}",
+                )
+                await db.commit()
+                return {"ResultCode": 0, "ResultDesc": "Payment result recorded"}
             logger.error(f"Customer {customer_id} not found")
             return {"ResultCode": 1, "ResultDesc": "Customer not found"}
         
@@ -1042,6 +1070,8 @@ async def register_hotspot_and_pay_api(
                         amount=float(plan.price),
                         reference=reference,
                         customer_id=customer.id,
+                        reseller_id=customer.user_id,
+                        router_id=customer.router_id,
                         plan_id=plan.id,
                         collection_mode=CollectionMode.SYSTEM_COLLECTED,
                         status=MpesaTransactionStatus.pending
@@ -1070,7 +1100,9 @@ async def register_hotspot_and_pay_api(
                                 phone_number=request.phone,
                                 amount=float(plan.price),
                                 reference=reference,
-                                customer_id=customer_id,
+                                customer_id=customer.id,
+                                reseller_id=customer.user_id,
+                                router_id=customer.router_id,
                                 plan_id=plan.id,
                                 collection_mode=CollectionMode.SYSTEM_COLLECTED,
                                 status=MpesaTransactionStatus.failed,
@@ -1227,20 +1259,52 @@ def _gateway_payment_condition():
     ])
 
 
-def _cp_ledger_condition(payment_method: Optional[str] = None):
-    """customer_payments rows that belong in the transaction ledger.
+_STK_PAYMENT_NOTE_PREFIXES = (
+    "M-Pesa STK Push. TX: ",
+    "M-Pesa reconciliation. TX: ",
+    "Manual completion from pending M-Pesa TX: ",
+)
 
-    mobile_money rows are skipped as twins of an mpesa_transactions / C2B row,
-    except gateway rows, which have no twin.
-    """
+
+def _archived_stk_payment_condition():
+    """Show the ledger entry when older code deleted the provider record."""
+    return and_(
+        CustomerPayment.customer_id.is_(None),
+        CustomerPayment.payment_method == PaymentMethod.MOBILE_MONEY,
+        CustomerPayment.status == PaymentStatus.COMPLETED,
+        or_(*(func.coalesce(CustomerPayment.notes, "").startswith(prefix) for prefix in _STK_PAYMENT_NOTE_PREFIXES)),
+        ~select(MpesaTransaction.id).where(
+            MpesaTransaction.reseller_id == CustomerPayment.reseller_id,
+            or_(
+                MpesaTransaction.mpesa_receipt_number == CustomerPayment.payment_reference,
+                MpesaTransaction.checkout_request_id == CustomerPayment.payment_reference,
+                *(
+                    and_(
+                        CustomerPayment.notes.startswith(prefix),
+                        MpesaTransaction.checkout_request_id == func.substr(CustomerPayment.notes, len(prefix) + 1),
+                    )
+                    for prefix in _STK_PAYMENT_NOTE_PREFIXES
+                ),
+            ),
+        ).exists(),
+    )
+
+
+def _cp_ledger_condition(payment_method: Optional[str] = None):
+    """Include ledger-only payments without counting provider records twice."""
+    ledger_only = or_(_gateway_payment_condition(), _archived_stk_payment_condition())
     if payment_method == "mobile_money":
-        return and_(
-            CustomerPayment.payment_method == PaymentMethod.MOBILE_MONEY,
-            _gateway_payment_condition(),
-        )
+        return and_(CustomerPayment.payment_method == PaymentMethod.MOBILE_MONEY, ledger_only)
+    return or_(CustomerPayment.payment_method != PaymentMethod.MOBILE_MONEY, ledger_only)
+
+
+def _mpesa_owned_by(user_id: int):
     return or_(
-        CustomerPayment.payment_method != PaymentMethod.MOBILE_MONEY,
-        _gateway_payment_condition(),
+        and_(MpesaTransaction.customer_id.is_(None), MpesaTransaction.reseller_id == user_id),
+        and_(
+            Customer.user_id == user_id,
+            or_(MpesaTransaction.reseller_id.is_(None), MpesaTransaction.reseller_id == user_id),
+        ),
     )
 
 
@@ -1400,18 +1464,18 @@ async def get_mpesa_transactions(
         # Settlement only describes M-Pesa money; cash/vouchers have none.
         # With payment_method=mobile_money this still runs for the gateway
         # rows (see _cp_ledger_condition).
-        want_other = settlement is None
+        want_other = settlement is None or want_mpesa
 
         # --- Query 1: M-Pesa transactions (preserves pending/failed/expired) ---
         if want_mpesa:
             mpesa_stmt = (
                 select(MpesaTransaction, Customer, Router, Plan)
-                .join(Customer, MpesaTransaction.customer_id == Customer.id)
-                .join(Router, Customer.router_id == Router.id, isouter=True)
+                .outerjoin(Customer, MpesaTransaction.customer_id == Customer.id)
+                .outerjoin(Router, Router.id == func.coalesce(MpesaTransaction.router_id, Customer.router_id))
                 # Prefer the plan snapshotted on the transaction itself; legacy
                 # rows (plan_id NULL) fall back to the customer's current plan.
                 .join(Plan, Plan.id == func.coalesce(MpesaTransaction.plan_id, Customer.plan_id), isouter=True)
-                .where(Customer.user_id == user.id)
+                .where(_mpesa_owned_by(user.id))
             )
             if router_id:
                 mpesa_stmt = mpesa_stmt.where(Router.id == router_id)
@@ -1505,9 +1569,12 @@ async def get_mpesa_transactions(
         # (customer_id SET NULL) are still included in the ledger.
         if want_other:
             cp_stmt = (
-                select(CustomerPayment, Customer, Router, Plan)
+                select(
+                    CustomerPayment, Customer, Router, Plan,
+                    _archived_stk_payment_condition().label("archived_stk"),
+                )
                 .outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
-                .outerjoin(Router, Customer.router_id == Router.id)
+                .outerjoin(Router, Router.id == func.coalesce(CustomerPayment.router_id, Customer.router_id))
                 # Prefer the plan snapshotted on the payment itself; legacy
                 # rows (plan_id NULL) fall back to the customer's current plan.
                 .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
@@ -1527,18 +1594,26 @@ async def get_mpesa_transactions(
                         detail=f"Invalid payment_method. Must be one of: {', '.join(valid)}",
                     )
             if router_id:
-                cp_stmt = cp_stmt.where(Customer.router_id == router_id)
+                cp_stmt = cp_stmt.where(Router.id == router_id)
             if customer_id:
                 cp_stmt = cp_stmt.where(CustomerPayment.customer_id == customer_id)
             if date_start:
                 cp_stmt = cp_stmt.where(CustomerPayment.created_at >= date_start)
             if date_end:
                 cp_stmt = cp_stmt.where(CustomerPayment.created_at <= date_end)
+            if settlement is not None:
+                cp_stmt = cp_stmt.where(_archived_stk_payment_condition())
+                if settlement == "direct":
+                    cp_stmt = cp_stmt.where(CustomerPayment.collection_mode == CollectionMode.DIRECT)
+                else:
+                    cp_stmt = cp_stmt.where(or_(
+                        CustomerPayment.collection_mode.is_(None),
+                        CustomerPayment.collection_mode != CollectionMode.DIRECT,
+                    ))
             if status:
                 if status.lower() in ("failed", "expired"):
-                    pass
+                    cp_stmt = cp_stmt.where(~_archived_stk_payment_condition())
                 else:
-                    from app.db.models import PaymentStatus
                     try:
                         cp_status = PaymentStatus(status.lower())
                         cp_stmt = cp_stmt.where(CustomerPayment.status == cp_status)
@@ -1555,7 +1630,7 @@ async def get_mpesa_transactions(
 
             cp_rows = (await db.execute(cp_stmt)).all()
 
-            for pay, customer, rtr, plan in cp_rows:
+            for pay, customer, rtr, plan, archived_stk in cp_rows:
                 payment_status = "completed" if pay.status and pay.status.value == "completed" else (pay.status.value if pay.status else "completed")
                 manual_supported, manual_reason = _manual_provision_support(
                     pay.payment_method.value,
@@ -1568,7 +1643,7 @@ async def get_mpesa_transactions(
                 # pay.customer_name holds the name snapshot from deletion time.
                 display_name = (customer.name if customer else None) or pay.customer_name or "Deleted customer"
                 results.append({
-                    "transaction_id": pay.id,
+                    "transaction_id": -pay.id if archived_stk else pay.id,
                     "checkout_request_id": None,
                     "phone_number": customer.phone if customer else None,
                     "amount": float(pay.amount),
@@ -1577,7 +1652,12 @@ async def get_mpesa_transactions(
                     "status": payment_status,
                     "payment_method": pay.payment_method.value,
                     "payment_reference": pay.payment_reference,
-                    "mpesa_receipt_number": None,
+                    "mpesa_receipt_number": (
+                        pay.payment_reference
+                        if archived_stk and not (pay.payment_reference or "").startswith("ws_CO")
+                        else None
+                    ),
+                    "settlement": _settlement_of_mpesa(pay.collection_mode) if archived_stk else None,
                     "result_code": None,
                     "result_desc": None,
                     "failure_source": None,
@@ -1613,7 +1693,7 @@ async def get_mpesa_transactions(
                     "manual_provision_supported": manual_supported,
                     "manual_provision_reason": manual_reason,
                     "counts_as_revenue": bool(pay.counts_as_revenue),
-                    "source": _cp_source(pay.payment_reference),
+                    "source": "mpesa_stk" if archived_stk else _cp_source(pay.payment_reference),
                     "days_paid_for": pay.days_paid_for,
                     "notes": pay.notes,
                     "_delivery_source_table": ProvisioningAttemptSource.CUSTOMER_PAYMENT.value,
@@ -1626,13 +1706,13 @@ async def get_mpesa_transactions(
             c2b_stmt = (
                 select(C2BTransaction, Customer, Router, Plan, CustomerPayment.days_paid_for)
                 .outerjoin(Customer, C2BTransaction.matched_customer_id == Customer.id)
-                .outerjoin(Router, Customer.router_id == Router.id)
                 # A processed paybill payment wrote a customer_payments twin
                 # (reference = TransID) that snapshots the plan it bought.
                 .outerjoin(CustomerPayment, and_(
                     CustomerPayment.payment_reference == C2BTransaction.trans_id,
-                    CustomerPayment.customer_id == C2BTransaction.matched_customer_id,
+                    CustomerPayment.reseller_id == C2BTransaction.matched_reseller_id,
                 ))
+                .outerjoin(Router, Router.id == func.coalesce(CustomerPayment.router_id, Customer.router_id))
                 .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
                 .where(C2BTransaction.matched_reseller_id == user.id)
                 # An STK echo is the C2B copy of an STK payment that Query 1
@@ -2095,10 +2175,10 @@ async def get_mpesa_transactions_summary(
                     Plan.connection_type,
                     MpesaTransaction.collection_mode,
                 )
-                .join(Customer, MpesaTransaction.customer_id == Customer.id)
-                .join(Router, Customer.router_id == Router.id, isouter=True)
+                .outerjoin(Customer, MpesaTransaction.customer_id == Customer.id)
+                .outerjoin(Router, Router.id == func.coalesce(MpesaTransaction.router_id, Customer.router_id))
                 .join(Plan, Plan.id == func.coalesce(MpesaTransaction.plan_id, Customer.plan_id), isouter=True)
-                .where(Customer.user_id == user.id)
+                .where(_mpesa_owned_by(user.id))
             )
             if router_id:
                 mpesa_stmt = mpesa_stmt.where(Router.id == router_id)
@@ -2134,11 +2214,11 @@ async def get_mpesa_transactions_summary(
                     Plan.connection_type,
                 )
                 .outerjoin(Customer, C2BTransaction.matched_customer_id == Customer.id)
-                .outerjoin(Router, Customer.router_id == Router.id)
                 .outerjoin(CustomerPayment, and_(
                     CustomerPayment.payment_reference == C2BTransaction.trans_id,
-                    CustomerPayment.customer_id == C2BTransaction.matched_customer_id,
+                    CustomerPayment.reseller_id == C2BTransaction.matched_reseller_id,
                 ))
+                .outerjoin(Router, Router.id == func.coalesce(CustomerPayment.router_id, Customer.router_id))
                 .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
                 .where(
                     C2BTransaction.matched_reseller_id == user.id,
@@ -2173,12 +2253,14 @@ async def get_mpesa_transactions_summary(
                     CustomerPayment.status,
                     CustomerPayment.payment_method,
                     CustomerPayment.counts_as_revenue,
+                    CustomerPayment.collection_mode,
+                    _archived_stk_payment_condition().label("archived_stk"),
                     Router.name,
                     Router.id,
                     Plan.connection_type,
                 )
                 .outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
-                .outerjoin(Router, Customer.router_id == Router.id)
+                .outerjoin(Router, Router.id == func.coalesce(CustomerPayment.router_id, Customer.router_id))
                 .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
                 .where(
                     CustomerPayment.reseller_id == user.id,
@@ -2192,7 +2274,7 @@ async def get_mpesa_transactions_summary(
                 except ValueError:
                     pass
             if router_id:
-                cp_stmt = cp_stmt.where(Customer.router_id == router_id)
+                cp_stmt = cp_stmt.where(Router.id == router_id)
             if date_start:
                 cp_stmt = cp_stmt.where(CustomerPayment.created_at >= date_start)
             if date_end:
@@ -2203,6 +2285,8 @@ async def get_mpesa_transactions_summary(
                 payment_status,
                 method,
                 counts_as_revenue,
+                collection_mode,
+                archived_stk,
                 router_name,
                 router_pk,
                 connection_type,
@@ -2211,6 +2295,7 @@ async def get_mpesa_transactions_summary(
                     "amount": float(amount),
                     "status": payment_status.value if payment_status else "completed",
                     "method": method.value,
+                    "settlement": _settlement_of_mpesa(collection_mode) if archived_stk else None,
                     "router_name": router_name,
                     "router_id": router_pk,
                     "counts_as_revenue": bool(counts_as_revenue),

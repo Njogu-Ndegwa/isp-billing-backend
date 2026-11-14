@@ -365,7 +365,7 @@ async def test_expired_trial_is_removed_by_both_expiry_paths(db, no_background_p
     assert due == [customer.id]
 
 
-async def test_deleting_a_reseller_removes_their_trial_claims(db, monkeypatch, no_background_provisioning):
+async def test_reseller_with_trial_payment_history_cannot_be_deleted(db, monkeypatch, no_background_provisioning):
     import app.api.admin_reseller_routes as admin_resellers
     from app.db.models import User, UserRole
     from app.services.free_trial import claim_free_trial
@@ -388,7 +388,10 @@ async def test_deleting_a_reseller_removes_their_trial_claims(db, monkeypatch, n
     monkeypatch.setattr(admin_resellers, "remove_wireguard_peer", _no_vpn_cleanup)
     monkeypatch.setattr(admin_resellers, "remove_l2tp_peer", _no_vpn_cleanup)
 
-    await admin_resellers.delete_reseller(reseller.id, True, db, "token")
+    with pytest.raises(HTTPException) as exc:
+        await admin_resellers.delete_reseller(reseller.id, True, db, "token")
 
-    assert await db.get(User, reseller.id) is None
-    assert await db.scalar(select(func.count(FreeTrialClaim.id))) == 0
+    assert exc.value.status_code == 409
+    assert await db.get(User, reseller.id) is not None
+    assert await db.scalar(select(func.count(FreeTrialClaim.id))) == 1
+    assert await db.scalar(select(func.count(CustomerPayment.id))) == 1

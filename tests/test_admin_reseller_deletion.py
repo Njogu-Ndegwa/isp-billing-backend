@@ -81,9 +81,7 @@ async def test_delete_reseller_cleans_messaging_and_related_fk_rows(db, monkeypa
     c2b = C2BTransaction(
         trans_id="C2B-DEL-1",
         trans_amount=100,
-        status=C2BTransactionStatus.PROCESSED,
-        matched_customer_id=customer.id,
-        matched_reseller_id=reseller.id,
+        status=C2BTransactionStatus.UNMATCHED,
     )
     db.add_all([campaign, product, order, c2b])
     await db.flush()

@@ -2641,6 +2641,48 @@ async def run_free_trial_migrations():
     logger.info("Free trial migrations complete")
 
 
+async def run_payment_history_retention_migrations():
+    """Keep payment history intact even if a deletion path misses a guard."""
+    if async_engine.dialect.name != "postgresql":
+        return
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text("""
+            ALTER TABLE mpesa_transactions
+            ADD COLUMN IF NOT EXISTS reseller_id INTEGER REFERENCES users(id),
+            ADD COLUMN IF NOT EXISTS router_id INTEGER REFERENCES routers(id) ON DELETE SET NULL
+        """))
+        await conn.execute(sa_text("ALTER TABLE payments ALTER COLUMN customer_id DROP NOT NULL"))
+        await conn.execute(sa_text("""
+            CREATE OR REPLACE FUNCTION prevent_payment_history_deletion()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'Payment history cannot be deleted from %', TG_TABLE_NAME
+                    USING ERRCODE = 'integrity_constraint_violation';
+            END;
+            $$
+        """))
+        for table in (
+            "payments", "customer_payments", "mpesa_transactions", "c2b_transactions",
+            "zenopay_transactions", "mtn_momo_transactions", "fapshi_transactions",
+            "b2b_transactions", "reseller_payouts", "subscription_payments",
+        ):
+            await conn.execute(sa_text(f"""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_trigger
+                        WHERE tgrelid = '{table}'::regclass
+                          AND tgname = 'preserve_payment_history'
+                    ) THEN
+                        CREATE TRIGGER preserve_payment_history
+                        BEFORE DELETE OR TRUNCATE ON {table}
+                        FOR EACH STATEMENT EXECUTE FUNCTION prevent_payment_history_deletion();
+                    END IF;
+                END;
+                $$
+            """))
+
+
 async def run_payment_port_attribution_migrations():
     """Add customer_payments.port_name (varchar, nullable) so revenue can be
     attributed to the router port the paying customer's device was on around
@@ -3282,6 +3324,7 @@ async def run_hot_path_index_migrations():
         "ix_customer_payments_customer_status",
         "ix_mpesa_txn_receipt_number",
         "ix_customer_payments_payment_reference",
+        "ix_mpesa_transactions_reseller_id",
     )
     async with async_engine.connect() as conn:
         conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
@@ -3375,21 +3418,22 @@ async def run_hot_path_index_migrations():
             # payment (customer_payments.payment_reference). Both tables are
             # 300k+ rows in production; without these each confirmation
             # would scan them in full.
-            for receipt_index, receipt_table, receipt_column in (
+            for index_name, table_name, column_name in (
                 ("ix_mpesa_txn_receipt_number", "mpesa_transactions", "mpesa_receipt_number"),
                 ("ix_customer_payments_payment_reference", "customer_payments", "payment_reference"),
+                ("ix_mpesa_transactions_reseller_id", "mpesa_transactions", "reseller_id"),
             ):
                 result = await conn.execute(sa_text(
                     "SELECT indisvalid FROM pg_index "
-                    f"WHERE indexrelid = to_regclass('public.{receipt_index}')"
+                    f"WHERE indexrelid = to_regclass('public.{index_name}')"
                 ))
                 if result.scalar_one_or_none() is False:
                     await conn.execute(sa_text(
-                        f"DROP INDEX CONCURRENTLY IF EXISTS public.{receipt_index}"
+                        f"DROP INDEX CONCURRENTLY IF EXISTS public.{index_name}"
                     ))
                 await conn.execute(sa_text(
-                    f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {receipt_index} "
-                    f"ON public.{receipt_table} ({receipt_column})"
+                    f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name} "
+                    f"ON public.{table_name} ({column_name})"
                 ))
         finally:
             await conn.execute(sa_text("RESET max_parallel_maintenance_workers"))
@@ -4013,6 +4057,8 @@ async def startup_event():
         logger.info("Free trial migrations completed successfully")
     except Exception as e:
         logger.error(f"Free trial migration failed (non-fatal): {e}")
+
+    await run_payment_history_retention_migrations()
 
     try:
         await run_payment_port_attribution_migrations()

@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 async def resolve_mpesa_collection_mode(
     db: AsyncSession,
     transaction: MpesaTransaction,
-    customer: Customer,
+    customer: Customer | None,
 ) -> CollectionMode:
     """Return the immutable collection owner for an M-Pesa transaction.
 
@@ -38,12 +38,13 @@ async def resolve_mpesa_collection_mode(
         return transaction.collection_mode
 
     method_type = None
-    if customer.router_id:
+    router_id = transaction.router_id if customer is None else customer.router_id
+    if router_id:
         result = await db.execute(
             select(ResellerPaymentMethod.method_type)
             .join(Router, Router.payment_method_id == ResellerPaymentMethod.id)
             .where(
-                Router.id == customer.router_id,
+                Router.id == router_id,
                 ResellerPaymentMethod.is_active == True,
             )
         )
@@ -52,6 +53,35 @@ async def resolve_mpesa_collection_mode(
     if method_type == ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS:
         return CollectionMode.DIRECT
     return CollectionMode.SYSTEM_COLLECTED
+
+async def record_detached_mpesa_payment(
+    db: AsyncSession,
+    transaction: MpesaTransaction,
+    *,
+    amount: float,
+    notes: str,
+) -> None:
+    """Record a confirmed payment after deletion, without granting access."""
+    plan = await db.get(Plan, transaction.plan_id) if transaction.plan_id else None
+    days = 1
+    if plan:
+        unit = plan.duration_unit.value.upper()
+        units_per_day = {"MINUTES": 1440, "HOURS": 24}.get(unit, 1)
+        days = max(1, plan.duration_value // units_per_day)
+    db.add(CustomerPayment(
+        reseller_id=transaction.reseller_id,
+        router_id=transaction.router_id,
+        plan_id=transaction.plan_id,
+        amount=amount,
+        payment_method=PaymentMethod.MOBILE_MONEY,
+        payment_reference=transaction.mpesa_receipt_number,
+        notes=notes,
+        days_paid_for=days,
+        collection_mode=await resolve_mpesa_collection_mode(db, transaction, None),
+    ))
+    await db.flush()
+    await update_reseller_financials(db, transaction.reseller_id)
+
 
 def _plan_gives_less(new_plan: Plan | None, old_plan: Plan) -> bool:
     """True when ``new_plan`` allows fewer devices or a lower data cap."""

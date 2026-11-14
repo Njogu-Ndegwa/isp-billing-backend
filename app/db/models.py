@@ -421,7 +421,7 @@ class FreeTrialClaim(Base):
 class Payment(Base):
     __tablename__ = "payments"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)
     amount = Column(Integer, nullable=False)
     days_paid_for = Column(Integer, nullable=False)
     paid_on = Column(DateTime, default=datetime.utcnow)
@@ -890,6 +890,9 @@ class MpesaTransaction(Base):
     lipay_tx_no = Column(String(255), nullable=True)  # <-- Add this line
     status = Column(Enum(MpesaTransactionStatus), default=MpesaTransactionStatus.pending)
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)
+    # Keep ownership and router attribution when the customer is deleted.
+    reseller_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    router_id = Column(Integer, ForeignKey("routers.id", ondelete="SET NULL"), nullable=True)
     # Snapshot of the plan purchased in THIS transaction. Customer.plan_id is
     # overwritten on every purchase, so it cannot be used for history.
     plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"), nullable=True)

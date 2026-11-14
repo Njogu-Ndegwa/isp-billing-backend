@@ -502,30 +502,31 @@ async def _handle_successful_reconciliation(
                 failure_source=None,
                 updated_at=datetime.utcnow(),
             )
+            .returning(MpesaTransaction)
         )
-        if claim.rowcount == 0:
+        mpesa_txn = claim.scalar_one_or_none()
+        if mpesa_txn is None:
             # Another path (callback, concurrent sweep, on-demand check)
             # already finalized this transaction.
             return
-        await db.commit()
-
-        # Re-fetch to read fields not on the caller's copy (e.g. mpesa_receipt_number set by the callback).
-        stmt = select(MpesaTransaction).where(
-            MpesaTransaction.checkout_request_id == txn.checkout_request_id
-        )
-        res = await db.execute(stmt)
-        mpesa_txn = res.scalar_one()
-
         logger.info(
             "[RECONCILE] Marked %s as completed via STK Query",
             txn.checkout_request_id,
         )
 
-        # --- Load customer with plan and router ---
         customer_id = mpesa_txn.customer_id
-        if not customer_id:
-            logger.warning("[RECONCILE] Transaction %s has no customer_id, skipping provisioning", txn.checkout_request_id)
+        if customer_id is None and mpesa_txn.reseller_id is not None:
+            from app.services.reseller_payments import record_detached_mpesa_payment
+
+            await record_detached_mpesa_payment(
+                db, mpesa_txn, amount=float(mpesa_txn.amount),
+                notes=f"M-Pesa reconciliation. TX: {txn.checkout_request_id}",
+            )
+        await db.commit()
+        if customer_id is None:
             return
+
+        # --- Load customer with plan and router ---
 
         cust_stmt = (
             select(Customer)
@@ -535,6 +536,16 @@ async def _handle_successful_reconciliation(
         cust_result = await db.execute(cust_stmt)
         customer = cust_result.scalar_one_or_none()
         if not customer:
+            await db.refresh(mpesa_txn)
+            if mpesa_txn.customer_id is None and mpesa_txn.reseller_id is not None:
+                from app.services.reseller_payments import record_detached_mpesa_payment
+
+                await record_detached_mpesa_payment(
+                    db, mpesa_txn, amount=float(mpesa_txn.amount),
+                    notes=f"M-Pesa reconciliation. TX: {txn.checkout_request_id}",
+                )
+                await db.commit()
+                return
             logger.error("[RECONCILE] Customer %s not found for transaction %s", customer_id, txn.checkout_request_id)
             return
 

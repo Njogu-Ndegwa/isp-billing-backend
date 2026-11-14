@@ -643,8 +643,10 @@
   "phone_number",
   "plan_id",
   "reference",
+  "reseller_id",
   "result_code",
   "result_desc",
+  "router_id",
   "status",
   "transaction_date",
   "updated_at"
