@@ -59,12 +59,14 @@ router = APIRouter(tags=["router-operations"])
 
 
 async def _run_locked_router_thread(router_obj: Router, sync_func, *args, **kwargs) -> dict:
-    """Run one live router mutation at a time per router."""
-    from app.services.mikrotik_background import router_locks
+    """Run a port change without queuing behind unrelated fleet maintenance."""
+    from app.services.router_mutations import RouterMutationBusy, run_router_mutation
 
     router_key = f"{router_obj.ip_address}:{router_obj.port}"
-    async with router_locks.acquire(router_key):
-        return await asyncio.to_thread(sync_func, *args, **kwargs)
+    try:
+        return await run_router_mutation(router_key, sync_func, *args, **kwargs)
+    except RouterMutationBusy as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
