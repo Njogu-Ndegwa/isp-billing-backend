@@ -6,6 +6,7 @@ failing test with its error, so a reviewer never has to open the log to find out
 what went wrong.
 
 Usage: python scripts/ci_test_summary.py pytest-report.xml >> "$GITHUB_STEP_SUMMARY"
+Use --annotations to report only failed test IDs on a public candidate run.
 
 Stdlib only, and deliberately forgiving: a malformed or missing report must not
 be the reason a build fails, so anything unexpected degrades to a short note and
@@ -92,6 +93,12 @@ def main() -> int:
                 ))
 
     passed = total - failed - errored - skipped
+
+    if '--annotations' in sys.argv[2:]:
+        for test_id, kind, _ in broken[:MAX_ROWS]:
+            escaped = test_id.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+            print(f'::error title=pytest::{escaped} ({kind})')
+        return 0
 
     if failed or errored:
         print(f"## ❌ {failed + errored} of {total} tests failed\n")

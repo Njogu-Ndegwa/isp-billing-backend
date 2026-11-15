@@ -2649,11 +2649,11 @@ async def run_payment_history_retention_migrations():
         return
     async with async_engine.begin() as conn:
         await conn.execute(sa_text("""
-            ALTER TABLE mpesa_transactions
+            ALTER TABLE IF EXISTS mpesa_transactions
             ADD COLUMN IF NOT EXISTS reseller_id INTEGER REFERENCES users(id),
             ADD COLUMN IF NOT EXISTS router_id INTEGER REFERENCES routers(id) ON DELETE SET NULL
         """))
-        await conn.execute(sa_text("ALTER TABLE payments ALTER COLUMN customer_id DROP NOT NULL"))
+        await conn.execute(sa_text("ALTER TABLE IF EXISTS payments ALTER COLUMN customer_id DROP NOT NULL"))
         await conn.execute(sa_text("""
             CREATE OR REPLACE FUNCTION prevent_payment_history_deletion()
             RETURNS trigger LANGUAGE plpgsql AS $$
@@ -2671,9 +2671,9 @@ async def run_payment_history_retention_migrations():
             await conn.execute(sa_text(f"""
                 DO $$
                 BEGIN
-                    IF NOT EXISTS (
+                    IF to_regclass('{table}') IS NOT NULL AND NOT EXISTS (
                         SELECT 1 FROM pg_trigger
-                        WHERE tgrelid = '{table}'::regclass
+                        WHERE tgrelid = to_regclass('{table}')
                           AND tgname = 'preserve_payment_history'
                     ) THEN
                         CREATE TRIGGER preserve_payment_history

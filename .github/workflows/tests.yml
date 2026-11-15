@@ -77,6 +77,10 @@ jobs:
         if: always()
         run: python scripts/ci_test_summary.py pytest-report.xml >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Annotate failed candidate tests
+        if: failure() && startsWith(github.ref, 'refs/heads/codex/qa/')
+        run: python scripts/ci_test_summary.py pytest-report.xml --annotations
+
       - name: Upload test report
         if: always()
         uses: actions/upload-artifact@v4
