@@ -2124,6 +2124,7 @@ class AccessCredential(Base):
     )
 
     bound_mac_address = Column(String(50), nullable=True)
+    additional_bound_macs = Column(JSON, nullable=True)
     bound_at = Column(DateTime, nullable=True)
     last_login_at = Column(DateTime, nullable=True)
     last_seen_at = Column(DateTime, nullable=True)

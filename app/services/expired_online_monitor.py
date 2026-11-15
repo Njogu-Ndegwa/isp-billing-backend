@@ -46,7 +46,8 @@ _CANDIDATES = text("""
       AND NOT EXISTS (
           SELECT 1 FROM access_credentials ac
           WHERE ac.router_id = c.router_id
-            AND upper(ac.bound_mac_address) = upper(c.mac_address)
+            AND (upper(ac.bound_mac_address) = upper(c.mac_address)
+                 OR CAST(ac.additional_bound_macs AS jsonb) ? upper(c.mac_address))
             AND ac.status = 'active' AND ac.revoked_at IS NULL
       )
     ORDER BY r.id, c.id
@@ -153,7 +154,8 @@ async def _run_scan() -> None:
                       AND NOT EXISTS (
                           SELECT 1 FROM access_credentials ac
                           WHERE ac.router_id = c.router_id
-                            AND upper(ac.bound_mac_address) = upper(c.mac_address)
+                            AND (upper(ac.bound_mac_address) = upper(c.mac_address)
+                                 OR CAST(ac.additional_bound_macs AS jsonb) ? upper(c.mac_address))
                             AND ac.status = 'active' AND ac.revoked_at IS NULL
                       )
                 """))

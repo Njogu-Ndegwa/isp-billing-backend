@@ -1,5 +1,6 @@
 {
  "access_credentials": [
+  "additional_bound_macs",
   "bound_at",
   "bound_mac_address",
   "created_at",

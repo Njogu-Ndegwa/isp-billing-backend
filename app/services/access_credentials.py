@@ -21,6 +21,7 @@ import re
 import secrets
 import string
 import time
+from weakref import WeakValueDictionary
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Optional, Union
@@ -35,6 +36,39 @@ logger = logging.getLogger(__name__)
 
 CMD_DELAY = 0.05
 USER_COMMENT_PREFIX = "ACCESS_CRED"
+SHARED_ACCESS_OWNER_IDS = frozenset({775})
+_credential_locks = WeakValueDictionary()
+
+
+def credential_lock(cred_id: int) -> asyncio.Lock:
+    lock = _credential_locks.get(cred_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _credential_locks[cred_id] = lock
+    return lock
+
+
+def credential_device_limit(cred: AccessCredential, router: Router) -> int:
+    if (getattr(cred, "user_id", None) in SHARED_ACCESS_OWNER_IDS
+            and getattr(router, "user_id", None) == cred.user_id
+            and router.auth_method == RouterAuthMethod.DIRECT_API):
+        return 2
+    return 1
+
+
+def bound_credential_macs(cred: AccessCredential) -> list[str]:
+    return list(dict.fromkeys(
+        normalize_mac_address(mac)
+        for mac in [cred.bound_mac_address, *(getattr(cred, "additional_bound_macs", None) or [])]
+        if mac
+    ))
+
+
+def set_bound_credential_macs(cred: AccessCredential, macs: list[str]) -> None:
+    cred.bound_mac_address = macs[0] if macs else None
+    cred.additional_bound_macs = macs[1:] or None
+    if not macs:
+        cred.bound_at = None
 
 
 # ---------------------------------------------------------------------------
@@ -465,18 +499,36 @@ def _deprovision_direct_api_sync(router_info: dict, payload: dict) -> dict:
                         run("/queue/simple/remove", {"numbers": qid})
                         removed["queues"] += 1
 
-        if bound_mac:
-            wanted = normalize_mac_address(bound_mac)
+        if bound_mac or payload.get("all_bindings"):
+            wanted = normalize_mac_address(bound_mac) if bound_mac else None
+            prefix = f"{USER_COMMENT_PREFIX}|cred:{cred_id}|"
+            own_macs = set(payload.get("bound_macs", ()))
+            other_macs = set()
             bindings = run("/ip/hotspot/ip-binding/print")
             if bindings.get("success") and bindings.get("data"):
                 for b in bindings["data"]:
                     bm = b.get("mac-address", "")
-                    if bm and normalize_mac_address(bm) == wanted:
+                    if (payload.get("all_bindings") and b.get("comment", "").startswith(prefix)) or (
+                        not payload.get("all_bindings") and bm and normalize_mac_address(bm) == wanted
+                    ):
+                        if bm:
+                            own_macs.add(normalize_mac_address(bm))
                         bid = b.get(".id")
                         if bid:
                             time.sleep(CMD_DELAY)
                             run("/ip/hotspot/ip-binding/remove", {"numbers": bid})
                             removed["bindings"] += 1
+                    elif bm:
+                        other_macs.add(normalize_mac_address(bm))
+            # Remove cached access as well as the binding. Leave devices with
+            # a separate entitlement alone; the router can keep them online.
+            if payload.get("all_bindings") and bindings.get("success") and own_macs - other_macs:
+                hosts = run("/ip/hotspot/host/print")
+                for host in hosts.get("data") or []:
+                    if (host.get("mac-address") and host.get(".id")
+                            and normalize_mac_address(host["mac-address"]) in own_macs - other_macs
+                            and str(host.get("bypassed", "")).lower() == "true"):
+                        run("/ip/hotspot/host/remove", {"numbers": host[".id"]})
 
         if errors:
             return {
@@ -534,6 +586,8 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
         #    the round-trip cost shows up directly in user-perceived login
         #    latency. One scan is enough.
         bindings_resp = api.send_command("/ip/hotspot/ip-binding/print")
+        if payload.get("owned_only") and not bindings_resp.get("success"):
+            return {"error": "bindings_unavailable", "message": "Could not verify existing router bindings"}
         existing_id = None
         old_binding_id = None
         if bindings_resp.get("success") and bindings_resp.get("data"):
@@ -543,6 +597,8 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
                     continue
                 bm = normalize_mac_address(bm_raw)
                 if bm == mac_address and existing_id is None:
+                    if payload.get("owned_only") and b.get("comment") != comment:
+                        return {"error": "binding_conflict", "message": "The device has a different router binding"}
                     existing_id = b.get(".id")
                 elif wanted_old and bm == wanted_old and old_binding_id is None:
                     old_binding_id = b.get(".id")
@@ -561,14 +617,21 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
         #    Every address behind the MAC is collected, not just the first:
         #    behind a MAC-NAT repeater several devices share the bound MAC.
         hosts_resp = api.send_command("/ip/hotspot/host/print")
+        host_rows = hosts_resp.get("data") if hosts_resp.get("success") else None
         client_ips = host_ips_for_mac(
-            hosts_resp.get("data") if hosts_resp.get("success") else None, mac_address)
+            host_rows, mac_address)
+        other_macs = payload.get("other_bound_macs") or []
 
-        if not client_ips:
+        arp_rows = None
+        if not client_ips or any(not host_ips_for_mac(host_rows, mac) for mac in other_macs):
             arp_resp = api.send_command("/ip/arp/print")
-            client_ips = host_ips_for_mac(
-                arp_resp.get("data") if arp_resp.get("success") else None, mac_address)
+            arp_rows = arp_resp.get("data") if arp_resp.get("success") else None
+            client_ips = client_ips or host_ips_for_mac(arp_rows, mac_address)
         client_ip = client_ips[0] if client_ips else None
+        all_ips = client_ips + [
+            ip for mac in other_macs
+            for ip in (host_ips_for_mac(host_rows, mac) or host_ips_for_mac(arp_rows, mac))
+        ]
 
         if old_binding_id:
             time.sleep(CMD_DELAY)
@@ -602,7 +665,7 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
         #    If the IP is unknown here, the access-credential reaper creates
         #    the queue on its next pass (see ensure_credential_queue_sync).
         queue_outcome = None
-        if rate_limit and client_ip:
+        if rate_limit and all_ips:
             queue_name = queue_name_for_credential(cred_id)
             queues_resp = api.send_command("/queue/simple/print")
             existing_queue = None
@@ -615,7 +678,7 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
                 time.sleep(CMD_DELAY)
                 queue_outcome = ensure_credential_queue_sync(
                     api, cred_id=cred_id, username=username, rate_limit=rate_limit,
-                    client_ip=client_ips, existing_queue=existing_queue,
+                    client_ip=all_ips, existing_queue=existing_queue,
                 )
         elif rate_limit:
             logger.warning(
@@ -732,15 +795,36 @@ def _release_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
         removed = {"bindings": 0, "queues": 0}
 
         bindings = api.send_command("/ip/hotspot/ip-binding/print")
+        if payload.get("owned_only") and not bindings.get("success"):
+            return {"error": "bindings_unavailable"}
+        other_binding = False
         if bindings.get("success") and bindings.get("data"):
             for b in bindings["data"]:
                 bm = b.get("mac-address", "")
                 if bm and normalize_mac_address(bm) == mac_address:
+                    if payload.get("owned_only") and not b.get("comment", "").startswith(
+                        f"{USER_COMMENT_PREFIX}|cred:{cred_id}|"
+                    ):
+                        other_binding = True
+                        continue
                     bid = b.get(".id")
                     if bid:
                         time.sleep(CMD_DELAY)
-                        api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": bid})
+                        result = api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": bid})
+                        if payload.get("owned_only") and not result.get("success"):
+                            return {"error": "binding_remove_failed"}
                         removed["bindings"] += 1
+
+        if payload.get("owned_only") and not other_binding:
+            hosts = api.send_command("/ip/hotspot/host/print")
+            if not hosts.get("success"):
+                return {"error": "hosts_unavailable"}
+            for host in hosts.get("data") or []:
+                if (host.get("mac-address") and normalize_mac_address(host["mac-address"]) == mac_address
+                        and str(host.get("bypassed", "")).lower() == "true" and host.get(".id")):
+                    result = api.send_command("/ip/hotspot/host/remove", {"numbers": host[".id"]})
+                    if not result.get("success"):
+                        return {"error": "host_remove_failed"}
 
         queue_name = queue_name_for_credential(cred_id)
         queues = api.send_command("/queue/simple/print")
@@ -758,8 +842,8 @@ def _release_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
         api.disconnect()
 
 
-def _live_usage_direct_api_sync(router_info: dict, mac_address: str, queue_name: str) -> dict:
-    """One-shot live-usage read: host entry for the bound MAC + matching simple-queue."""
+def _live_usage_direct_api_sync(router_info: dict, mac_addresses: list[str], queue_name: str) -> dict:
+    """One-shot live-usage read: the bound devices and their shared simple queue."""
     api = MikroTikAPI(
         router_info["ip"], router_info["username"],
         router_info["password"], router_info["port"],
@@ -768,21 +852,23 @@ def _live_usage_direct_api_sync(router_info: dict, mac_address: str, queue_name:
     if not api.connect():
         return {"error": "connection_failed", "message": api.last_connect_error}
     try:
-        wanted = normalize_mac_address(mac_address)
+        wanted = set(mac_addresses)
         info: Dict[str, Any] = {"online": False}
 
         hosts = api.send_command("/ip/hotspot/host/print")
         if hosts.get("success") and hosts.get("data"):
             for h in hosts["data"]:
                 hm = h.get("mac-address", "")
-                if hm and normalize_mac_address(hm) == wanted:
-                    info["online"] = True
-                    info["bound_ip_address"] = h.get("address") or h.get("to-address")
-                    info["uptime"] = h.get("uptime")
-                    info["idle_time"] = h.get("idle-time")
-                    info["bytes_in"] = _safe_int(h.get("bytes-in"))
-                    info["bytes_out"] = _safe_int(h.get("bytes-out"))
-                    break
+                mac = normalize_mac_address(hm) if hm else None
+                if mac in wanted:
+                    wanted.remove(mac)
+                    if not info["online"]:
+                        info["online"] = True
+                        info["bound_ip_address"] = h.get("address") or h.get("to-address")
+                        info["uptime"] = h.get("uptime")
+                        info["idle_time"] = h.get("idle-time")
+                    info["bytes_in"] = info.get("bytes_in", 0) + _safe_int(h.get("bytes-in"))
+                    info["bytes_out"] = info.get("bytes_out", 0) + _safe_int(h.get("bytes-out"))
 
         queues = api.send_command("/queue/simple/print")
         if queues.get("success") and queues.get("data"):
@@ -899,6 +985,9 @@ async def deprovision_credential(db: AsyncSession, cred: AccessCredential, route
         "username": cred.username,
         "bound_mac_address": cred.bound_mac_address,
     }
+    if credential_device_limit(cred, router) > 1:
+        payload["all_bindings"] = True
+        payload["bound_macs"] = bound_credential_macs(cred)
     await db.commit()
     return await asyncio.to_thread(_deprovision_direct_api_sync, _router_info(router), payload)
 
@@ -927,6 +1016,10 @@ async def bind_mac_for_login(
         "rate_limit": cred.rate_limit or "",
         "previous_mac_address": cred.bound_mac_address,
     }
+    if credential_device_limit(cred, router) > 1:
+        payload["owned_only"] = True
+        payload["previous_mac_address"] = None
+        payload["other_bound_macs"] = [mac for mac in bound_credential_macs(cred) if mac != mac_address]
     return await asyncio.to_thread(_bind_mac_direct_api_sync, _router_info(router), payload)
 
 
@@ -1003,6 +1096,8 @@ async def release_mac(cred: AccessCredential, router: Router, mac_address: str) 
         "cred_id": cred.id,
         "mac_address": mac_address,
     }
+    if credential_device_limit(cred, router) > 1:
+        payload["owned_only"] = True
     return await asyncio.to_thread(_release_mac_direct_api_sync, _router_info(router), payload)
 
 
@@ -1016,7 +1111,7 @@ async def fetch_live_usage(cred: AccessCredential, router: Router) -> dict:
         return await asyncio.to_thread(
             _live_usage_direct_api_sync,
             _router_info(router),
-            cred.bound_mac_address,
+            bound_credential_macs(cred),
             queue_name_for_credential(cred.id),
         )
     except Exception as e:
@@ -1040,6 +1135,7 @@ def serialize_credential(
         "label": cred.label,
         "status": cred.status.value,
         "bound_mac_address": cred.bound_mac_address,
+        "bound_device_count": len(bound_credential_macs(cred)),
         "bound_at": cred.bound_at.isoformat() if cred.bound_at else None,
         "last_login_at": cred.last_login_at.isoformat() if cred.last_login_at else None,
         "last_seen_at": cred.last_seen_at.isoformat() if cred.last_seen_at else None,

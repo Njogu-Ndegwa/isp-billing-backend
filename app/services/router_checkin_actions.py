@@ -273,6 +273,12 @@ def credential_line(cred: AccessCredential) -> Optional[str]:
         return format_credential_add_line(
             cred.id, cred.user_id, router_rate(cred.rate_limit), cred.username, cred.password or "")
     if cred.router_sync in ("remove", "delete"):
+        from app.services.access_credentials import SHARED_ACCESS_OWNER_IDS
+
+        # The installed check-in applier can remove one MAC per credential
+        # action. Let the API retry remove all tagged bindings before ACK.
+        if cred.user_id in SHARED_ACCESS_OWNER_IDS:
+            return None
         return format_credential_remove_line(cred.id, cred.router_sync_mac, cred.username)
     return None
 

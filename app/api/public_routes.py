@@ -990,15 +990,19 @@ async def access_credential_login_public(
             "mac_address": "AA:BB:CC:DD:EE:FF"
         }
 
-    Returns 401 on bad credential / revoked credential, 409 when the credential
-    is currently bound to a different MAC. On success the requester's MAC is
+    Returns 401 for invalid or revoked credentials and 409 when all device
+    slots are occupied. On success the requester's MAC is
     added as a ``bypassed`` IP-binding on the router (with a per-MAC simple
     queue carrying the credential's rate-limit), and the credential's
-    ``bound_mac_address`` is updated.
+    bound MAC list is updated.
     """
     from app.db.models import AccessCredential, AccessCredStatus
     from app.services.access_credentials import (
         bind_mac_for_login,
+        bound_credential_macs,
+        credential_device_limit,
+        credential_lock,
+        set_bound_credential_macs,
         kick_mac_async,
         router_info_for_kick,
     )
@@ -1033,81 +1037,97 @@ async def access_credential_login_public(
     )
     cred = (await db.execute(cred_stmt)).scalar_one_or_none()
 
-    # Constant-ish responses to avoid leaking which credentials exist
     if not cred or cred.password != password:
         raise HTTPException(status_code=401, detail="Invalid username or password")
-    if cred.status != AccessCredStatus.ACTIVE:
-        raise HTTPException(status_code=401, detail="Credential is revoked")
-
-    # Single-concurrent enforcement: same MAC is idempotent, different MAC is rejected.
-    existing_mac = (cred.bound_mac_address or "").upper() or None
-    if existing_mac and normalize_mac_address(existing_mac) != normalized_mac:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "credential_in_use",
-                "message": "This credential is currently in use on another device",
-            },
-        )
-
-    router_obj = await db.get(Router, rid)
-    if not router_obj:
-        raise HTTPException(status_code=404, detail="Router not found")
-
-    logger.info(
-        f"[ACCESS-LOGIN] cred={cred.id} user={username} router={rid} mac={normalized_mac} -> binding"
-    )
-    await db.commit()
-    bind_result = await bind_mac_for_login(cred, router_obj, normalized_mac)
-    if bind_result.get("error"):
-        logger.warning(
-            f"[ACCESS-LOGIN] binding FAILED cred={cred.id} mac={normalized_mac}: "
-            f"{bind_result.get('message')}"
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=f"Router binding failed: {bind_result.get('message', 'unknown error')}",
-        )
-
-    now = datetime.utcnow()
-    cred.bound_mac_address = normalized_mac
-    cred.bound_at = now
-    cred.last_login_at = now
-    cred.last_seen_at = now
-    cred.last_seen_ip = bind_result.get("client_ip")
+    credential_id = cred.id
     await db.commit()
 
-    # Force MikroTik to re-evaluate the device's hotspot state against the
-    # bypass binding we just installed. MUST run after the response is sent:
-    # the kick removes the device's /ip/hotspot/host row, which drops the
-    # conntrack entry that's NATing this very HTTP response back to the
-    # phone -- doing it inline here would deliver a "network error" instead
-    # of the 200 below. We snapshot the router into a plain dict because the
-    # DB session is closed by the time the BackgroundTask runs.
-    is_radius_router = router_obj.auth_method == RouterAuthMethod.RADIUS
-    if not is_radius_router:
-        background_tasks.add_task(
-            kick_mac_async,
-            router_info_for_kick(router_obj),
-            normalized_mac,
-        )
-        logger.info(
-            f"[ACCESS-LOGIN] cred={cred.id} mac={normalized_mac} kick scheduled (post-response)"
-        )
-    else:
-        logger.info(
-            f"[ACCESS-LOGIN] cred={cred.id} mac={normalized_mac} radius router - kick skipped"
-        )
+    async with credential_lock(credential_id):
+        cred = await db.get(AccessCredential, credential_id, populate_existing=True)
+        if not cred or cred.password != password:
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+        if cred.status != AccessCredStatus.ACTIVE:
+            raise HTTPException(status_code=401, detail="Credential is revoked")
 
-    return {
-        "success": True,
-        "username": cred.username,
-        "rate_limit": cred.rate_limit,
-        "router_id": rid,
-        "mac_address": normalized_mac,
-        "client_ip": bind_result.get("client_ip"),
-        "message": "You're online. Enjoy your WiFi.",
-    }
+        router_obj = await db.get(Router, rid)
+        if not router_obj:
+            raise HTTPException(status_code=404, detail="Router not found")
+        macs = bound_credential_macs(cred)
+        device_limit = credential_device_limit(cred, router_obj)
+        new_device = normalized_mac not in macs
+        if new_device and len(macs) >= device_limit:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "credential_in_use",
+                    "message": "This credential has reached its device limit",
+                },
+            )
+
+        logger.info(
+            f"[ACCESS-LOGIN] cred={cred.id} user={username} router={rid} mac={normalized_mac} -> binding"
+        )
+        if new_device and device_limit > 1:
+            # Reserve the slot before RouterOS access. After a process crash or
+            # an uncertain write, the reaper can still reconcile the device.
+            set_bound_credential_macs(cred, [*macs, normalized_mac])
+            cred.bound_at = datetime.utcnow()
+        await db.commit()
+        bind_result = await bind_mac_for_login(cred, router_obj, normalized_mac)
+        if bind_result.get("error"):
+            if new_device and device_limit > 1 and bind_result["error"] in {
+                "connection_failed", "binding_conflict", "bindings_unavailable",
+            }:
+                set_bound_credential_macs(cred, macs)
+                await db.commit()
+            logger.warning(
+                f"[ACCESS-LOGIN] binding FAILED cred={cred.id} mac={normalized_mac}: "
+                f"{bind_result.get('message')}"
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Router binding failed: {bind_result.get('message', 'unknown error')}",
+            )
+
+        now = datetime.utcnow()
+        set_bound_credential_macs(cred, list(dict.fromkeys([*macs, normalized_mac])))
+        cred.bound_at = now
+        cred.last_login_at = now
+        cred.last_seen_at = now
+        cred.last_seen_ip = bind_result.get("client_ip")
+        await db.commit()
+
+        # Force MikroTik to re-evaluate the device's hotspot state against the
+        # bypass binding we just installed. MUST run after the response is sent:
+        # the kick removes the device's /ip/hotspot/host row, which drops the
+        # conntrack entry that's NATing this very HTTP response back to the
+        # phone -- doing it inline here would deliver a "network error" instead
+        # of the 200 below. We snapshot the router into a plain dict because the
+        # DB session is closed by the time the BackgroundTask runs.
+        is_radius_router = router_obj.auth_method == RouterAuthMethod.RADIUS
+        if not is_radius_router:
+            background_tasks.add_task(
+                kick_mac_async,
+                router_info_for_kick(router_obj),
+                normalized_mac,
+            )
+            logger.info(
+                f"[ACCESS-LOGIN] cred={cred.id} mac={normalized_mac} kick scheduled (post-response)"
+            )
+        else:
+            logger.info(
+                f"[ACCESS-LOGIN] cred={cred.id} mac={normalized_mac} radius router - kick skipped"
+            )
+
+        return {
+            "success": True,
+            "username": cred.username,
+            "rate_limit": cred.rate_limit,
+            "router_id": rid,
+            "mac_address": normalized_mac,
+            "client_ip": bind_result.get("client_ip"),
+            "message": "You're online. Enjoy your WiFi.",
+        }
 
 
 @router.get("/api/public/voucher/verify/{code}")
