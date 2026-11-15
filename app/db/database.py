@@ -31,6 +31,13 @@ def connection_server_settings() -> dict[str, str]:
     server_settings = {
         "idle_in_transaction_session_timeout": str(settings.DB_IDLE_TX_TIMEOUT_MS),
         "lock_timeout": str(settings.DB_LOCK_TIMEOUT_MS),
+        # No LLVM JIT for app queries. Postgres JIT-compiles any statement whose
+        # estimated cost tops jit_above_cost (100k), and a correlated EXISTS
+        # inflates estimates far past that: the transactions list spent 0.4-1.4 s
+        # compiling queries that then ran in 13 ms (2.4 s -> 0.75 s end to end
+        # with JIT off; nothing else measured slower). Our queries are short
+        # OLTP reads where compile time never pays back.
+        "jit": "off",
     }
     if settings.SHADOW_MODE:
         # Database enforcement is the final backstop for a GET endpoint or
