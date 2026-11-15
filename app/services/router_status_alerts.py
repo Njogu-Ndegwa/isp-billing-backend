@@ -4,7 +4,7 @@
 One flag (``routers.status_alerts_enabled``) covers both directions:
 
 - Offline: a scheduler scan (``scan_and_notify_offline_routers``) notices routers
-  that have been confirmed offline for at least MIN_OUTAGE_FOR_ALERTS and sends
+  that have been confirmed offline and meet their configured delay and sends
   one "went offline" notice per outage. A single failed probe is NOT trusted —
   the debounce is the whole point, since availability is recorded by ~40 code
   paths and one failed connect can be a tunnel blip rather than an outage.
@@ -39,8 +39,8 @@ Noise control:
 - Per-reseller SMS cap: at most ``MAX_STATUS_ALERT_SMS_PER_OWNER_PER_DAY`` status
   SMS per reseller per local day across all their routers; beyond that the
   alert is inbox-only.
-- ``MIN_OUTAGE_FOR_ALERTS``: outages shorter than this produce no message in
-  either direction.
+- The per-router delay defaults to 15 minutes. Short outages produce no
+  message in either direction.
 - ``MAX_OUTAGE_AGE_FOR_ALERTS``: "went offline" is only announced while the
   outage is recent; ancient outages (zombie rows from re-registrations,
   decommissioned routers) stay silent.
@@ -54,9 +54,9 @@ Noise control:
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Literal, Optional, get_args
 
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 
 from app.config import settings
 from app.core.local_time import local_midnight_utc, local_now
@@ -78,7 +78,9 @@ logger = logging.getLogger(__name__)
 
 ALERT_SMS_CATEGORY = "router_status_alert"
 
-MIN_OUTAGE_FOR_ALERTS = timedelta(minutes=15)
+AlertDelayMinutes = Literal[5, 10, 15, 30, 60]
+DEFAULT_ALERT_DELAY_MINUTES = 15
+MIN_OUTAGE_FOR_ALERTS = timedelta(minutes=DEFAULT_ALERT_DELAY_MINUTES)
 NOTIFY_COOLDOWN = timedelta(minutes=30)
 # Only announce outages that BEGAN recently. An outage older than this is not
 # news — the owner already knows, or the row is a zombie left behind by a
@@ -167,7 +169,7 @@ def should_consider_recovery_notification(router: Router, checked_at: datetime) 
     """Cheap pre-check, run inside the availability session BEFORE the status flip.
 
     True only for a genuine offline -> online transition on an opted-in router
-    where the outage lasted at least MIN_OUTAGE_FOR_ALERTS (a never-seen-online
+    where the outage met its configured delay (a never-seen-online
     router coming up for the first time also counts). The cooldown is NOT checked
     here — it is claimed atomically in send_router_recovery_notification.
     """
@@ -176,9 +178,13 @@ def should_consider_recovery_notification(router: Router, checked_at: datetime) 
     if router.last_status is not False:
         return False
     last_online = getattr(router, "last_online_at", None)
-    if last_online is not None and (checked_at - last_online) < MIN_OUTAGE_FOR_ALERTS:
-        return False
-    return True
+    if last_online is None:
+        return True
+    offline_notice = getattr(router, "offline_notified_at", None)
+    if offline_notice is not None and last_online <= offline_notice <= checked_at:
+        return True
+    delay = getattr(router, "status_alert_delay_minutes", None) or DEFAULT_ALERT_DELAY_MINUTES
+    return (checked_at - last_online) >= timedelta(minutes=delay)
 
 
 def _humanize_duration(delta: timedelta) -> str:
@@ -466,13 +472,18 @@ async def _outage_alerts_from(db) -> Optional[datetime]:
 def _offline_candidate_filters(now: datetime, alerts_from: Optional[datetime] = None):
     """WHERE clauses shared by the scan's SELECT and the per-router claim UPDATE."""
     extra = (Router.last_online_at >= alerts_from,) if alerts_from is not None else ()
+    alert_cutoff = case(
+        {minutes: now - timedelta(minutes=minutes) for minutes in get_args(AlertDelayMinutes)},
+        value=Router.status_alert_delay_minutes,
+        else_=now - MIN_OUTAGE_FOR_ALERTS,
+    )
     return extra + (
         Router.status_alerts_enabled.is_(True),
         Router.last_status.is_(False),
         Router.last_checked_at.isnot(None),
         Router.last_checked_at >= now - OFFLINE_STATUS_FRESH_WINDOW,
         Router.last_online_at.isnot(None),
-        Router.last_online_at <= now - MIN_OUTAGE_FOR_ALERTS,
+        Router.last_online_at <= alert_cutoff,
         Router.last_online_at >= now - MAX_OUTAGE_AGE_FOR_ALERTS,
         (Router.offline_notified_at.is_(None))
         | (

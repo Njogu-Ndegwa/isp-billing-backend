@@ -287,6 +287,55 @@ async def test_offline_scan_skips_stale_status(db):
     assert await _inbox_messages(db, reseller.id) == []
 
 
+async def test_alert_settings_update_delay_and_toggle_independently(db, monkeypatch):
+    from app.api import router_management
+
+    _, owner, router = await _setup_offline_router(db, alerts=False)
+
+    async def authenticate(token, session):
+        return owner
+
+    monkeypatch.setattr(router_management, "get_current_user", authenticate)
+    change = await router_management.set_router_status_alerts(
+        router.id, router_management.RouterStatusAlertsRequest(delay_minutes=5),
+        db=db, token="test",
+    )
+    assert change["status_alert_delay_minutes"] == 5
+    assert change["status_alerts_enabled"] is False
+
+    change = await router_management.set_router_status_alerts(
+        router.id, router_management.RouterStatusAlertsRequest(enabled=True),
+        db=db, token="test",
+    )
+    assert change["status_alert_delay_minutes"] == 5
+    assert change["status_alerts_enabled"] is True
+
+
+async def test_router_specific_delay_controls_claim_and_preserves_recovery(db):
+    _, owner, router = await _setup_offline_router(db, offline_for=timedelta(minutes=6))
+    default_router = await make_router(
+        db, owner, last_status=False, last_online_at=router.last_online_at,
+        last_checked_at=router.last_checked_at, status_alerts_enabled=True,
+    )
+    router.status_alert_delay_minutes = 5
+    await db.commit()
+
+    assert await scan_and_notify_offline_routers() == 1
+    messages = await _inbox_messages(db, owner.id)
+    assert len(messages) == 1
+    assert router.name in messages[0].subject
+    assert default_router.name not in messages[0].subject
+
+    await db.refresh(router)
+    router.status_alert_delay_minutes = 30
+    await db.commit()
+    await record_router_availability(db, router.id, True, "test")
+    await record_router_availability(db, default_router.id, True, "test")
+    messages = await _inbox_messages(db, owner.id)
+    assert len(messages) == 2
+    assert "back online" in messages[-1].subject.lower()
+
+
 async def test_full_outage_and_recovery_pair(db):
     _, reseller, router = await _setup_offline_router(db, offline_for=timedelta(minutes=30))
 

@@ -1117,6 +1117,7 @@
   "radius_secret",
   "router_agent_enabled",
   "snmp_enabled",
+  "status_alert_delay_minutes",
   "status_alerts_day",
   "status_alerts_enabled",
   "status_alerts_sent_today",

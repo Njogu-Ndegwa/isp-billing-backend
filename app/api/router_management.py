@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import delete as sql_delete, inspect, or_, select, update, func, case, text
 from sqlalchemy.orm import selectinload
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from typing import Optional, List
 from datetime import datetime, timedelta
 import httpx
@@ -33,6 +33,7 @@ from app.db.models import (
 from app.services.auth import verify_token, get_current_user
 from app.services.markets import get_market
 from app.services.subscription import enforce_active_subscription
+from app.services.router_status_alerts import AlertDelayMinutes, DEFAULT_ALERT_DELAY_MINUTES
 from app.services.router_availability import (
     build_router_status,
     public_contact_times,
@@ -170,7 +171,14 @@ class RouterIdentityUpdate(BaseModel):
 
 
 class RouterStatusAlertsRequest(BaseModel):
-    enabled: bool
+    enabled: Optional[bool] = None
+    delay_minutes: Optional[AlertDelayMinutes] = None
+
+    @model_validator(mode="after")
+    def require_change(self):
+        if self.enabled is None and self.delay_minutes is None:
+            raise ValueError("Set enabled, delay_minutes, or both")
+        return self
 
 
 class InsuranceWireGuardRequest(BaseModel):
@@ -1388,6 +1396,7 @@ async def get_routers(
             "emergency_message": getattr(router_obj, "emergency_message", None),
             "hotspot_sharing_blocked": getattr(router_obj, "hotspot_sharing_blocked", False),
             "status_alerts_enabled": getattr(router_obj, "status_alerts_enabled", False),
+            "status_alert_delay_minutes": router_obj.status_alert_delay_minutes or DEFAULT_ALERT_DELAY_MINUTES,
             "pppoe_expired_redirect": bool(getattr(router_obj, "pppoe_expired_redirect", False)),
             "pppoe_lock_new_customers": bool(getattr(router_obj, "pppoe_lock_new_customers", False)),
             "lb_enabled": bool(router_obj.lb_enabled),
@@ -2042,6 +2051,7 @@ async def update_router(
             "emergency_message": router_obj.emergency_message,
             "hotspot_sharing_blocked": getattr(router_obj, "hotspot_sharing_blocked", False),
             "status_alerts_enabled": getattr(router_obj, "status_alerts_enabled", False),
+            "status_alert_delay_minutes": router_obj.status_alert_delay_minutes or DEFAULT_ALERT_DELAY_MINUTES,
             "pppoe_expired_redirect": bool(getattr(router_obj, "pppoe_expired_redirect", False)),
             "pppoe_lock_new_customers": bool(getattr(router_obj, "pppoe_lock_new_customers", False)),
             "updated_at": datetime.utcnow().isoformat()
@@ -2062,18 +2072,21 @@ async def set_router_status_alerts(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
-    """Toggle the opt-in offline/back-online inbox alerts for one router."""
+    """Update offline/back-online alerts for one router."""
     user = await get_current_user(token, db)
     enforce_active_subscription(user)
     router_obj = await _get_owned_router(db, router_id, user.id)
-    router_obj.status_alerts_enabled = request.enabled
+    if request.enabled is not None:
+        router_obj.status_alerts_enabled = request.enabled
+    if request.delay_minutes is not None:
+        router_obj.status_alert_delay_minutes = request.delay_minutes
     await db.commit()
     return {
         "router_id": router_obj.id,
         "status_alerts_enabled": router_obj.status_alerts_enabled,
-        "message": (
-            "Status alerts enabled" if request.enabled
-            else "Status alerts disabled"
+        "status_alert_delay_minutes": router_obj.status_alert_delay_minutes,
+        "message": "Status alerts updated" if request.enabled is None else (
+            "Status alerts enabled" if request.enabled else "Status alerts disabled"
         ),
     }
 

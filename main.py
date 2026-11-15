@@ -3079,6 +3079,7 @@ async def run_router_status_alert_migrations():
         await conn.execute(sa_text("""
             ALTER TABLE routers
             ADD COLUMN IF NOT EXISTS status_alerts_enabled BOOLEAN NOT NULL DEFAULT true,
+            ADD COLUMN IF NOT EXISTS status_alert_delay_minutes INTEGER NOT NULL DEFAULT 15,
             ADD COLUMN IF NOT EXISTS online_notified_at TIMESTAMP NULL,
             ADD COLUMN IF NOT EXISTS offline_notified_at TIMESTAMP NULL
         """))
@@ -4294,7 +4295,7 @@ async def startup_event():
     )
     scheduler.add_job(
         scan_and_notify_offline_routers,
-        trigger=IntervalTrigger(seconds=293),
+        trigger=IntervalTrigger(seconds=60),
         id='router_offline_alerts',
         name='Send opt-in router offline alerts (DB-only, debounced)',
         replace_existing=True,

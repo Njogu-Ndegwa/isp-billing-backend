@@ -676,6 +676,7 @@ class Router(Base):
     # online. The *_notified_at stamps throttle repeats (and the offline stamp marks
     # the current outage as announced) so a flapping router cannot flood the inbox.
     status_alerts_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
+    status_alert_delay_minutes = Column(Integer, nullable=False, default=15, server_default="15")
     online_notified_at = Column(DateTime, nullable=True)
     offline_notified_at = Column(DateTime, nullable=True)
     # Anti-spam daily budget for status alerts (router_status_alerts): local
