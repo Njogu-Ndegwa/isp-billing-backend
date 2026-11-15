@@ -689,6 +689,11 @@ async def test_second_ap_action_gets_409(client, db, patch_router):
         headers=headers(_owner_token(owner)), json={"confirm": True},
     )
     assert resp.status_code == 409
+    status = await client.get(
+        f"/api/routers/{router.id}/access-points/{AP_MAC}/status",
+        headers=headers(_owner_token(owner)),
+    )
+    assert status.status_code == 409
     ap_control.release_claim(held)
     again = await client.post(
         f"/api/routers/{router.id}/access-points/{AP_MAC}/reboot",

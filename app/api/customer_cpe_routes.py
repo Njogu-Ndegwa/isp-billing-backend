@@ -350,11 +350,14 @@ async def cpe_status(
     token: str = Depends(verify_token),
 ):
     ctx = await _prepare_action(db, customer_id, token)
-    result = await run_with_guard(
-        ctx["router_id"], cpe_control.read_cpe_status_sync,
-        ctx["router_info"], ctx["cred"], ctx["username"], ctx["port"],
-        acquire_timeout_seconds=5, timeout_seconds=_CPE_READ_TIMEOUT,
-    )
+    try:
+        result = await ap_control.run_claimed_action(
+            ctx["router_id"], cpe_control.read_cpe_status_sync,
+            ctx["router_info"], ctx["cred"], ctx["username"], ctx["port"],
+            run_guard=run_with_guard, timeout_seconds=_CPE_READ_TIMEOUT,
+        )
+    except ap_control.ApActionBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if result.get("error") == "connect_failed":
         await record_router_availability(db, ctx["router_id"], False, "cpe_status")
     await _persist_outcome(customer_id, cpe_control.ACTION_STATUS, result)

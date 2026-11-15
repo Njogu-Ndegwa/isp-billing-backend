@@ -48,3 +48,9 @@ The firmware adapter now probes `getstok`, uses the challenge digest and capture
 At 19:59:42 EAT the candidate read firmware `V12.01.01.59_multi`, mode `router`, and the live session address/uptime through MikroTik 563 in 6.08 seconds. At 19:59:49 the reboot was accepted (7.42-second request). The observer saw no PPPoE session at 19:59:52 and a new session at 20:00:11 with uptime 0s, 29.1 seconds after request start. This was the CPE service candidate loaded only into an isolated Python process, not a deployment or production API pass.
 
 The focused AP/CPE, transport, interactive mutation, port, and PPPoE redirect tests passed: 170 tests, including 23 wire-level V12 regression cases. Session-discipline guard passed. Physical model remains unknown because this status response does not expose it; no model is inferred from firmware.
+
+## Production persistence failure and follow-up
+
+PR 361 deployed as `3ffc498` at 20:39 EAT. At 20:40:41, the dashboard GET `/api/customers/53867/cpe/status` returned HTTP 500 `Internal server error`. The device login/status read completed, but `_persist_outcome` failed at `customer_cpe_routes.py:187`: `StringDataRightTruncationError: value too long for type character varying(16)`. The new login-method identifier `tenda_v12_challenge` had 19 characters; both credential tables limit it to 16. The transaction rolled back, leaving the earlier failed-login count and error unchanged. No production API reboot was attempted.
+
+The identifier is shortened to `tenda_v12`, requiring no schema change. Regression coverage now checks the existing column bounds and runs successful status and reboot through the real HTTP route and outcome persistence. The bounds test reproduced the defect before the fix (19 > 16); CI runs the HTTP cases against Postgres. This closes the gap left by the isolated device/service test.
