@@ -192,3 +192,31 @@ def test_cookies_cannot_inject_routeros_headers(cookie):
     client = ap_fetch.RouterFetchHttpClient(None, "192.0.2.3")
     client._accept_cookies([cookie])
     assert client.cookie is None
+
+
+@pytest.mark.parametrize("body,expected", [
+    ('{"errCode":1,"result":0}', False),
+    ('{"errCode":0,"result":1}', True),
+    ('{"result":"success"}', True),
+    ('{"unexpected":0}', False),
+])
+def test_legacy_reboot_preserves_authoritative_error_field(body, expected):
+    adapter = ap_adapters.TendaApAdapter()
+    assert adapter.reboot_response_ok(body, json.loads) is expected
+
+
+def test_v12_ap_setup_stops_before_any_unverified_setter(monkeypatch):
+    fake = V12Router()
+    cred = _cred(ap_ip=SESSION_IP)
+    lan = ap_control.HotspotLan(gateway="10.90.0.1", subnet="10.90.0.0/24",
+                                pool_ranges="10.90.0.10-10.90.0.200")
+    monkeypatch.setattr(ap_control, "_locate_ap", lambda api, cred: (lan, None))
+    monkeypatch.setattr(ap_control, "_addresses_in_use", lambda api: set())
+    monkeypatch.setattr(ap_control, "_client_for", lambda info, cred, api:
+                        ap_fetch.RouterFetchHttpClient(api, cred.ap_ip, port=WAN_PORT))
+    result = ap_control.make_safe_ap_sync(ROUTER_INFO, cred, api_factory=fake.factory)
+    assert result["error"] == "unsupported_firmware"
+    assert result["login_ok"] is True
+    assert len(fake.fetches) == 3  # challenge, login, status; no setter or reboot
+    assert not fake.rebooted
+    assert not fake.mutating_router_calls

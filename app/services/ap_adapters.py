@@ -148,8 +148,13 @@ class ApAdapter:
     def reboot_response_ok(self, body: str, parse_json: Callable[[str], Any]) -> bool:
         data = parse_json(body)
         if isinstance(data, dict):
-            return any(str(data.get(k)).lower() in ("0", "ok", "success", "true")
-                       for k in ("errCode", "errcode", "error", "ret", "result") if k in data)
+            for key in ("errCode", "errcode", "error", "ret", "result"):
+                if key in data:
+                    try:
+                        return int(data[key]) == 0
+                    except (TypeError, ValueError):
+                        return str(data[key]).lower() in ("0", "ok", "success", "true")
+            return False
         return not body.strip()
 
     def login_attempts(self, username: str, password: str,
