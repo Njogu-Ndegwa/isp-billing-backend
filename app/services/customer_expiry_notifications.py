@@ -52,6 +52,8 @@ DEFAULT_REMINDER_OFFSETS_MINUTES = (1440,)
 MIN_REMINDER_OFFSET_MINUTES = 30
 MAX_REMINDER_OFFSET_MINUTES = 30 * 24 * 60
 MAX_REMINDER_OFFSETS = 5
+TECHMID_SMS_OWNER_ID = 597
+TECHMID_DIRECT_PAYBILL_ROUTERS = frozenset({556, 564, 670})
 
 
 def expiry_message_category(expiry: datetime) -> str:
@@ -151,6 +153,9 @@ async def resolve_paybills(
         can see (own paybill not registered, direct-settlement paybill, till
         or bank) -> None: the reminder drops the "Pay via Paybill" clause.
 
+    Techmid's three assigned direct Paybills can use a separate Daraja
+    registration when it unambiguously matches the same destination.
+
     The last case used to fall back to the platform paybill, so customers of
     resellers who settle directly were told to pay us (2026-10-11).
 
@@ -176,12 +181,12 @@ async def resolve_paybills(
 
             pm = await default_direct_method(db, reseller.id)
         out[router_id] = await _paybill_for_method(
-            db, pm, resolve_direct_destination
+            db, pm, resolve_direct_destination, reseller.id, router_id
         )
     return out
 
 
-async def _paybill_for_method(db, pm, resolve_direct_destination) -> str | None:
+async def _paybill_for_method(db, pm, resolve_direct_destination, owner_id, router_id) -> str | None:
     if pm is None:
         return settings.MPESA_SHORTCODE  # platform-collected, routed by account
     method_type = pm.method_type
@@ -198,10 +203,44 @@ async def _paybill_for_method(db, pm, resolve_direct_destination) -> str | None:
         ResellerPaymentMethodType.BANK_ACCOUNT,
         ResellerPaymentMethodType.MPESA_TILL,
     ):
-        if await resolve_direct_destination(db, pm) is not None:
-            return None  # settles straight to the reseller; not ours to advertise
+        destination = await resolve_direct_destination(db, pm)
+        if destination is not None:
+            if (
+                method_type == ResellerPaymentMethodType.MPESA_PAYBILL
+                and owner_id == pm.user_id == TECHMID_SMS_OWNER_ID
+                and router_id in TECHMID_DIRECT_PAYBILL_ROUTERS
+            ):
+                return await _registered_direct_paybill(db, owner_id, router_id, pm.id, destination.party_b)
+            return None
         return settings.MPESA_SHORTCODE  # system-collected, paid out by B2B
     # ZenoPay, MTN MoMo, ... have no account-number paybill.
+    return None
+
+
+async def _registered_direct_paybill(db, owner_id, router_id, method_id, shortcode) -> str | None:
+    if not shortcode or shortcode == settings.MPESA_SHORTCODE:
+        return None
+    assigned_router = await db.scalar(select(Router.id).where(
+        Router.id == router_id, Router.user_id == owner_id, Router.payment_method_id == method_id,
+    ))
+    if assigned_router is None:
+        return None
+
+    # C2B resolves active shortcodes across all owners. Any active duplicate
+    # makes the destination ambiguous, even when that other record is unregistered.
+    matches = (await db.execute(select(
+        ResellerPaymentMethod.user_id,
+        ResellerPaymentMethod.method_type,
+        ResellerPaymentMethod.c2b_registered_at,
+    ).where(
+        ResellerPaymentMethod.mpesa_shortcode == shortcode,
+        ResellerPaymentMethod.is_active.is_(True),
+    ).limit(2))).all()
+    if len(matches) != 1:
+        return None
+    registered_owner, method_type, registered_at = matches[0]
+    if registered_owner == owner_id and method_type == ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS and registered_at:
+        return shortcode
     return None
 
 

@@ -662,6 +662,42 @@ async def test_direct_settlement_router_without_a_method_uses_no_platform_paybil
     assert "Paybill" not in body
 
 
+@pytest.mark.parametrize("registration", ["matching", "wrong_owner", "unregistered", "inactive", "different", "ambiguous"])
+async def test_techmid_sms_requires_unique_matching_c2b_registration(db, registration):
+    from app.services.payment_gateway import resolve_collection_payment_method
+
+    owner = await make_reseller(db, id=597, settlement_mode="direct")
+    other = await make_reseller(db, settlement_mode="direct")
+    router = await make_router(db, owner, id=556)
+    comparison = await make_router(db, owner, id=648)
+    destination = "4699342"
+    assigned = await _add_method(
+        db, owner, ResellerPaymentMethodType.MPESA_PAYBILL,
+        mpesa_paybill_number=destination,
+    )
+    registered = await _add_method(
+        db, other if registration == "wrong_owner" else owner,
+        ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS,
+        mpesa_shortcode="4699343" if registration == "different" else destination,
+        c2b_registered_at=None if registration == "unregistered" else datetime.utcnow(),
+    )
+    if registration == "inactive":
+        registered.is_active = False
+    if registration == "ambiguous":
+        await _add_method(db, other, ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS, mpesa_shortcode=destination)
+    router.payment_method_id = comparison.payment_method_id = assigned.id
+    await db.commit()
+
+    result = await customer_expiry_notifications.resolve_paybills(db, owner, {router.id, comparison.id})
+
+    assert result == {router.id: destination if registration == "matching" else None, comparison.id: None}
+    assert (await resolve_collection_payment_method(db, router.id)).id == assigned.id
+    if registration == "matching":
+        router.payment_method_id = None
+        await db.commit()
+        assert await customer_expiry_notifications.resolve_paybills(db, owner, {router.id}) == {router.id: None}
+
+
 async def test_platform_settlement_paybill_method_keeps_the_platform_paybill(
     db, session_factory,
 ):
