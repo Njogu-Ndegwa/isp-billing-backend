@@ -15,7 +15,6 @@ not become a lookup of names and phone numbers by username.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 from datetime import datetime
@@ -83,11 +82,13 @@ def _router_io(router_info: dict, func_, *args):
 
 
 async def _locked_router_io(router_info: dict, func_, *args):
-    from app.services.mikrotik_background import router_locks
+    from app.services.router_mutations import RouterMutationBusy, run_router_mutation
 
     key = f"{router_info['ip']}:{router_info['port']}"
-    async with router_locks.acquire(key):
-        return await asyncio.to_thread(_router_io, router_info, func_, *args)
+    try:
+        return await run_router_mutation(key, _router_io, router_info, func_, *args)
+    except RouterMutationBusy as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
 
 
 @router.put("/api/routers/{router_id}/pppoe-expired-redirect")

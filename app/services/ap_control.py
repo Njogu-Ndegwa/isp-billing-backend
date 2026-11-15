@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -131,6 +132,9 @@ class LoginResult:
     locked: bool = False
     unreachable: bool = False
     error: Optional[str] = None
+    unsupported: bool = False
+    adapter: Optional[ApAdapter] = None
+    status: Optional[ApStatus] = None
 
 
 def _sleep(seconds: float) -> None:
@@ -366,14 +370,20 @@ def pick_static_ip(lan: HotspotLan, used=None) -> Optional[str]:
 # Login (with lockout)
 # ---------------------------------------------------------------------------
 
-def _read_status_body(client: RouterFetchHttpClient, adapter: ApAdapter):
+def _read_status_body(client: RouterFetchHttpClient, adapter: ApAdapter, *, diagnostics=None):
     """Try the adapter's candidate status endpoints; return (ApRequest, dict)
     for the first that answers with a JSON object, else (None, None)."""
     for req in adapter.status_requests():
         resp = client.request(req)
         parsed = parse_json_body(resp.body) if resp.ok else None
         if isinstance(parsed, dict) and parsed:
-            return resp, adapter.parse_status(resp.body, parse_json_body)
+            status = adapter.parse_status(resp.body, parse_json_body)
+            if status.recognised():
+                return resp, status
+        if diagnostics is not None:
+            login_page = ("login" in (resp.location or "").lower()
+                          or bool(re.search(r"<[^>]+>.*(?:login|password)", resp.body, re.I | re.S)))
+            diagnostics["auth_required" if login_page else "unsupported"] = True
     return None, None
 
 
@@ -381,9 +391,16 @@ def _login(client: RouterFetchHttpClient, adapter: ApAdapter, cred: ApCredential
     if cred.failed_login_count >= MAX_FAILED_LOGINS:
         return LoginResult(ok=False, locked=True,
                            error=f"Locked after {cred.failed_login_count} failed logins; replace the password.")
+    probe = adapter.login_probe_request()
+    if probe is not None:
+        reply = client.request(probe)
+        if not reply.ok and reply.status is None:
+            return LoginResult(ok=False, unreachable=True, error=reply.error)
+        adapter = adapter.select_protocol(reply.body, parse_json_body)
     attempts = adapter.login_attempts(cred.username, cred.password, preferred=cred.login_method)
     last_error = None
     answered = False
+    unsupported = False
     for attempt in attempts:
         resp = client.login(attempt.post_data, adapter.login_path, attempt.cookie)
         if not resp.ok:
@@ -391,18 +408,33 @@ def _login(client: RouterFetchHttpClient, adapter: ApAdapter, cred: ApCredential
             continue
         answered = True
         _sleep(LOGIN_SETTLE_SECONDS)
+        required_cookie = adapter.required_session_cookie
+        if required_cookie and not client.has_cookie(required_cookie):
+            # A redirect back to login is explicit rejection. A successful
+            # redirect with no usable cookie is a transport/protocol gap.
+            if "login" not in (resp.location or "").lower():
+                unsupported = True
+            last_error = "The device did not return a usable login session."
+            continue
         # Confirm the session by reading status; a wrong password answers with a
         # login page / error rather than a usable status body.
-        status_resp, _status = _read_status_body(client, adapter)
+        diagnostics = {}
+        status_resp, status = _read_status_body(client, adapter, diagnostics=diagnostics)
         if status_resp is not None:
-            return LoginResult(ok=True, method=attempt.method)
+            return LoginResult(ok=True, method=attempt.method, adapter=adapter, status=status)
+        unsupported |= diagnostics.get("unsupported", False) or bool(required_cookie)
         last_error = "The AP answered, but the saved password did not open a session."
     # No answer at all says nothing about the password, so it must not count
     # towards the lockout.
+    if unsupported:
+        return LoginResult(ok=False, unsupported=True,
+                           error="This device's login or status protocol is not supported by the selected adapter.")
     return LoginResult(ok=False, unreachable=not answered, error=last_error or "login failed")
 
 
 def _login_refusal(login: LoginResult) -> Dict[str, Any]:
+    if login.unsupported:
+        return {"error": "unsupported_firmware", "message": login.error}
     if login.unreachable:
         return {"error": "ap_unreachable",
                 "message": f"The access point did not answer through the router: {login.error}"}
@@ -443,7 +475,7 @@ def read_status_sync(router_info: Dict[str, Any], cred: ApCredential, *, api_fac
         login = _login(client, adapter, cred)
         if not login.ok:
             return _login_refusal(login)
-        _resp, status = _read_status_body(client, adapter)
+        status = login.status
         if status is None:
             return {"error": "ap_unreachable", "login_ok": True, "login_method": login.method,
                     "message": "The access point did not answer."}
@@ -471,8 +503,9 @@ def reboot_ap_sync(router_info: Dict[str, Any], cred: ApCredential, *, api_facto
         login = _login(client, adapter, cred)
         if not login.ok:
             return _login_refusal(login)
-        resp = client.request(adapter.reboot_request())
-        if not resp.ok or not (resp.redirected or reply_ok(resp.body)):
+        active_adapter = login.adapter or adapter
+        resp = client.request(active_adapter.reboot_request())
+        if not resp.ok or resp.redirected or not active_adapter.reboot_response_ok(resp.body, parse_json_body):
             return {"error": "reboot_failed", "login_ok": True, "login_method": login.method,
                     "message": resp.error or "The access point did not accept the reboot."}
         return {"success": True, "login_ok": True, "login_method": login.method,
@@ -512,8 +545,12 @@ def make_safe_ap_sync(router_info: Dict[str, Any], cred: ApCredential, *, api_fa
         if not login.ok:
             return _login_refusal(login)
 
+        if login.adapter and not login.adapter.supports_ap_setup:
+            return {"error": "unsupported_firmware", "login_ok": True, "login_method": login.method,
+                    "message": "Status and restart are supported, but remote AP setup is not verified for this firmware."}
+
         # Pre-check: the AP is reachable right now, and tells us its model.
-        _pre_resp, pre_status = _read_status_body(client, adapter)
+        pre_status = login.status
         if pre_status is None:
             return {"error": "ap_unreachable", "login_ok": True, "login_method": login.method,
                     "message": "The access point did not answer the pre-check."}

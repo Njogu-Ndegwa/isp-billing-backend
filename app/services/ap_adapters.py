@@ -77,8 +77,8 @@ MODE_UNKNOWN = "unknown"
 class LoginAttempt:
     """One credential encoding to try, newest-evidence first."""
     method: str
-    post_data: Dict[str, str]
-    cookie: Optional[str] = None  # deterministic cookie when the firmware uses one
+    post_data: Dict[str, str] = field(repr=False)
+    cookie: Optional[str] = field(default=None, repr=False)
 
 
 @dataclass
@@ -101,6 +101,7 @@ class ApStatus:
     client_count: Optional[int] = None
     mac: Optional[str] = None
     raw_keys: List[str] = field(default_factory=list)
+    protocol: Optional[str] = None
 
     def public(self) -> Dict[str, Any]:
         return {
@@ -112,7 +113,12 @@ class ApStatus:
             "dhcp_server_on": self.dhcp_server_on,
             "client_count": self.client_count,
             "mac": self.mac,
+            "protocol": self.protocol,
         }
+
+    def recognised(self) -> bool:
+        return bool(self.model or self.firmware or self.ip or self.mode != MODE_UNKNOWN
+                    or self.dhcp_server_on is not None)
 
     def is_safe_ap(self, *, gateway_ip: Optional[str] = None) -> bool:
         """A safe AP is in AP/bridge mode with its own DHCP server off."""
@@ -130,6 +136,26 @@ class ApAdapter:
     login_path: str = "/login/Auth"
     username_field: str = "username"
     password_field: str = "password"
+    required_session_cookie: Optional[str] = None
+    supports_ap_setup: bool = True
+
+    def login_probe_request(self) -> Optional[ApRequest]:
+        return None
+
+    def select_protocol(self, body: str, parse_json: Callable[[str], Any]) -> "ApAdapter":
+        return self
+
+    def reboot_response_ok(self, body: str, parse_json: Callable[[str], Any]) -> bool:
+        data = parse_json(body)
+        if isinstance(data, dict):
+            for key in ("errCode", "errcode", "error", "ret", "result"):
+                if key in data:
+                    try:
+                        return int(data[key]) == 0
+                    except (TypeError, ValueError):
+                        return str(data[key]).lower() in ("0", "ok", "success", "true")
+            return False
+        return not body.strip()
 
     def login_attempts(self, username: str, password: str,
                         preferred: Optional[str] = None) -> List[LoginAttempt]:
@@ -210,6 +236,17 @@ class TendaApAdapter(ApAdapter):
 
     vendor = "Tenda"
     model = "tenda-generic"
+
+    def login_probe_request(self) -> Optional[ApRequest]:
+        return ApRequest("get", "/goform/getstok")
+
+    def select_protocol(self, body: str, parse_json: Callable[[str], Any]) -> ApAdapter:
+        data = parse_json(body)
+        challenge = data.get("random") if isinstance(data, dict) else None
+        if isinstance(challenge, (str, int)) and not isinstance(challenge, bool):
+            if 0 < len(str(challenge)) <= 256:
+                return TendaV12Adapter(str(challenge))
+        return self
 
     # CONFIRMED path (marc0u/tenda-wifi). Status endpoint name on the AP build
     # is ASSUMED; getSysStatusInfo is the common Tenda AP status goform and
@@ -298,6 +335,55 @@ class TendaApAdapter(ApAdapter):
             "gateway": gateway,
             "dns1": dns,
         })]
+
+
+class TendaV12Adapter(TendaApAdapter):
+    """Bench-verified V12 challenge firmware; independent of the case label.
+
+    Observed on V12.01.01.59_multi: getstok challenge, returned ecos_pw cookie,
+    nested getStatus modules, and sysReboot returning errCode=100. Other
+    firmware families keep their own adapters rather than sharing setters.
+    """
+
+    required_session_cookie = "ecos_pw"
+    supports_ap_setup = False  # mode/LAN setters have not been bench-verified
+    status_path = "/goform/getStatus?modules=internetStatus,systemInfo,wifiRelay"
+    status_alternates = []
+
+    def __init__(self, challenge: str):
+        self._challenge = challenge
+
+    def login_attempts(self, username: str, password: str,
+                       preferred: Optional[str] = None) -> List[LoginAttempt]:
+        encoded = base64.b64encode(password.encode()).decode()
+        digest = hashlib.md5((encoded + self._challenge).encode()).hexdigest()
+        return [LoginAttempt("tenda_v12_challenge", {"password": digest})]
+
+    def parse_status(self, body: str, parse_json: Callable[[str], Any]) -> ApStatus:
+        data = parse_json(body)
+        if not isinstance(data, dict):
+            return ApStatus()
+        info = data.get("systemInfo")
+        relay = data.get("wifiRelay")
+        if not isinstance(info, dict) or not isinstance(relay, dict):
+            return ApStatus()
+        raw_mode = relay.get("wifiRelayType")
+        modes = {"disabled": MODE_ROUTER, "ap": MODE_AP, "wisp": MODE_WISP,
+                 "client+ap": MODE_REPEATER}
+        return ApStatus(
+            model=info.get("productName") or info.get("deviceName") or info.get("model"),
+            firmware=info.get("softVersion"),
+            ip=info.get("statusWanIP") or info.get("lanIP"),
+            mode=modes.get(raw_mode, MODE_UNKNOWN), mode_raw=raw_mode,
+            raw_keys=sorted(data), protocol="tenda_v12",
+        )
+
+    def reboot_request(self) -> ApRequest:
+        return ApRequest("post", "/goform/sysReboot", {"module1": "sysOperate", "action": "reboot"})
+
+    def reboot_response_ok(self, body: str, parse_json: Callable[[str], Any]) -> bool:
+        data = parse_json(body)
+        return isinstance(data, dict) and str(data.get("errCode")) == "100"
 
 
 class TendaOap1200V2Adapter(TendaApAdapter):

@@ -234,10 +234,9 @@ def test_wrong_port_is_cpe_unreachable():
     assert res["error"] == "cpe_unreachable"
 
 
-def test_unrecognised_status_page_reports_password_or_model():
-    # With /tool fetch the only "logged in" signal is a readable status page, so
-    # an answering device with no recognised status endpoint can't be told apart
-    # from a wrong password -- the error names both causes (password / model).
+def test_unrecognised_status_page_does_not_count_as_wrong_password():
+    # Undefined status forms are a compatibility problem, not proof that the
+    # credential is wrong. Repeated checks must not lock a valid credential.
     class NoStatus(FakeTendaCpe):
         def handle(self, host, port, method, path, data, cookie):
             if path in ("/goform/GetRouterStatus", "/goform/getSysStatusInfo"):
@@ -247,8 +246,9 @@ def test_unrecognised_status_page_reports_password_or_model():
     fake = FakeMikroTik(NoStatus())
     res = cpe_control.read_cpe_status_sync(ROUTER_INFO, _cred(), PPPOE_USER, WAN_PORT,
                                            api_factory=fake.factory)
-    assert res["error"] == "login_failed"
-    assert "model" in res["message"] and "password" in res["message"]
+    assert res["error"] == "cpe_unsupported"
+    assert "not supported" in res["message"]
+    assert res.get("login_ok") is not False
 
 
 def test_reboot_sends_reboot_after_login():
@@ -406,6 +406,30 @@ async def test_status_endpoint(client, db, patch_router):
     resp = await client.get(f"/api/customers/{customer.id}/cpe/status", headers=headers(_owner_token(owner)))
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"]["mode"] == "router"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_status_never_locks_valid_credential(client, db, patch_router):
+    class UnsupportedFirmware(FakeTendaCpe):
+        def handle(self, host, port, method, path, data, cookie):
+            if path in ("/goform/GetRouterStatus", "/goform/getSysStatusInfo"):
+                return 200, "<html>Form is not defined</html>"
+            return super().handle(host, port, method, path, data, cookie)
+
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_IP)
+    customer = await _pppoe_customer(db, owner, router)
+    await _saved_cred(db, customer.id)
+    patch_router(UnsupportedFirmware())
+    for _ in range(ap_control.MAX_FAILED_LOGINS + 1):
+        response = await client.get(f"/api/customers/{customer.id}/cpe/status",
+                                    headers=headers(_owner_token(owner)))
+        assert response.status_code == 502
+        assert "not supported" in response.json()["detail"]
+    row = (await db.execute(select(CustomerCpeCredential))).scalar_one()
+    await db.refresh(row)
+    assert row.failed_login_count == 0
+    assert "not supported" in row.last_error
 
 
 @pytest.mark.asyncio

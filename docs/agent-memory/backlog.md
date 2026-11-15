@@ -4,6 +4,13 @@ Project-level items that should survive across agent sessions.
 
 ## Reliability And Architecture
 
+### Tenda V12 CPE Authentication And Status Compatibility
+
+- Status: firmware adapter implemented; isolated live status and reboot passed on November 15. Production release and dashboard verification in progress.
+- Problem: firmware `V12.01.01.59_multi` uses challenge-based login, an `ecos_pw` cookie and nested `/goform/getStatus` JSON. The current adapter assumes raw MD5/Base64, a different cookie and two nonexistent status forms. Status returns 502 and increments the wrong-password counter even though browser login works.
+- Why it matters: remote CPE status/reboot cannot be validated, and repeated checks can lock a valid saved credential.
+- Next step: finish the authorized release and reseller dashboard checks on customer 53867/router 563, then qualify additional firmware families with captured responses and live tests. Do not advertise untested models as verified. Evidence: [incident](incidents/2026-11-15-tenda-v12-cpe-adapter-incompatible.md).
+
 ### Historical Reconnect Router-State Cleanup
 
 - Status: planned
