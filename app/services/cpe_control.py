@@ -41,9 +41,9 @@ from app.services.ap_adapters import (
     DEFAULT_LAN_WEB_PORT, DEFAULT_WAN_REMOTE_MGMT_PORT, detect_model_key, get_adapter,
 )
 from app.services.ap_control import (
-    ApCredential, LoginResult, _login, _read_status_body, _rows, _with_api,
+    ApCredential, LoginResult, _login, _rows, _with_api,
 )
-from app.services.ap_fetch import RouterFetchHttpClient, reply_ok
+from app.services.ap_fetch import RouterFetchHttpClient, parse_json_body
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +126,8 @@ def _cpe_login_refusal(login: LoginResult, port: int) -> Dict[str, Any]:
     Distinguishes "did not answer" (remote management off / wrong port / source
     not allowed) from "answered but rejected the password".
     """
+    if login.unsupported:
+        return {"error": "cpe_unsupported", "message": login.error}
     if login.unreachable:
         detail = f" ({login.error})" if login.error else ""
         return {
@@ -171,7 +173,7 @@ def read_cpe_status_sync(router_info: Dict[str, Any], cred: ApCredential, userna
         login = _login(client, adapter, cred)
         if not login.ok:
             return _cpe_login_refusal(login, port)
-        _resp, status = _read_status_body(client, adapter)
+        status = login.status
         if status is None:
             return {
                 "error": "cpe_unsupported", "login_ok": True, "login_method": login.method,
@@ -205,8 +207,9 @@ def reboot_cpe_sync(router_info: Dict[str, Any], cred: ApCredential, username: s
         login = _login(client, adapter, cred)
         if not login.ok:
             return _cpe_login_refusal(login, port)
-        resp = client.request(adapter.reboot_request())
-        if not resp.ok or not (resp.redirected or reply_ok(resp.body)):
+        active_adapter = login.adapter or adapter
+        resp = client.request(active_adapter.reboot_request())
+        if not resp.ok or resp.redirected or not active_adapter.reboot_response_ok(resp.body, parse_json_body):
             return {"error": "cpe_reboot_failed", "login_ok": True, "login_method": login.method,
                     "message": resp.error or "The router (CPE) did not accept the reboot."}
         return {"success": True, "login_ok": True, "login_method": login.method,

@@ -8,18 +8,11 @@ into that fetch command, sends it over our existing MikroTik API session, and
 returns the body -- so an adapter can drive the AP without us ever touching the
 hotspot LAN directly.
 
-Cookies: ``/tool fetch`` does NOT expose the AP's ``Set-Cookie`` response
-header, so we cannot read a server-issued session id. Two things make a session
-work anyway, and both are used:
-
-* the AP sees every request coming from the same source (the MikroTik's LAN
-  address), and the Tenda firmware ties a session to that source; and
-* on several Tenda builds the session cookie is derived from the credentials
-  (CVE-2026-22082), so the adapter can hand us a deterministic ``Cookie`` to
-  send on every request.
-
-This is the part most in need of bench confirmation (see the PR checklist). The
-transport is intentionally thin and fully faked in tests.
+Login requests capture response headers. RouterOS 7.19.6 includes Set-Cookie
+in the redirect trap when output=user-with-headers is used; successful HTTP
+responses carry the headers in data. Cookies stay in this single-device client
+and never enter public results or logs. Redirects are not followed, so neither
+credentials nor cookies can be forwarded to a different host.
 
 SAFETY: this only ever issues ``/tool fetch`` against the AP's address. It never
 changes the MikroTik's own configuration.
@@ -29,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
@@ -49,17 +43,17 @@ class FetchResponse:
     body: str
     error: Optional[str] = None
     redirected: bool = False
+    location: Optional[str] = None
 
 
 def _redirect_error(message: str) -> bool:
-    text = (message or "").lower()
-    return "302" in text or "301" in text or "redirect" in text or "moved" in text
+    return _status_from_error(message) in (301, 302, 303, 307, 308)
 
 
 def _status_from_error(message: str) -> Optional[int]:
-    text = (message or "")
-    for code in ("301", "302", "303", "307", "400", "401", "403", "404", "500", "502", "503"):
-        if code in text:
+    text = re.sub(r'(?i)(Set-Cookie|Location):\s*"[^"\r\n]*"', "", message or "")
+    for code in ("301", "302", "303", "307", "308", "400", "401", "403", "404", "500", "502", "503"):
+        if re.search(rf"\b{code}\b", text):
             return int(code)
     return None
 
@@ -105,14 +99,37 @@ class RouterFetchHttpClient:
                 fields.append(f"{key}: {value}")
         return ",".join(fields)
 
-    def request(self, req: ApRequest) -> FetchResponse:
+    def _accept_cookies(self, headers: List[str]) -> None:
+        cookies = {}
+        for item in (self.cookie or "").split("; "):
+            if "=" in item:
+                name, value = item.split("=", 1)
+                cookies[name] = value
+        for header in headers:
+            pair = header.split(";", 1)[0].strip()
+            name, sep, value = pair.partition("=")
+            # Reject header injection and RouterOS header-list delimiters.
+            if (sep and re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name)
+                    and len(value) <= 4096
+                    and not re.search(r'[\x00-\x20\x7f,;"\\]', value)):
+                if value:
+                    cookies[name] = value
+                else:
+                    cookies.pop(name, None)
+        self.cookie = "; ".join(f"{k}={v}" for k, v in cookies.items()) or None
+
+    def has_cookie(self, name: str) -> bool:
+        return any(p.partition("=")[0] == name for p in (self.cookie or "").split("; "))
+
+    def request(self, req: ApRequest, *, capture_headers: bool = False) -> FetchResponse:
         params: Dict[str, str] = {
             "url": self._url(req.path),
             "mode": self.scheme,
             "http-method": req.method.lower(),
-            "output": "user",
+            "output": "user-with-headers" if capture_headers else "user",
             "as-value": "",
             "check-certificate": "no",
+            "http-max-redirect-count": "0",
         }
         header_extra: Dict[str, str] = {}
         if req.method.lower() == "post":
@@ -125,11 +142,18 @@ class RouterFetchHttpClient:
         result = self.api.send_command("/tool/fetch", params)
         if result.get("error"):
             message = str(result.get("error"))
+            self._accept_cookies(re.findall(r'Set-Cookie:\s*"([^"\r\n]*)"', message, re.I))
+            location_match = re.search(r'Location:\s*"([^"\r\n]*)"', message, re.I)
+            location = location_match.group(1) if location_match else None
             if _redirect_error(message):
                 # A 3xx (e.g. the login redirect) is a reachable server, not a
                 # failure. ROS gives us no body for it.
                 return FetchResponse(ok=True, status=_status_from_error(message) or 302,
-                                     body="", redirected=True)
+                                     body="", redirected=True, location=location)
+            # RouterOS traps can contain session cookies and redirect queries.
+            # Keep the cause, never the raw HTTP header values.
+            message = re.sub(r'(?i)(Set-Cookie|Location):\s*"[^"\r\n]*"',
+                             r'\1: [redacted]', message)
             return FetchResponse(ok=False, status=_status_from_error(message),
                                  body="", error=message)
 
@@ -138,18 +162,26 @@ class RouterFetchHttpClient:
         rows = result.get("data") or []
         row = rows[-1] if rows else {}
         body = row.get("data", "") or ""
+        location = None
+        if capture_headers and body.startswith("HTTP/"):
+            parts = re.split(r"\r?\n\r?\n", body, maxsplit=1)
+            if len(parts) == 2:
+                head, body = parts
+                self._accept_cookies(re.findall(r"(?im)^Set-Cookie:\s*([^\r\n]*)", head))
+                match = re.search(r"(?im)^Location:\s*([^\r\n]*)", head)
+                location = match.group(1) if match else None
         status_text = str(row.get("status", "")).lower()
         ok = status_text in ("", "finished", "finished.") or "finish" in status_text
         return FetchResponse(ok=ok, status=200 if ok else None, body=body,
-                             error=None if ok else status_text or "fetch did not finish")
+                             error=None if ok else status_text or "fetch did not finish",
+                             location=location)
 
     def login(self, attempt_post_data: Dict[str, str], login_path: str,
               cookie: Optional[str]) -> FetchResponse:
         # Send the cookie the firmware expects (if any) ON the login too, then
         # keep it for later requests.
-        if cookie:
-            self.cookie = cookie
-        return self.request(ApRequest("post", login_path, attempt_post_data))
+        self.cookie = cookie  # discard any earlier failed attempt's session
+        return self.request(ApRequest("post", login_path, attempt_post_data), capture_headers=True)
 
 
 def parse_json_body(body: str) -> Any:

@@ -2,7 +2,7 @@
 
 ## Summary
 
-The first live CPE test reached customer 53867's Tenda through MikroTik 563. Disconnect/redial passed; status failed with HTTP 502 because the adapter's assumed authentication and status protocol does not match firmware `V12.01.01.59_multi`. No CPE API reboot was attempted and no fix was deployed.
+The first live CPE test reached customer 53867's Tenda through MikroTik 563. Disconnect/redial passed; status failed with HTTP 502 because the adapter's assumed authentication and status protocol does not match firmware `V12.01.01.59_multi`. The initial ordered test stopped at status. The firmware fix subsequently passed an isolated live status/reboot test; release verification is recorded below.
 
 ## Symptoms
 
@@ -40,3 +40,11 @@ Application access-log evidence and the seven-step table are in [the CPE test re
 - Capture sanitized response fixtures and test both challenge and legacy firmware, including cookie handling and unsupported-response classification.
 - Re-run status before attempting the API reboot, concurrency and reseller UI checks. Do not mark the direct configuration reboot as the API reboot test.
 - The separate slow-port-change fix is local commit `6d71f01`, 55 focused tests passed, not deployed. No CPE adapter fix is included in it.
+
+## Fix and isolated live verification
+
+The firmware adapter now probes `getstok`, uses the challenge digest and captures the returned `ecos_pw` cookie from RouterOS `output=user-with-headers`. Redirect following is disabled. Status uses the observed nested modules; reboot uses `POST /goform/sysReboot` with `module1=sysOperate&action=reboot` and requires `errCode=100`. Unrecognised status is an unsupported-firmware error and does not increment the bad-password counter. Remote AP configuration remains unavailable for this firmware until its setters are verified.
+
+At 19:59:42 EAT the candidate read firmware `V12.01.01.59_multi`, mode `router`, and the live session address/uptime through MikroTik 563 in 6.08 seconds. At 19:59:49 the reboot was accepted (7.42-second request). The observer saw no PPPoE session at 19:59:52 and a new session at 20:00:11 with uptime 0s, 29.1 seconds after request start. This was the CPE service candidate loaded only into an isolated Python process, not a deployment or production API pass.
+
+The focused AP/CPE, transport, interactive mutation, port, and PPPoE redirect tests passed: 170 tests, including 23 wire-level V12 regression cases. Session-discipline guard passed. Physical model remains unknown because this status response does not expose it; no model is inferred from firmware.
