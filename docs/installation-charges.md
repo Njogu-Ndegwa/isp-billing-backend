@@ -8,10 +8,10 @@ existing debts are imported automatically. The customer card states:
 
 ## Access and accounting boundaries
 
-- Backend is disabled by default (`TECHMID_INSTALLATION_CHARGES_ENABLED=false`)
-  and additionally restricted to verified reseller ID 597. Frontend has its own
-  disabled-by-default `NEXT_PUBLIC_TECHMID_INSTALLATION_CHARGES_ENABLED` flag;
-  it is display control only, not authorization.
+- The approved rollout is limited to verified reseller ID 597. Set
+  `TECHMID_INSTALLATION_CHARGES_ENABLED=false` to disable the API. A frontend
+  build with `NEXT_PUBLIC_TECHMID_INSTALLATION_CHARGES_ENABLED=false` also hides
+  the card. The API enforces authorization.
 - Only the actual owner can write. Staff, including account admins, cannot.
   Customer-view staff can read. Standard inactive-subscription restrictions
   apply to writes. Existing impersonation middleware still applies.
@@ -53,12 +53,11 @@ snapshots retain the audit trail without blocking normal customer deletion.
 Charge/event rows are deliberately not cascaded away. Currency is explicitly
 stored and constrained to KES.
 
-Review and test both repositories before publication. Deploy with both flags
-off; verify both new tables and ordinary customer/payment flows. Only after
-authorized canary enablement, enable the backend flag and rebuild the frontend
-with its matching flag for Techmid. Validate with a clearly identified test
-customer/charge and reverse the test entry; do not manufacture customer debt.
-No real ledger mutation is part of automated deployment verification.
+Review and test both repositories before publication. Deploy the backend first
+and verify that both tables exist and the scoped read endpoint responds for
+Techmid. Deploy the frontend after the API check. Verify the card with the
+account owner. Automated deployment verification uses only read operations in
+production, with ledger mutation and reversal exercised in isolated tests.
 
 Rollback: disable flags first. The additive tables and history remain intact;
 do not drop them or reverse legitimate customer entries. Existing application
