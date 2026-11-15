@@ -15,7 +15,7 @@ Remote management cannot be enabled through a WAN administration interface that 
 
 | Protocol / device | Status | Restart | Limits |
 |---|---|---|---|
-| Tenda V12.01.01.59_multi, MikroTik ROS 7.19.6 | Live candidate passed | Live candidate passed, redial within 29s | Production verification recorded in the test report; hardware model not exposed by device status. |
+| Tenda V12.01.01.59_multi, MikroTik ROS 7.19.6 | Deployed API/dashboard passed | Deployed API/dashboard passed; observed drop and redial in 29s | Verified November 15, 2026 on customer 53867/router 563. Hardware model not exposed by device status. |
 | Existing Tenda legacy/F3/OAP adapters | Regression tests pass | Regression tests pass | Not live-qualified by this test. |
 | Other Tenda firmware / other vendors | Not claimed | Not claimed | Add a firmware adapter and qualify against a real device before advertising support. |
 
