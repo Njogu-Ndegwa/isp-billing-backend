@@ -60,10 +60,12 @@ async def test_transaction_summary_selects_only_columns_used_by_response(
 
     def _capture_sql(_conn, _cursor, statement, _parameters, _context, _executemany):
         normalized = " ".join(statement.lower().split())
-        if " from mpesa_transactions " in normalized:
-            source_selects["mpesa"] = normalized.split(" from ", 1)[0]
-        elif " from customer_payments " in normalized:
-            source_selects["customer_payments"] = normalized.split(" from ", 1)[0]
+        projection, _, source = normalized.partition(" from ")
+        # A ledger WHERE clause may check the provider table for duplicates.
+        if source.startswith("mpesa_transactions "):
+            source_selects["mpesa"] = projection
+        elif source.startswith("customer_payments "):
+            source_selects["customer_payments"] = projection
 
     event.listen(engine.sync_engine, "before_cursor_execute", _capture_sql)
     try:

@@ -2254,7 +2254,7 @@ async def get_mpesa_transactions_summary(
                     CustomerPayment.payment_method,
                     CustomerPayment.counts_as_revenue,
                     CustomerPayment.collection_mode,
-                    _archived_stk_payment_condition().label("archived_stk"),
+                    CustomerPayment.payment_reference,
                     Router.name,
                     Router.id,
                     Plan.connection_type,
@@ -2286,11 +2286,15 @@ async def get_mpesa_transactions_summary(
                 method,
                 counts_as_revenue,
                 collection_mode,
-                archived_stk,
+                payment_reference,
                 router_name,
                 router_pk,
                 connection_type,
             ) in (await db.execute(cp_stmt)).all():
+                # The ledger filter already verified the fallback. Any mobile
+                # money row without a gateway prefix is an archived STK.
+                archived_stk = (method == PaymentMethod.MOBILE_MONEY
+                                and not (payment_reference or "").startswith(GATEWAY_REFERENCE_PREFIXES))
                 rows.append({
                     "amount": float(amount),
                     "status": payment_status.value if payment_status else "completed",
