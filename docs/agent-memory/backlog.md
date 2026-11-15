@@ -4,12 +4,21 @@ Project-level items that should survive across agent sessions.
 
 ## Reliability And Architecture
 
+### TR-069 Management And Reseller Setup
+
+- Status: deferred at Dennis's request on November 15, 2026. Release the verified Tenda CPE feature first. No TR-069 implementation or infrastructure was added.
+- Problem: web-admin integrations vary by firmware and do not provide broad router/GPON ONT compatibility.
+- Agreed direction: a Bitwave-managed ACS, with GenieACS evaluated as the protocol engine. Resellers should get a guided customer-device enrollment flow, copyable ACS settings, connection status, device information and confirmed reboot controls. Keep existing Tenda controls available.
+- Requirements: isolate devices and actions by reseller/customer; authenticate each enrolled device; keep ACS management interfaces private; distinguish queued actions from completed actions; provide clear last-contact and error states. Follow short DB-session discipline and wire any schema additions into idempotent startup migrations.
+- Verification: test real CWMP exchanges against the managed ACS with a simulated device first. Dennis currently has no TR-069-capable test router/ONT available. Qualify each physical firmware/model before claiming hardware support. TR-069 manages compatible ONTs; OLT/OMCI management is a separate integration.
+- Next step when resumed: finalize enrollment identity/authentication and the deployment design, then implement the ACS connection and reseller setup flow. References: [GenieACS authentication](https://docs.genieacs.com/en/stable/cpe-authentication.html), [API](https://docs.genieacs.com/en/stable/api-reference.html), [installation](https://docs.genieacs.com/en/stable/installation-guide.html).
+
 ### Tenda V12 CPE Authentication And Status Compatibility
 
-- Status: firmware adapter implemented; isolated live status and reboot passed on November 15. Production release and dashboard verification in progress.
-- Problem: firmware `V12.01.01.59_multi` uses challenge-based login, an `ecos_pw` cookie and nested `/goform/getStatus` JSON. The current adapter assumes raw MD5/Base64, a different cookie and two nonexistent status forms. Status returns 502 and increments the wrong-password counter even though browser login works.
-- Why it matters: remote CPE status/reboot cannot be validated, and repeated checks can lock a valid saved credential.
-- Next step: finish the authorized release and reseller dashboard checks on customer 53867/router 563, then qualify additional firmware families with captured responses and live tests. Do not advertise untested models as verified. Evidence: [incident](incidents/2026-11-15-tenda-v12-cpe-adapter-incompatible.md).
+- Status: deployed and verified November 15, 21:28 EAT. Backend PRs 361/362 and frontend PR 196 shipped; public API/dashboard status, reboot/redial (29s), disconnect (5s), concurrency 409 and mobile UI passed on customer 53867/router 563.
+- Resolved problem: firmware `V12.01.01.59_multi` uses challenge-based login, an `ecos_pw` cookie and nested `/goform/getStatus` JSON. The previous adapter assumed raw MD5/Base64, a different cookie and two nonexistent status forms. Status returned 502 and incremented the wrong-password counter even though browser login worked.
+- Impact addressed: remote CPE status/reboot now passes live verification, and unsupported firmware no longer consumes the wrong-password allowance.
+- Next step: qualify additional firmware families with captured responses and live tests. Hardware model is not exposed by this device; do not advertise untested models as verified. V12 AP/LAN configuration setters remain unsupported until verified. Evidence: [final test report](../cpe-e2e-2026-11-15.md), [incident](incidents/2026-11-15-tenda-v12-cpe-adapter-incompatible.md).
 
 ### Historical Reconnect Router-State Cleanup
 
