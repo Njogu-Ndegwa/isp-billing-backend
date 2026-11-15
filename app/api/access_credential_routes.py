@@ -3,6 +3,7 @@ Reseller API for managing access credentials (comp hotspot logins).
 """
 
 from datetime import datetime
+from functools import wraps
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -19,6 +20,9 @@ from app.services.subscription import enforce_active_subscription
 from app.services.access_credentials import (
     InvalidRateLimit,
     bind_mac_for_login,
+    bound_credential_macs,
+    credential_device_limit,
+    credential_lock,
     deprovision_credential,
     fetch_live_usage,
     generate_password,
@@ -27,6 +31,7 @@ from app.services.access_credentials import (
     provision_credential,
     release_mac,
     serialize_credential,
+    set_bound_credential_macs,
 )
 from app.services.router_helpers import get_router_by_id
 from app.services import access_credential_sync as cred_sync
@@ -40,6 +45,14 @@ router = APIRouter(prefix="/api/access-credentials", tags=["access-credentials"]
 
 
 _USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
+
+
+def _serialize_mutation(endpoint):
+    @wraps(endpoint)
+    async def mutation(cred_id: int, *args, **kwargs):
+        async with credential_lock(cred_id):
+            return await endpoint(cred_id, *args, **kwargs)
+    return mutation
 
 
 def _validate_rate_limit(value: Optional[str]) -> Optional[str]:
@@ -293,6 +306,7 @@ async def get_credential(
 
 
 @router.patch("/{cred_id}")
+@_serialize_mutation
 async def update_credential(
     cred_id: int,
     payload: UpdateRequest,
@@ -351,6 +365,7 @@ async def update_credential(
 
 
 @router.post("/{cred_id}/rotate-password")
+@_serialize_mutation
 async def rotate_password(
     cred_id: int,
     db: AsyncSession = Depends(get_db),
@@ -383,6 +398,7 @@ async def rotate_password(
 
 
 @router.post("/{cred_id}/revoke")
+@_serialize_mutation
 async def revoke_credential(
     cred_id: int,
     db: AsyncSession = Depends(get_db),
@@ -402,8 +418,8 @@ async def revoke_credential(
     # Revoked in the DB either way: our login page refuses it from now on.
     cred.status = AccessCredStatus.REVOKED
     cred.revoked_at = datetime.utcnow()
-    cred.bound_mac_address = None
-    cred.bound_at = None
+    if not (router_obj and credential_device_limit(cred, router_obj) > 1 and result.get("error")):
+        set_bound_credential_macs(cred, [])
     await db.commit()
     await db.refresh(cred)
 
@@ -421,6 +437,7 @@ async def revoke_credential(
 
 
 @router.post("/{cred_id}/restore")
+@_serialize_mutation
 async def restore_credential(
     cred_id: int,
     db: AsyncSession = Depends(get_db),
@@ -432,6 +449,9 @@ async def restore_credential(
     router_obj = await db.get(Router, cred.router_id)
     if not router_obj:
         raise HTTPException(status_code=404, detail="Router not found")
+    if (credential_device_limit(cred, router_obj) > 1
+            and cred.router_sync in (cred_sync.SYNC_REMOVE, cred_sync.SYNC_DELETE)):
+        raise HTTPException(status_code=409, detail="Wait for the router to finish removing the previous login")
 
     cred.status = AccessCredStatus.ACTIVE
     cred.revoked_at = None
@@ -452,6 +472,7 @@ async def restore_credential(
 
 
 @router.post("/{cred_id}/sync")
+@_serialize_mutation
 async def sync_credential(
     cred_id: int,
     db: AsyncSession = Depends(get_db),
@@ -508,6 +529,7 @@ async def sync_credential(
 
 
 @router.post("/{cred_id}/force-logout")
+@_serialize_mutation
 async def force_logout(
     cred_id: int,
     db: AsyncSession = Depends(get_db),
@@ -519,18 +541,22 @@ async def force_logout(
     cred = await _own_or_admin(db, cred_id, user)
     router_obj = await db.get(Router, cred.router_id)
 
-    if cred.bound_mac_address and router_obj:
+    macs = bound_credential_macs(cred)
+    if macs and router_obj:
         await db.commit()
-        await release_mac(cred, router_obj, cred.bound_mac_address)
+        for mac in macs:
+            result = await release_mac(cred, router_obj, mac)
+            if credential_device_limit(cred, router_obj) > 1 and result.get("error"):
+                raise HTTPException(status_code=502, detail="Router did not confirm logging out every device")
 
-    cred.bound_mac_address = None
-    cred.bound_at = None
+    set_bound_credential_macs(cred, [])
     await db.commit()
     await db.refresh(cred)
     return serialize_credential(cred)
 
 
 @router.delete("/{cred_id}")
+@_serialize_mutation
 async def delete_credential(
     cred_id: int,
     db: AsyncSession = Depends(get_db),
@@ -552,8 +578,8 @@ async def delete_credential(
         # once the router has confirmed the removal (retry or check-in).
         cred.status = AccessCredStatus.REVOKED
         cred.revoked_at = cred.revoked_at or datetime.utcnow()
-        cred.bound_mac_address = None
-        cred.bound_at = None
+        if credential_device_limit(cred, router_obj) == 1:
+            set_bound_credential_macs(cred, [])
         await db.commit()
         pending = await _settle_router_result(
             db, cred, router_obj, result, cred_sync.SYNC_DELETE, mac=bound_mac)

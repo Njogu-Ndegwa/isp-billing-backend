@@ -60,10 +60,10 @@ class FakeRouter:
             self.queues = [q for q in self.queues if q[".id"] != arguments["numbers"]]
             return {"success": True}
         if command == "/ip/hotspot/ip-binding/remove":
-            self.bindings = []
+            self.bindings = [row for row in self.bindings if row[".id"] != arguments["numbers"]]
             return {"success": True}
         if command == "/ip/hotspot/host/remove":
-            self.hosts = []
+            self.hosts = [row for row in self.hosts if row[".id"] != arguments["numbers"]]
             return {"success": True}
         return {"success": True}
 
@@ -91,6 +91,26 @@ def _cred(**overrides):
 def _scan(monkeypatch, router, cred):
     monkeypatch.setattr(mikrotik_background, "MikroTikAPI", lambda *_a, **_k: router)
     return mikrotik_background._scan_router_idle_credentials_sync(ROUTER, [cred], 15 * 60)
+
+
+def test_shared_revoke_removes_both_devices_but_keeps_a_separate_entitlement(monkeypatch):
+    second = "02:00:00:00:00:02"
+    unrelated = "02:00:00:00:00:03"
+    router = FakeRouter(queues=[{".id": "*Q1", "name": "cred_77"}])
+    router.hosts += [{".id": hid, "mac-address": mac, "bypassed": "true"}
+                     for hid, mac in [("*H2", second), ("*H3", unrelated)]]
+    router.bindings += [
+        {".id": "*B2", "mac-address": second, "comment": "ACCESS_CRED|cred:77|user:kadot"},
+        {".id": "*B3", "mac-address": unrelated, "comment": "customer data"},
+    ]
+    monkeypatch.setattr(access_credentials, "MikroTikAPI", lambda *_a, **_k: router)
+    result = access_credentials._deprovision_direct_api_sync(ROUTER, {
+        "cred_id": 77, "username": "kadot", "all_bindings": True, "bound_macs": [MAC, second],
+    })
+    assert result["success"]
+    assert [row[".id"] for row in router.hosts] == ["*H3"]
+    assert [row[".id"] for row in router.bindings] == ["*B3"]
+    assert router.queues == []
 
 
 # --- helper ---------------------------------------------------------------
@@ -168,6 +188,33 @@ def test_reaper_creates_missing_queue_for_bound_credential(monkeypatch):
     assert queue["target"] == "192.168.88.50/32"
     assert queue["max-limit"] == "5M/5M"
     assert router.fasttrack_calls == [["192.168.88.50"]]
+
+
+def test_reaper_keeps_both_active_devices_in_the_same_rate_queue(monkeypatch):
+    second = "AA:BB:CC:DD:EE:49"
+    router = FakeRouter()
+    router.hosts.append({**router.hosts[0], ".id": "*H2", "mac-address": second, "address": "192.168.88.51"})
+
+    result = _scan(monkeypatch, router, _cred(bound_macs=[MAC, second]))
+
+    assert result["to_release"] == []
+    [queue] = router.queues
+    assert set(queue["target"].split(",")) == {"192.168.88.50/32", "192.168.88.51/32"}
+
+
+def test_reaper_releases_only_the_idle_device_and_keeps_the_other_rate_limited(monkeypatch):
+    second = "AA:BB:CC:DD:EE:49"
+    router = FakeRouter(idle="20m")
+    router.hosts.append({**router.hosts[0], ".id": "*H2", "mac-address": second,
+                         "address": "192.168.88.51", "idle-time": "1m"})
+    router.bindings.append({**router.bindings[0], ".id": "*B2", "mac-address": second})
+
+    result = _scan(monkeypatch, router, _cred(bound_macs=[MAC, second]))
+
+    assert [row["mac"] for row in result["to_release"]] == [MAC]
+    assert [row["mac-address"] for row in router.bindings] == [second]
+    assert router.queues[0]["target"] == "192.168.88.51/32"
+    assert router.sent("/queue/simple/remove") == []
 
 
 def test_reaper_leaves_steady_state_untouched(monkeypatch):

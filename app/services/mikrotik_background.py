@@ -2424,91 +2424,93 @@ def _scan_router_idle_credentials_sync(
         now_utc = datetime.utcnow()
 
         pending_releases = []
+        retained: set[int] = set()
         for cred in creds:
-            mac = cred.get("bound_mac_address")
-            if not mac:
-                continue
-            wanted = normalize_mac_address(mac)
-            host = hosts_by_mac.get(wanted)
-            should_release = False
-            if not host:
-                # After a successful login the kick removes the host entry so
-                # MikroTik can re-evaluate the device as bypassed. There is a
-                # brief window (a few seconds) where the host entry is gone
-                # but the device is still active. Treat any credential bound
-                # within the last 2 minutes as "recently connected" and skip
-                # the absent-host release to avoid kicking live users.
-                bound_at_str = cred.get("bound_at")
-                recently_bound = False
-                if bound_at_str:
-                    try:
-                        from datetime import timezone
-                        bound_at = datetime.fromisoformat(bound_at_str)
-                        # Handle both timezone-aware and naive datetimes
-                        if bound_at.tzinfo is not None:
-                            age_seconds = (now_utc.replace(tzinfo=timezone.utc) - bound_at).total_seconds()
-                        else:
-                            age_seconds = (now_utc - bound_at).total_seconds()
-                        recently_bound = age_seconds < 120
-                    except (ValueError, TypeError):
-                        pass
-                if not recently_bound:
-                    should_release = True
-            else:
-                idle_str = host.get("idle-time", "")
-                idle_seconds = _parse_mikrotik_duration(idle_str)
-                if idle_seconds >= idle_threshold_seconds:
-                    should_release = True
+            macs = cred.get("bound_macs") or [cred.get("bound_mac_address")]
+            live_ips: list[str] = []
+            for mac in filter(None, macs):
+                wanted = normalize_mac_address(mac)
+                host = hosts_by_mac.get(wanted)
+                should_release = False
+                if not host:
+                    # After a successful login the kick removes the host entry so
+                    # MikroTik can re-evaluate the device as bypassed. There is a
+                    # brief window (a few seconds) where the host entry is gone
+                    # but the device is still active. Treat any credential bound
+                    # within the last 2 minutes as "recently connected" and skip
+                    # the absent-host release to avoid kicking live users.
+                    bound_at_str = cred.get("bound_at")
+                    recently_bound = False
+                    if bound_at_str:
+                        try:
+                            from datetime import timezone
+                            bound_at = datetime.fromisoformat(bound_at_str)
+                            # Handle both timezone-aware and naive datetimes
+                            if bound_at.tzinfo is not None:
+                                age_seconds = (now_utc.replace(tzinfo=timezone.utc) - bound_at).total_seconds()
+                            else:
+                                age_seconds = (now_utc - bound_at).total_seconds()
+                            recently_bound = age_seconds < 120
+                        except (ValueError, TypeError):
+                            pass
+                    if not recently_bound:
+                        should_release = True
+                else:
+                    idle_str = host.get("idle-time", "")
+                    idle_seconds = _parse_mikrotik_duration(idle_str)
+                    if idle_seconds >= idle_threshold_seconds:
+                        should_release = True
 
-            if should_release:
-                remove_failed = False
-                for binding_id in bindings_by_credential.get((cred["id"], wanted), []):
-                    result = api.send_command("/ip/hotspot/ip-binding/remove",
-                                              {"numbers": binding_id})
-                    if not result.get("success"):
-                        remove_failed = True
-                if remove_failed:
-                    logger.warning("[REAPER] Credential %s binding removal failed; keeping bound MAC",
-                                   cred["id"])
-                    continue
-                if host and str(host.get("bypassed", "false")).lower() == "true":
-                    host_id = host.get(".id")
-                    if host_id:
-                        api.send_command("/ip/hotspot/host/remove", {"numbers": host_id})
-                pending_releases.append({
-                    "id": cred["id"],
-                    "mac": mac,
-                    "normalized_mac": wanted,
-                    "bytes_in": int(host.get("bytes-in", 0) or 0) if host else 0,
-                    "bytes_out": int(host.get("bytes-out", 0) or 0) if host else 0,
-                    "ip": (host.get("address") or host.get("to-address")) if host else None,
-                })
-            else:
-                host_ip = host.get("address") or host.get("to-address")
-                out["to_update"].append({
-                    "id": cred["id"],
-                    "bytes_in": int(host.get("bytes-in", 0) or 0),
-                    "bytes_out": int(host.get("bytes-out", 0) or 0),
-                    "ip": host_ip,
-                })
-                # Unread queue table: adding blind would collide on the name.
-                if queues_read and "rate_limit" in cred:
-                    cred_ips = _queue_target_ips(host_ips_by_mac.get(wanted) or host_ip)
-                    outcome = ensure_credential_queue_sync(
-                        api,
-                        cred_id=cred["id"],
-                        username=cred.get("username") or "",
-                        rate_limit=cred.get("rate_limit"),
-                        client_ip=cred_ips,
-                        existing_queue=queues_by_name.get(queue_name_for_credential(cred["id"])),
-                    )
-                    if outcome in ("created", "updated", "removed"):
-                        logger.warning("[REAPER] %s: %s queue %s (%s -> %s)",
-                                       router_info.get("name"), outcome,
-                                       queue_name_for_credential(cred["id"]),
-                                       ",".join(cred_ips), cred.get("rate_limit"))
-                    if outcome in ("created", "updated", "unchanged") and cred.get("rate_limit"):
-                        limited_ips.extend(cred_ips)
+                if should_release:
+                    remove_failed = False
+                    for binding_id in bindings_by_credential.get((cred["id"], wanted), []):
+                        result = api.send_command("/ip/hotspot/ip-binding/remove",
+                                                  {"numbers": binding_id})
+                        if not result.get("success"):
+                            remove_failed = True
+                    if remove_failed:
+                        logger.warning("[REAPER] Credential %s binding removal failed; keeping bound MAC",
+                                       cred["id"])
+                        retained.add(cred["id"])
+                        continue
+                    if host and str(host.get("bypassed", "false")).lower() == "true":
+                        host_id = host.get(".id")
+                        if host_id:
+                            api.send_command("/ip/hotspot/host/remove", {"numbers": host_id})
+                    pending_releases.append({
+                        "id": cred["id"],
+                        "mac": mac,
+                        "normalized_mac": wanted,
+                        "bytes_in": int(host.get("bytes-in", 0) or 0) if host else 0,
+                        "bytes_out": int(host.get("bytes-out", 0) or 0) if host else 0,
+                        "ip": (host.get("address") or host.get("to-address")) if host else None,
+                    })
+                else:
+                    retained.add(cred["id"])
+                    if not host:
+                        continue
+                    host_ip = host.get("address") or host.get("to-address")
+                    out["to_update"].append({
+                        "id": cred["id"],
+                        "bytes_in": int(host.get("bytes-in", 0) or 0),
+                        "bytes_out": int(host.get("bytes-out", 0) or 0),
+                        "ip": host_ip,
+                    })
+                    live_ips.extend(host_ips_by_mac.get(wanted) or ([host_ip] if host_ip else []))
+            if queues_read and live_ips and "rate_limit" in cred:
+                cred_ips = _queue_target_ips(live_ips)
+                queue_name = queue_name_for_credential(cred["id"])
+                outcome = ensure_credential_queue_sync(
+                    api, cred_id=cred["id"], username=cred.get("username") or "",
+                    rate_limit=cred.get("rate_limit"), client_ip=cred_ips,
+                    existing_queue=queues_by_name.get(queue_name),
+                )
+                if outcome in ("created", "updated", "removed"):
+                    logger.warning("[REAPER] %s: %s queue %s (%s -> %s)",
+                                   router_info.get("name"), outcome, queue_name,
+                                   ",".join(cred_ips), cred.get("rate_limit"))
+                if outcome in ("created", "updated", "unchanged") and cred.get("rate_limit"):
+                    limited_ips.extend(cred_ips)
         if limited_ips:
             _ensure_credential_queue_fasttrack_bypass(api, router_info.get("name"), limited_ips)
         if pending_releases:
@@ -2530,6 +2532,10 @@ def _scan_router_idle_credentials_sync(
                 if h.get("mac-address")
                 and str(h.get("bypassed", "false")).lower() == "true"
             }
+            retained.update(entry["id"] for entry in pending_releases
+                            if (entry["id"], entry["normalized_mac"]) in remaining
+                            or entry["normalized_mac"] in bypassed_macs)
+            removed_queues = set()
             for entry in pending_releases:
                 key = (entry["id"], entry["normalized_mac"])
                 if key in remaining or entry["normalized_mac"] in bypassed_macs:
@@ -2537,8 +2543,9 @@ def _scan_router_idle_credentials_sync(
                                    entry["id"])
                     continue
                 queue_id = (queues_by_name.get(queue_name_for_credential(entry["id"])) or {}).get(".id")
-                if queue_id:
+                if queue_id and entry["id"] not in retained and queue_id not in removed_queues:
                     api.send_command("/queue/simple/remove", {"numbers": queue_id})
+                    removed_queues.add(queue_id)
                 entry.pop("normalized_mac")
                 out["to_release"].append(entry)
         return out
@@ -2595,6 +2602,7 @@ async def _reap_idle_access_credentials(db: AsyncSession) -> int:
     """Free credentials whose bound MAC is gone or idle, and refresh usage stats."""
     from app.db.models import AccessCredential, AccessCredStatus, Router as RouterModel
     from app.config import settings as _settings
+    from app.services.access_credentials import bound_credential_macs, set_bound_credential_macs
 
     threshold_minutes = max(1, int(getattr(_settings, "ACCESS_CRED_IDLE_RELEASE_MINUTES", 15)))
     threshold_seconds = threshold_minutes * 60
@@ -2640,6 +2648,7 @@ async def _reap_idle_access_credentials(db: AsyncSession) -> int:
         by_router[rid]["creds"].append({
             "id": c.id,
             "bound_mac_address": c.bound_mac_address,
+            "bound_macs": bound_credential_macs(c),
             "bound_at": c.bound_at.isoformat() if c.bound_at else None,
             "username": c.username,
             "rate_limit": c.rate_limit,
@@ -2669,6 +2678,7 @@ async def _reap_idle_access_credentials(db: AsyncSession) -> int:
     )
 
     cred_by_id = {c.id: c for c in creds}
+    saved_bound_times = {c.id: c.bound_at for c in creds}
     released_count = 0
     now = datetime.utcnow()
 
@@ -2683,10 +2693,10 @@ async def _reap_idle_access_credentials(db: AsyncSession) -> int:
             cred = await db.get(AccessCredential, entry["id"], populate_existing=True)
             if not cred:
                 continue
-            if (cred.status != AccessCredStatus.ACTIVE
-                    or not cred.bound_mac_address
-                    or normalize_mac_address(cred.bound_mac_address)
-                       != normalize_mac_address(entry["mac"])):
+            mac = normalize_mac_address(entry["mac"])
+            current = bound_credential_macs(cred)
+            if (cred.status != AccessCredStatus.ACTIVE or mac not in current
+                    or cred.bound_at != saved_bound_times[cred.id]):
                 continue
             if entry.get("bytes_in"):
                 cred.total_bytes_in = (cred.total_bytes_in or 0) + entry["bytes_in"]
@@ -2695,8 +2705,8 @@ async def _reap_idle_access_credentials(db: AsyncSession) -> int:
             if entry.get("ip"):
                 cred.last_seen_ip = entry["ip"]
             cred.last_seen_at = now
-            cred.bound_mac_address = None
-            cred.bound_at = None
+            set_bound_credential_macs(cred, [other for other in current if other != mac])
+            await db.flush()
             released_count += 1
 
         for entry in scan.get("to_update", []):

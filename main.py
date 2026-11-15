@@ -1913,6 +1913,9 @@ async def run_access_credential_migrations():
         await conn.run_sync(
             lambda c: AccessCredential.__table__.create(c, checkfirst=True)
         )
+        await conn.execute(sa_text(
+            "ALTER TABLE access_credentials ADD COLUMN IF NOT EXISTS additional_bound_macs JSON"
+        ))
 
         await conn.execute(sa_text(
             "CREATE INDEX IF NOT EXISTS idx_access_cred_user "

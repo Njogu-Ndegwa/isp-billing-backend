@@ -129,13 +129,14 @@ async def macs_in_use_on_router(db: AsyncSession, router_id: int, macs: set[str]
     )
     in_use.update(compacts[_compact(mac)] for (mac,) in rows.all() if mac)
     rows = await db.execute(
-        select(AccessCredential.bound_mac_address).where(
+        select(AccessCredential.bound_mac_address, AccessCredential.additional_bound_macs).where(
             AccessCredential.router_id == router_id,
             AccessCredential.status == AccessCredStatus.ACTIVE,
-            _mac_compact_expr(AccessCredential.bound_mac_address).in_(list(compacts)),
+            AccessCredential.bound_mac_address.isnot(None),
         )
     )
-    in_use.update(compacts[_compact(mac)] for (mac,) in rows.all() if mac)
+    in_use.update(compacts[key] for first, extra in rows.all() for mac in [first, *(extra or [])]
+                  if mac and (key := _compact(mac)) in compacts)
     return in_use
 
 

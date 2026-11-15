@@ -141,7 +141,9 @@ def _note_failure(router_id: int, now_mono: float) -> None:
 
 
 async def _load_work(now_mono: float) -> tuple[list[_Work], set[int]]:
-    from app.services.access_credentials import _router_info, comment_for_credential
+    from app.services.access_credentials import (
+        _router_info, bound_credential_macs, comment_for_credential, credential_device_limit,
+    )
 
     async with database.async_session() as db:
         rows = (await db.execute(
@@ -171,6 +173,9 @@ async def _load_work(now_mono: float) -> tuple[list[_Work], set[int]]:
                     "cred_id": cred.id, "username": cred.username,
                     "bound_mac_address": cred.router_sync_mac,
                 }
+                if credential_device_limit(cred, router) > 1:
+                    payload["all_bindings"] = True
+                    payload["bound_macs"] = bound_credential_macs(cred)
             work.append(_Work(cred.id, cred.router_sync, router.id, _router_info(router), payload))
         await db.commit()
     return work, routers
@@ -185,8 +190,10 @@ async def _record(item: _Work, result: dict) -> None:
         elif item.kind == SYNC_DELETE:
             await db.execute(delete(AccessCredential).where(same))
         else:
-            await db.execute(update(AccessCredential).where(same).values(
-                router_sync=None, router_sync_since=None, router_sync_error=None, router_sync_mac=None))
+            values = dict(router_sync=None, router_sync_since=None, router_sync_error=None, router_sync_mac=None)
+            if item.kind == SYNC_REMOVE and item.payload.get("all_bindings"):
+                values.update(bound_mac_address=None, additional_bound_macs=None, bound_at=None)
+            await db.execute(update(AccessCredential).where(same).values(**values))
         await db.commit()
 
 
