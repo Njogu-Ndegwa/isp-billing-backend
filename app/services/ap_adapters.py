@@ -357,7 +357,7 @@ class TendaV12Adapter(TendaApAdapter):
                        preferred: Optional[str] = None) -> List[LoginAttempt]:
         encoded = base64.b64encode(password.encode()).decode()
         digest = hashlib.md5((encoded + self._challenge).encode()).hexdigest()
-        return [LoginAttempt("tenda_v12_challenge", {"password": digest})]
+        return [LoginAttempt("tenda_v12", {"password": digest})]
 
     def parse_status(self, body: str, parse_json: Callable[[str], Any]) -> ApStatus:
         data = parse_json(body)

@@ -99,7 +99,7 @@ def test_firmware_detected_independently_of_model_label(model):
     cred = _cred()
     cred.model = model
     result = status(fake, cred)
-    assert result["success"] and result["login_method"] == "tenda_v12_challenge"
+    assert result["success"] and result["login_method"] == "tenda_v12"
     assert result["status"]["firmware"] == "V12.01.01.59_multi"
     assert result["status"]["mode"] == "router"
     assert result["status"]["protocol"] == "tenda_v12"
@@ -220,3 +220,54 @@ def test_v12_ap_setup_stops_before_any_unverified_setter(monkeypatch):
     assert len(fake.fetches) == 3  # challenge, login, status; no setter or reboot
     assert not fake.rebooted
     assert not fake.mutating_router_calls
+
+
+def test_v12_login_method_fits_existing_credential_columns():
+    from app.db.database import Base
+    method = ap_adapters.TendaV12Adapter("test-challenge").login_attempts("admin", "test-password")[0].method
+    for table in ("customer_cpe_credentials", "router_ap_credentials"):
+        assert len(method) <= Base.metadata.tables[table].c.login_method.type.length
+
+
+# Use the real route/session fixtures: a service-only success did not exercise
+# the Postgres VARCHAR(16) write and missed the first live API failure.
+from tests.test_cpe_control import client, _pppoe_customer, _saved_cred, _owner_token, headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["status", "reboot"])
+async def test_v12_success_is_persisted_through_http(client, db, monkeypatch, action):
+    from sqlalchemy import select
+    from app.config import settings
+    from app.db.models import CustomerCpeCredential
+    from app.services import staff_access
+    from tests.factories import make_reseller, make_router
+
+    monkeypatch.setattr(settings, "AP_CONTROL_ENABLED_FOR", "all")
+    staff_access.reset_cache()
+    ap_control.reset_claims()
+    fake = V12Router()
+    monkeypatch.setattr(cpe_control, "_with_api",
+                        lambda info, factory, fn: ap_control._with_api(info, fake.factory, fn))
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_INFO["ip"])
+    customer = await _pppoe_customer(db, owner, router)
+    await _saved_cred(db, customer.id, failed_login_count=1, last_error="earlier failure")
+    url = f"/api/customers/{customer.id}/cpe/{action}"
+    try:
+        response = (await client.get(url, headers=headers(_owner_token(owner))) if action == "status"
+                    else await client.post(url, headers=headers(_owner_token(owner)), json={"confirm": True}))
+        assert response.status_code == 200, response.text
+        row = (await db.execute(select(CustomerCpeCredential))).scalar_one()
+        await db.refresh(row)
+        assert row.login_method == "tenda_v12"
+        assert row.last_login_ok is True
+        assert row.failed_login_count == 0 and row.last_error is None
+        assert row.last_action == action
+        if action == "status":
+            assert row.last_status["firmware"] == "V12.01.01.59_multi"
+        else:
+            assert row.last_reboot_at is not None and fake.rebooted
+    finally:
+        staff_access.reset_cache()
+        ap_control.reset_claims()
