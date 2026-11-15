@@ -71,6 +71,15 @@ def test_shadow_database_connections_are_read_only(monkeypatch):
     assert "lock_timeout" in server_settings
 
 
+def test_app_connections_never_jit_compile(monkeypatch):
+    """JIT compile time (0.4-1.4 s) dwarfed the transactions queries it sped up."""
+    from app.db.database import connection_server_settings
+
+    for shadow in (False, True):
+        monkeypatch.setattr(settings, "SHADOW_MODE", shadow)
+        assert connection_server_settings()["jit"] == "off"
+
+
 @pytest.mark.asyncio
 async def test_shadow_startup_registers_no_migrations_or_jobs(monkeypatch):
     import main
