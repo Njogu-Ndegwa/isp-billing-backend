@@ -358,10 +358,13 @@ async def ap_status(
     token: str = Depends(verify_token),
 ):
     router_info, router_name, cred = await _prepare_action(db, router_id, ap_mac, token)
-    result = await run_with_guard(
-        router_id, ap_control.read_status_sync, router_info, cred,
-        acquire_timeout_seconds=5, timeout_seconds=_AP_READ_TIMEOUT,
-    )
+    try:
+        result = await ap_control.run_claimed_action(
+            router_id, ap_control.read_status_sync, router_info, cred,
+            run_guard=run_with_guard, timeout_seconds=_AP_READ_TIMEOUT,
+        )
+    except ap_control.ApActionBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if result.get("error") == "connect_failed":
         await record_router_availability(db, router_id, False, "ap_status")
     await _persist_outcome(router_id, cred.ap_mac, ap_control.ACTION_STATUS, result)

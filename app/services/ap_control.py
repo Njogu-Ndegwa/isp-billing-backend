@@ -109,6 +109,37 @@ def reset_claims() -> None:
         _claims.clear()
 
 
+class ApActionBusy(Exception):
+    """Another CPE/AP login or write already owns this MikroTik's action slot."""
+
+
+async def run_claimed_action(router_id, sync_fn, *args, run_guard, timeout_seconds):
+    """Serialize status logins with writes, retaining ownership past timeout.
+
+    The HTTP caller can time out while its thread still talks to the device.
+    Only that worker releases a started claim; queued abandoned work never runs.
+    """
+    claim = try_claim(router_id)
+    if claim is None:
+        raise ApActionBusy(
+            "Another router (CPE/AP) action is running on this router. Wait for it to finish."
+        )
+
+    def worker(*values):
+        if not begin_claim(claim):
+            return {"error": "cancelled", "message": "The request expired before it started."}
+        try:
+            return sync_fn(*values)
+        finally:
+            release_claim(claim)
+
+    try:
+        return await run_guard(router_id, worker, *args,
+                               acquire_timeout_seconds=5, timeout_seconds=timeout_seconds)
+    finally:
+        abandon_if_not_started(claim)
+
+
 # ---------------------------------------------------------------------------
 # Credential view passed into the worker (password already decrypted)
 # ---------------------------------------------------------------------------

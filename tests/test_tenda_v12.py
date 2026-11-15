@@ -271,3 +271,50 @@ async def test_v12_success_is_persisted_through_http(client, db, monkeypatch, ac
     finally:
         staff_access.reset_cache()
         ap_control.reset_claims()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("competing", ["status", "reboot", "disconnect"])
+async def test_status_claim_rejects_competing_cpe_actions(client, db, monkeypatch, competing):
+    import asyncio
+    import threading
+    from app.config import settings
+    from app.services import staff_access
+    from tests.factories import make_reseller, make_router
+
+    entered, release = threading.Event(), threading.Event()
+    class PausedLogin(V12Router):
+        def _fetch(self, params):
+            if params["url"].endswith("/goform/getstok"):
+                entered.set()
+                assert release.wait(10), "test did not release login"
+            return super()._fetch(params)
+
+    monkeypatch.setattr(settings, "AP_CONTROL_ENABLED_FOR", "all")
+    staff_access.reset_cache()
+    ap_control.reset_claims()
+    fake = PausedLogin()
+    monkeypatch.setattr(cpe_control, "_with_api",
+                        lambda info, factory, fn: ap_control._with_api(info, fake.factory, fn))
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_INFO["ip"])
+    customer = await _pppoe_customer(db, owner, router)
+    await _saved_cred(db, customer.id)
+    auth = headers(_owner_token(owner))
+    base = f"/api/customers/{customer.id}/cpe"
+    first = asyncio.create_task(client.get(base + "/status", headers=auth))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        response = (await client.get(base + "/status", headers=auth) if competing == "status"
+                    else await client.post(base + "/" + competing, headers=auth, json={"confirm": True}))
+        assert response.status_code == 409, response.text
+        assert "Another router (CPE/AP) action" in response.json()["detail"]
+        assert not fake.rebooted and not fake.removed_sessions
+        release.set()
+        assert (await first).status_code == 200
+        assert not ap_control.ap_write_in_progress(router.id)
+    finally:
+        release.set()
+        await first
+        staff_access.reset_cache()
+        ap_control.reset_claims()
