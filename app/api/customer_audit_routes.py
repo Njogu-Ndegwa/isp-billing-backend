@@ -191,10 +191,9 @@ def _router_status_items(
         return next((t for t in tunnels if t[0] <= at and (t[1] is None or at < t[1])), None)
 
     out: list[dict] = []
-    site_starts, site_ends = set(), set()
+    site_ends = set()
     for outage in judged["outages"]:
         started, ended = span(outage)
-        site_starts.add(started)
         if ended is not None:
             site_ends.add(ended)
         if _in_window(started, window_end, window_start, inclusive):
@@ -216,8 +215,8 @@ def _router_status_items(
                 router_id=router_id, ref=f"rt-up:{router_id}:{ended.isoformat()}",
             ))
     for started, ended in tunnels:
-        # A site outage that opens the tunnel outage already says so.
-        if started not in site_starts and _in_window(started, window_end, window_start, inclusive):
+        # The site coming back with the tunnel still down already says so.
+        if started not in site_ends and _in_window(started, window_end, window_start, inclusive):
             out.append(_item(
                 started, "router", "tunnel_down",
                 "Management tunnel down, site still online: the router kept reaching Bitwave "

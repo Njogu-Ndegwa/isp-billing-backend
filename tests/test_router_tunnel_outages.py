@@ -53,14 +53,43 @@ def test_an_outage_with_no_public_call_is_still_the_site():
 
 
 def test_calls_over_the_internet_make_it_a_tunnel_outage():
-    contacts = [_at(m) for m in (72, 76, 80, 95, 110, 125)]
+    # The outage starts at 64 (failures within 8 minutes of the last report,
+    # at 55, do not count); the router calls over the internet from 65.
+    contacts = [_at(m) for m in (65, 72, 76, 80, 95, 110, 125)]
     out = _split(_checks(60, 135), contacts, now=_at(180))
     assert out["outages"] == []
     (tunnel,) = out["tunnel_outages"]
-    # Failures within 8 minutes of the last report (at 55) do not count.
-    assert tunnel["started_at"] == _at(64).isoformat()
+    assert tunnel["started_at"] == _at(65).isoformat()
     assert tunnel["ended_at"] == _at(135).isoformat()
-    assert tunnel["public_contacts"] == 6
+    assert tunnel["public_contacts"] == 7
+
+
+def test_before_the_first_call_the_site_still_counts_as_down():
+    # 2026-10-12, router 351: silent from 13:59, first call over the
+    # internet at 14:12. Nothing proves the site was up in between.
+    contacts = [_at(m) for m in (77, 81, 85, 97, 101, 110)]
+    out = _split(_checks(60, 135), contacts, now=_at(180))
+    (site,) = out["outages"]
+    assert (site["started_at"], site["ended_at"]) == (_at(64).isoformat(), _at(77).isoformat())
+    (tunnel,) = out["tunnel_outages"]
+    assert (tunnel["started_at"], tunnel["ended_at"]) == (_at(77).isoformat(), _at(135).isoformat())
+
+
+def test_a_power_cut_is_not_turned_into_a_tunnel_outage_by_the_boot_call():
+    # Down 30 minutes; on boot the reaper calls over the internet before the
+    # tunnel is up, then the reports resume.
+    out = _split(_checks(60, 95), [_at(91)], now=_at(180))
+    assert len(out["outages"]) == 1 and out["tunnel_outages"] == []
+
+
+def test_a_site_back_before_its_tunnel_is_down_then_tunnel_only():
+    # Internet back at 90 but the tunnel stays dead another hour: site
+    # downtime until the first call, tunnel outage after.
+    contacts = [_at(m) for m in (90, 100, 120, 140)]
+    out = _split(_checks(60, 150), contacts, now=_at(180))
+    (site,) = out["outages"]
+    assert (site["started_at"], site["ended_at"]) == (_at(64).isoformat(), _at(90).isoformat())
+    assert out["tunnel_outages"][0]["started_at"] == _at(90).isoformat()
 
 
 def test_a_long_quiet_stretch_inside_a_tunnel_outage_is_still_site_downtime():
@@ -77,14 +106,14 @@ def test_a_long_quiet_stretch_inside_a_tunnel_outage_is_still_site_downtime():
 def test_a_tunnel_outage_still_going_with_no_recent_call_is_the_site_again():
     last_call = 70
     now = last_call + PUBLIC_CONTACT_SILENCE.total_seconds() / 60 + 30
-    out = _split(_checks(60, int(now), until=int(now)), [_at(last_call)], now=_at(now))
+    out = _split(_checks(60, int(now), until=int(now)), [_at(65), _at(last_call)], now=_at(now))
     (site,) = out["outages"]
     assert site["started_at"] == _at(last_call).isoformat() and site["ended_at"] is None
     assert out["tunnel_outages"][0]["ended_at"] is None
 
 
 def test_activity_log_says_tunnel_down_not_site_offline():
-    contacts = [_at(m) for m in (72, 90, 110, 125)]
+    contacts = [_at(m) for m in (65, 72, 90, 110, 125)]
     items = _router_status_items(
         _checks(60, 135), 448, window_start=T, window_end=_at(180), public_contacts=contacts,
     )
@@ -117,7 +146,7 @@ async def test_uptime_does_not_count_a_tunnel_outage(db):
             await record_router_availability(None, router.id, False, "provisioning", checked_at=at)
         else:
             await record_router_availability(None, router.id, True, "usage_push", checked_at=at)
-    for m in (70, 85, 100, 115, 130):
+    for m in (66, 70, 85, 100, 115):
         db.add(RouterPublicContact(router_id=router.id, contacted_at=start + timedelta(minutes=m),
                                    source="expiry_check"))
     await db.commit()
