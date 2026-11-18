@@ -11,6 +11,7 @@ never runs while a cleanup transaction is open.
 import asyncio
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from sqlalchemy import or_, select
@@ -183,6 +184,102 @@ async def resolve_paybills(
         out[router_id] = await _paybill_for_method(
             db, pm, resolve_direct_destination, reseller.id, router_id
         )
+    return out
+
+
+@dataclass(frozen=True)
+class PaymentTarget:
+    """Where a customer on one router can pay by hand, for SMS wording.
+
+    ``account`` overrides the customer's own account number (a bank paybill
+    needs the reseller's bank account); None means "the customer's account".
+    """
+    paybill: str | None = None
+    account: str | None = None
+    till: str | None = None
+    # False when a hand payment reaches the reseller but not us (no C2B), so
+    # the customer is not renewed until the reseller does it.
+    auto_renews: bool = False
+
+    def fields(self, customer_account: str | None) -> dict[str, str | None]:
+        """build_context keyword arguments for one customer."""
+        if self.till:
+            return {"paybill": None, "account_number": customer_account, "till": self.till}
+        if self.paybill and (self.account or customer_account):
+            return {
+                "paybill": self.paybill,
+                "account_number": self.account or customer_account,
+                "till": None,
+            }
+        return {"paybill": None, "account_number": customer_account, "till": None}
+
+
+def payment_fields(
+    target: PaymentTarget | None, customer_account: str | None
+) -> dict[str, str | None]:
+    """build_context payment kwargs. No customer account (hotspot) = none."""
+    if target is None or not customer_account:
+        return {"paybill": None, "account_number": customer_account, "till": None}
+    return target.fields(customer_account)
+
+
+async def resolve_payment_targets(
+    db, reseller: User, router_ids
+) -> dict[int | None, PaymentTarget | None]:
+    """What customer SMS tell customers on each router to pay into.
+
+    Starts from ``resolve_paybills`` (a paybill whose payments reach us and
+    renew the customer). Where that has none because the reseller settles
+    directly into a bank paybill, an M-Pesa paybill or a till without a C2B
+    registration we can see, the SMS still names that destination: a
+    customer has to know where to pay (Dennis, 18 Nov). Such a payment lands
+    with the reseller but is not matched to the customer automatically; the
+    reseller renews them.
+    """
+    from app.services.direct_settlement import (
+        default_direct_method,
+        resolve_direct_destination,
+    )
+    from app.services.payment_gateway import resolve_collection_payment_method
+
+    router_ids = set(router_ids)
+    paybills = await resolve_paybills(db, reseller, router_ids)
+    out: dict[int | None, PaymentTarget | None] = {}
+    for router_id in router_ids:
+        if paybills.get(router_id):
+            out[router_id] = PaymentTarget(paybill=paybills[router_id], auto_renews=True)
+            continue
+        out[router_id] = None
+        if reseller_market(reseller).code != "KE":
+            continue
+        pm = (
+            await resolve_collection_payment_method(db, router_id)
+            if router_id else await default_direct_method(db, reseller.id)
+        )
+        if pm is None:
+            continue
+        method_type = pm.method_type
+        if isinstance(method_type, str):
+            method_type = ResellerPaymentMethodType(method_type)
+        if method_type == ResellerPaymentMethodType.MPESA_PAYBILL_WITH_KEYS:
+            # The reseller's own shortcode; C2B not registered with us.
+            if (pm.mpesa_shortcode or "").strip():
+                out[router_id] = PaymentTarget(paybill=pm.mpesa_shortcode.strip())
+            continue
+        destination = await resolve_direct_destination(db, pm)
+        if destination is None or not destination.party_b:
+            continue
+        party_b = str(destination.party_b).strip()
+        if method_type == ResellerPaymentMethodType.MPESA_TILL:
+            out[router_id] = PaymentTarget(till=party_b)
+        elif method_type == ResellerPaymentMethodType.BANK_ACCOUNT:
+            out[router_id] = PaymentTarget(
+                paybill=party_b, account=(destination.account_reference or "").strip() or None,
+            )
+            if out[router_id].account is None:
+                out[router_id] = None
+        elif method_type == ResellerPaymentMethodType.MPESA_PAYBILL:
+            out[router_id] = PaymentTarget(paybill=party_b)
     return out
 
 
@@ -381,7 +478,7 @@ async def _queue_expiry_style_campaign(
         if not rows:
             return None
     support_phone = await reseller_support_phone(db, reseller)
-    paybills = await resolve_paybills(db, reseller, {row.router_id for row in rows})
+    targets = await resolve_payment_targets(db, reseller, {row.router_id for row in rows})
 
     recipients: list[tuple[int, str, str, str]] = []
     seen_phones: set[str] = set()
@@ -403,7 +500,8 @@ async def _queue_expiry_style_campaign(
             if row.connection_type == ConnectionType.PPPOE
             else None
         )
-        paybill = paybills.get(row.router_id) if payment_account else None
+        payment = payment_fields(targets.get(row.router_id), payment_account)
+        paybill = payment["paybill"]
         uses_paybill = uses_paybill or bool(payment_account and paybill)
         summary_paybill = summary_paybill or paybill
         context = templates.build_context(
@@ -412,9 +510,8 @@ async def _queue_expiry_style_campaign(
             customer_name=row.name,
             plan_name=row.plan_name,
             expiry=row.expiry,
-            account_number=payment_account,
-            paybill=paybill,
             support_phone=support_phone,
+            **payment,
         )
         recipients.append((
             row.id,

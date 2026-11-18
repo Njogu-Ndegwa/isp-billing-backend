@@ -276,23 +276,33 @@ async def preview_customer_event_message(body: TemplatePreviewIn,
     router_ids = set((await db.execute(
         select(Router.id).where(Router.user_id == user.id)
     )).scalars().all()) or {None}
-    paybills = await customer_expiry_notifications.resolve_paybills(db, user, router_ids)
-    advertised = sorted({p for p in paybills.values() if p})
+    targets = await customer_expiry_notifications.resolve_payment_targets(db, user, router_ids)
+    known = [t for t in targets.values() if t is not None]
     paybill_note = None
-    if advertised:
-        context["paybill"] = advertised[0]
-        if len(advertised) > 1 or None in paybills.values():
-            paybill_note = ("The paybill shown differs by router; some customers "
-                            "get no paybill line.")
+    if known:
+        context.update(customer_expiry_notifications.payment_fields(
+            known[0], context["account"]
+        ))
+        context["account"] = context.pop("account_number")
+        if len(set(known)) > 1 or None in targets.values():
+            paybill_note = ("The payment details shown differ by router; some "
+                            "customers get no payment line.")
+        elif not known[0].auto_renews:
+            paybill_note = (
+                "Customers who pay into this account by hand reach you directly, "
+                "not us, so they are not renewed automatically: renew them "
+                "yourself, or register C2B for an M-Pesa paybill under Payment "
+                "methods."
+            )
     else:
         context["paybill"] = ""
         context["account"] = ""
         if market.code == "KE":
+            # Shown as a warning on the SMS settings screen.
             paybill_note = (
-                "Customers are paid straight into your own M-Pesa account, which "
-                "is not registered with us for account-number (C2B) payments, so "
-                "messages leave out the \"Pay via Paybill\" line. Register C2B "
-                "for your paybill under Payment methods to include it."
+                "Your messages have no payment details: none of your routers has "
+                "an active payment method customers can pay into. Add one under "
+                "Payment methods."
             )
     text = sms_templates.render(
         body.event, context, {body.event: custom} if custom else None
