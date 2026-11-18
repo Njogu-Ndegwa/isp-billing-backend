@@ -4334,6 +4334,19 @@ async def startup_event():
         max_instances=1,
         misfire_grace_time=60,
     )
+    from app.services.lb_auto_activate import (
+        LB_AUTO_ACTIVATE_INTERVAL_SECONDS,
+        auto_activate_dormant_wans_background,
+    )
+    scheduler.add_job(
+        auto_activate_dormant_wans_background,
+        trigger=IntervalTrigger(seconds=LB_AUTO_ACTIVATE_INTERVAL_SECONDS),
+        id='lb_auto_activate_dormant_wans',
+        name='Load balancing: switch on saved WAN lines once they work',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=60,
+    )
     scheduler.add_job(
         reconcile_lb_paid_background,
         trigger=IntervalTrigger(seconds=271),
