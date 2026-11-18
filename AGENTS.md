@@ -126,6 +126,24 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   native Hetzner path, but **`isp_billing_app` there must stay STOPPED**. On 2026-09-22 the
   old CI step restarted it and its stale scheduler deleted 1,062 paid-client router bindings.
   Never start it — by hand or from CI.
+- **Rules for agents on the AWS box** (Dennis, 2026-09-23 — "be careful not to start that app"):
+  - Don't go there unless the task needs something only AWS has. Router work goes through
+    `isp_billing_hetzner_app` on Hetzner, which reaches every router (natively over wg2, or
+    via `wg-aws-transit`) — you never need AWS to talk to a router.
+  - Never run `docker compose`, `docker start/restart/run`, or any deploy there, and never
+    edit `/home/dennis/apps/isp-billing/.env` (it carries the `RUN_SCHEDULER=false` fence; do
+    NOT add `SHADOW_MODE`, `isp_wg_manager` reads it).
+  - If you really must use it as a second network vantage point: plain `python3` stdlib only,
+    no `docker exec`, no app code; delete anything you copy to `/tmp` (especially credentials).
+  - Open one SSH connection at a time. UFW rate-limits port 22 (`LIMIT`), so polling loops
+    get the connection reset and lock you out for about a minute.
+  - Before leaving, `docker ps` must show only `isp_billing_postgres`, `isp_billing_radius`
+    and `isp_wg_manager`.
+- **Env switches on the Hetzner host:** `.env.hetzner` was built from the shadow template, and
+  on 2026-09-23 `SMS_DISPATCH_ENABLED=false` was found still set ~40 h after promotion — no
+  SMS (customer campaigns, reseller alerts, expiry reminders) left production in that time.
+  After any env rebuild or promotion, diff every `*_ENABLED` / boolean switch in
+  `.env.hetzner` against the defaults in `app/config.py` and justify each difference.
 - Routers keep their stored `10.0.X.Y` address; the Hetzner host routes each one natively
   via wg2 (`10.251.0.0/16`) once `ops/native-router-route-sync.py` (30 s timer) has verified
   it, else via `wg-aws-transit`. Scripts never choose a path.
