@@ -24,7 +24,11 @@ from app.db.models import (
     Router,
     RouterCommand,
 )
-from app.services.mikrotik_api import normalize_mac_address, parse_speed_to_mikrotik
+from app.services.mikrotik_api import (
+    DEFAULT_PPPOE_DNS_SERVERS,
+    normalize_mac_address,
+    parse_speed_to_mikrotik,
+)
 from app.services.customer_grace import effective_expiry, has_access_time
 from app.services.pull_provisioning import render_hotspot_provision_rsc
 
@@ -131,6 +135,7 @@ def render_pppoe_provision_action(
 }} else={{
     /ppp profile set [find name=\"{profile}\"] rate-limit=\"{rate}\"
 }}
+:do {{ :if ([:len [:tostr [/ppp profile get [find name=\"{profile}\"] dns-server]]] = 0) do={{ /ppp profile set [find name=\"{profile}\"] dns-server={DEFAULT_PPPOE_DNS_SERVERS} }} }} on-error={{}}
 :if ([:len [/ppp secret find name=\"{user}\"]] = 0) do={{
     /ppp secret add name=\"{user}\" password=\"{password_q}\" service=pppoe profile=\"{profile}\" comment=\"{comment_q}\"{caller_arg}
 }} else={{
