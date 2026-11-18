@@ -708,22 +708,45 @@ async def collect_due_reminder_groups(
             row.connection_type, row.pppoe_username
         ):
             continue
-        period = plan_duration_minutes(row.duration_value, row.duration_unit)
-        for offset_minutes in offsets_by_reseller[row.user_id]:
-            if row.expiry > now + timedelta(minutes=offset_minutes):
-                continue
-            if not reminder_fits_plan(offset_minutes, period):
-                continue
-            category = reminder_message_category(row.expiry, offset_minutes)
-            if (row.id, category) in existing:
-                continue
-            group_key = (row.user_id, offset_minutes)
-            group_phone_keys = seen_phones.setdefault(group_key, set())
-            if phone_key in group_phone_keys:
-                continue
-            group_phone_keys.add(phone_key)
-            groups.setdefault(group_key, []).append(row.id)
+        offset_minutes = nearest_due_offset(
+            offsets_by_reseller[row.user_id],
+            expiry=row.expiry,
+            now=now,
+            period_minutes=plan_duration_minutes(
+                row.duration_value, row.duration_unit
+            ),
+        )
+        if offset_minutes is None:
+            continue
+        category = reminder_message_category(row.expiry, offset_minutes)
+        if (row.id, category) in existing:
+            continue
+        group_key = (row.user_id, offset_minutes)
+        group_phone_keys = seen_phones.setdefault(group_key, set())
+        if phone_key in group_phone_keys:
+            continue
+        group_phone_keys.add(phone_key)
+        groups.setdefault(group_key, []).append(row.id)
     return groups
+
+
+def nearest_due_offset(
+    offsets, *, expiry: datetime, now: datetime, period_minutes: int | None
+) -> int | None:
+    """The one reminder a customer should get now, or None.
+
+    When several offsets are due at once (the expiry was moved close, or the
+    job was down), only the one nearest expiry is sent; the earlier ones are
+    out of date and count as handled. Because the nearest due offset is the
+    only one ever considered, a skipped 3-day reminder never fires after the
+    1-hour one has gone out.
+    """
+    due = [
+        offset for offset in offsets
+        if expiry <= now + timedelta(minutes=offset)
+        and reminder_fits_plan(offset, period_minutes)
+    ]
+    return min(due) if due else None
 
 
 async def _queue_reseller_reminder_campaign(
