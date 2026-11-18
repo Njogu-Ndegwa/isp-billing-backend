@@ -7,9 +7,12 @@ use are listed in ``EVENT_PLACEHOLDERS`` and enforced when the template is
 saved.
 
 The defaults are rendered by code rather than from a placeholder string because
-they drop a whole clause when its data is missing (no paybill outside Kenya, no
-reference on a cash payment). A custom template is the reseller's own wording,
-so it is rendered literally and an empty field simply renders empty.
+they drop a whole clause when its data is missing (no paybill outside Kenya or
+for a direct-settlement reseller, no reference on a cash payment). A custom
+template follows the same rule: a sentence whose field is empty is left out
+rather than sent half-filled ("Pay via M-Pesa Paybill , Account 123"), and a
+dropped paybill sentence in a reminder or expiry notice is replaced by the same
+"Please renew" line the default uses.
 
 Pure functions only: no database, no I/O.
 """
@@ -106,8 +109,34 @@ def validate_template(event: str, body: str) -> str | None:
     return None
 
 
-def render_custom(body: str, context: dict[str, str]) -> str:
-    """Fill a reseller template. Unknown fields are left as typed."""
+# Fields that are always filled (build_context gives them a fallback), so a
+# sentence holding one is never dropped.
+_ALWAYS_FILLED = frozenset({"name", "brand", "plan"})
+
+# Sentence boundaries: end punctuation followed by space, or a line break. The
+# separator is captured so the reseller's spacing and line breaks survive.
+_SENTENCE_BREAK = re.compile(r"((?<=[.!?]) +|\s*\n\s*)")
+
+# What the default says instead of the paybill line when there is none.
+_RENEW_INSTEAD = {
+    EVENT_REMINDER: "Please renew to avoid disconnection.",
+    EVENT_EXPIRY: "Please renew to restore service.",
+}
+
+
+def _has_empty_field(sentence: str, context: dict[str, str]) -> bool:
+    return any(
+        key in context and key not in _ALWAYS_FILLED and not context[key]
+        for key in _PLACEHOLDER.findall(sentence)
+    )
+
+
+def render_custom(body: str, context: dict[str, str], event: str | None = None) -> str:
+    """Fill a reseller template. Unknown fields are left as typed.
+
+    A sentence that uses a field with no value is dropped, as the defaults do,
+    so customers never get "Pay via M-Pesa Paybill , Account 123" or "Ref .".
+    """
 
     def _fill(match: re.Match) -> str:
         key = match.group(1)
@@ -115,8 +144,27 @@ def render_custom(body: str, context: dict[str, str]) -> str:
             return match.group(0)
         return context[key] or ""
 
-    text = _PLACEHOLDER.sub(_fill, body.strip())
-    return re.sub(r"[ \t]{2,}", " ", text).strip()
+    parts = _SENTENCE_BREAK.split(body.strip())
+    kept: list[str] = []
+    renew_added = False
+    for index in range(0, len(parts), 2):
+        sentence = parts[index]
+        separator = parts[index + 1] if index + 1 < len(parts) else ""
+        if _has_empty_field(sentence, context):
+            renew = _RENEW_INSTEAD.get(event)
+            if renew and "{paybill}" in sentence and not renew_added:
+                kept.append(renew + (separator or " "))
+                renew_added = True
+            continue
+        kept.append(sentence + separator)
+
+    text = _PLACEHOLDER.sub(_fill, "".join(kept))
+    text = re.sub(r"[ \t]{2,}", " ", text).strip()
+    if not text:
+        # Every sentence needed a missing field: the default is better than
+        # an empty message.
+        return _DEFAULTS[event](context) if event in _DEFAULTS else ""
+    return text
 
 
 def custom_template(templates, event: str) -> str | None:
@@ -277,5 +325,5 @@ def render(event: str, context: dict[str, str], templates=None) -> str:
     """The message for `event`: the reseller's template if set, else the default."""
     custom = custom_template(templates, event)
     if custom is not None:
-        return render_custom(custom, context)
+        return render_custom(custom, context, event)
     return _DEFAULTS[event](context)

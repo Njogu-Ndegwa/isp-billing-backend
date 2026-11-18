@@ -894,3 +894,56 @@ async def test_hotspot_only_reseller_with_include_off_queues_nothing(
         )
     ).scalar_one()
     assert credits.balance == 5
+
+
+async def test_only_the_nearest_due_reminder_is_sent_when_several_are_due(
+    db, session_factory,
+):
+    """Expiry moved to within 1 hour used to send the 3-day and 1-hour reminders together."""
+    now = datetime.utcnow().replace(microsecond=0)
+    reseller = await _reminder_reseller(db, offsets=(4320, 60))
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.PPPOE)
+    customer = await make_customer(
+        db, reseller, plan, status=CustomerStatus.ACTIVE,
+        expiry=now + timedelta(minutes=45), pppoe_username="edited",
+        phone="254700000222",
+    )
+
+    groups = await customer_expiry_notifications.collect_due_reminder_groups(
+        session_factory=session_factory, now=now,
+    )
+    assert groups == {(reseller.id, 60): [customer.id]}
+
+    # Once the 1-hour reminder has gone out, the skipped 3-day one stays skipped.
+    db.add(SmsMessage(
+        user_id=reseller.id,
+        customer_id=customer.id,
+        recipient_phone=customer.phone,
+        body="Reminder",
+        segments=1,
+        credits_charged=1,
+        kind=SmsMessageKind.RESELLER_TO_CUSTOMER,
+        status=SmsMessageStatus.SENT,
+        category=customer_expiry_notifications.reminder_message_category(
+            customer.expiry, 60
+        ),
+    ))
+    await db.commit()
+    groups = await customer_expiry_notifications.collect_due_reminder_groups(
+        session_factory=session_factory, now=now + timedelta(minutes=5),
+    )
+    assert groups == {}
+
+
+async def test_nearest_due_offset_normal_progression():
+    now = datetime(2030, 1, 1)
+    expiry = now + timedelta(days=2)
+    assert customer_expiry_notifications.nearest_due_offset(
+        [4320, 60], expiry=expiry, now=now, period_minutes=None
+    ) == 4320
+    assert customer_expiry_notifications.nearest_due_offset(
+        [4320, 60], expiry=expiry, now=expiry - timedelta(minutes=30), period_minutes=None
+    ) == 60
+    assert customer_expiry_notifications.nearest_due_offset(
+        [60], expiry=expiry, now=now, period_minutes=None
+    ) is None
