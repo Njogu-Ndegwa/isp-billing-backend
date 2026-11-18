@@ -454,6 +454,8 @@ async def enable_load_balancing(
     router_obj.lb_config = {
         "wan_ports": list(request.wan_ports),
         "applied_at": applied_at.isoformat(),
+        # Watched by lb_auto_activate: switched on by itself once the line works.
+        "dormant_ports": list(result.get("dormant_ports") or []),
     }
     router_obj.lb_applied_at = applied_at
     await db.commit()
