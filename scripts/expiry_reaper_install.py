@@ -6,7 +6,8 @@ Run inside the app container (uses the app's DB models and RouterOS client):
     docker exec -e ROUTER_IDS=478,464 -e APPLY=1 -i isp_billing_hetzner_app python - < scripts/expiry_reaper_install.py
     docker exec -e ROUTER_IDS=478 -e UNINSTALL=1 -e APPLY=1 -i isp_billing_hetzner_app python - < scripts/expiry_reaper_install.py
 
-Without APPLY=1 it only reports what it would change. Skips RADIUS routers,
+ALLOW_SMALL=1 lets hAP lite class boards in (pilot), only with a working tunnel
+and at least MIN_FREE_MB free. Without APPLY=1 it only reports what it would change. Skips RADIUS routers,
 suspended/inactive owners, unreachable routers, RouterOS < 6.43, and small
 boards with no route to the tunnel address (ALLOW_HTTPS=1 overrides). With
 APPLY=1, per router:
@@ -47,6 +48,12 @@ APPLY = os.environ.get("APPLY") == "1"
 # HTTPS (5-7 s of full CPU per call on a hAP lite): skipped unless allowed.
 ALLOW_HTTPS = os.environ.get("ALLOW_HTTPS") == "1"
 ALLOW_BUSY = os.environ.get("ALLOW_BUSY") == "1"
+# hAP lite class pilot (2026-10-11): their CPU is mostly idle now that the
+# push is off them and Bitwave scripts take turns (router_script_gate), so the
+# reaper can enforce expiry while the server can't reach them. Free RAM is the
+# limit (5-8 MB of 32), so a router below MIN_FREE_MB is still skipped.
+ALLOW_SMALL = os.environ.get("ALLOW_SMALL") == "1"
+MIN_FREE_MB = 4
 WEAK_BOARDS = ("hAP lite", "hAP mini", "hAP ac lite", "cAP lite", "RB9", "RB750", "RB941", "RB931", "hEX lite", "mAP")
 UNINSTALL = os.environ.get("UNINSTALL") == "1"
 IDS = [int(x) for x in os.environ.get("ROUTER_IDS", "").split(",") if x.strip().isdigit()]
@@ -168,7 +175,13 @@ def install(r, paid) -> str:
         # schedulers; the server cleanup keeps enforcing expiry on them.
         model = (first(api, "/system/routerboard/print").get("model") or "")
         if any(k in f"{board} {model}".lower() for k in ("hap lite", "rb941", "hap mini", "rb931")):
-            return f"skipped: small board {board or model} (hAP lite class excluded)"
+            if not ALLOW_SMALL:
+                return f"skipped: small board {board or model} (hAP lite class excluded; ALLOW_SMALL=1 to pilot)"
+            free_mb = int(res.get("free-memory") or 0) // 1048576
+            if free_mb < MIN_FREE_MB:
+                return f"skipped: small board with {free_mb} MB free (needs {MIN_FREE_MB})"
+            if not tunnel_ok:
+                return "skipped: small board without a tunnel route (public HTTPS costs 5-7 s of CPU)"
         try:
             busy = int(cpu) >= 90
         except (TypeError, ValueError):
