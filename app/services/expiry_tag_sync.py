@@ -291,7 +291,7 @@ async def sync_router(t: Target, reason: str, now: datetime) -> int:
     from app.services.mikrotik_background import router_locks
 
     key = f"{t.ip}:{t.port}"
-    async with router_locks.acquire_router_only(key):
+    async with router_locks.acquire_router_only(key, holder="expiry tag sync"):
         bindings = await asyncio.to_thread(read_bindings_sync, t)
     if not bindings:
         return 0
@@ -301,7 +301,7 @@ async def sync_router(t: Target, reason: str, now: datetime) -> int:
     wanted = await fresh_wanted(t.id, {f.mac for f in early}, now)
     if not wanted:
         return 0
-    async with router_locks.acquire_router_only(key):
+    async with router_locks.acquire_router_only(key, holder="expiry tag sync"):
         done = await asyncio.to_thread(apply_fixes_sync, t, wanted)
     await record_fixes(t.id, done, reason)
     if done:

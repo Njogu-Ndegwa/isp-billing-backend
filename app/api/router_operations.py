@@ -1273,15 +1273,22 @@ async def cleanup_expired_customers_for_router(
             }
         }
         
-        from app.services.mikrotik_background import router_locks, _cleanup_single_router_hotspot_sync
-        
+        from app.services.mikrotik_background import _cleanup_single_router_hotspot_sync
+        from app.services.router_mutations import RouterMutationBusy, run_router_mutation
+
         router_key = f"{router_obj.ip_address}:{router_obj.port}"
-        async with router_locks.acquire(router_key):
-            mikrotik_results = await asyncio.to_thread(
+        # A dashboard click: never wait on the fleet slots background jobs use.
+        try:
+            mikrotik_results = await run_router_mutation(
+                router_key,
                 _cleanup_single_router_hotspot_sync,
                 router_customers_map[router_key]["router"],
                 router_customers_map[router_key]["customers"],
+                holder="an expired-user cleanup from the dashboard",
+                lock_wait_seconds=25,
             )
+        except RouterMutationBusy as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
 
         successful_ids = {r["id"] for r in mikrotik_results["removed"]}
         deactivated_count = 0

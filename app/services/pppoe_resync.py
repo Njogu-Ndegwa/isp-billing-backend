@@ -422,7 +422,7 @@ async def _router_io(router_info: dict, func, *args):
     from app.services.mikrotik_background import router_locks
 
     router_key = f"{router_info['ip']}:{router_info['port']}"
-    async with router_locks.acquire_router_only(router_key):
+    async with router_locks.acquire_router_only(router_key, holder="PPPoE resync"):
         return await asyncio.to_thread(func, router_info, *args)
 
 

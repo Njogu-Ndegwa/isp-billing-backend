@@ -99,7 +99,7 @@ async def upgrade_router(identity: str) -> Optional[str]:
             return None
         from app.services.mikrotik_background import router_locks
 
-        async with router_locks.acquire_router_only(f"{r.ip_address}:{r.port}"):
+        async with router_locks.acquire_router_only(f"{r.ip_address}:{r.port}", holder="expiry reaper upgrade"):
             outcome = await asyncio.to_thread(
                 upgrade_script_sync, r.ip_address, r.username, r.password, r.port, r.identity)
         if outcome == "unreachable" and identity in _attempted:

@@ -119,48 +119,128 @@ INACTIVE_PPPOE_RECONCILE_BATCH_SIZE = 20
 INACTIVE_PPPOE_RECONCILE_MAX_PER_ROUTER = 5
 
 
+BACKGROUND_HOLDER = "background maintenance"
+
+
+class _RouterLockState:
+    """One router's lock plus who holds it and whether a user is waiting."""
+
+    __slots__ = ("lock", "interactive_waiting", "no_interactive", "holder", "held_since")
+
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.interactive_waiting = 0
+        self.no_interactive = asyncio.Event()
+        self.no_interactive.set()
+        self.holder: str | None = None
+        self.held_since: float | None = None
+
+
 class RouterLockManager:
     """Per-router async locks with a global concurrency semaphore.
 
     Operations on the same router serialize; different routers run concurrently
     up to *max_concurrent* at a time (to avoid exhausting the thread pool).
+
+    Dashboard actions use ``acquire_interactive``: no fleet slot at all, and
+    priority on the router. While a user is waiting for a router, background
+    work does not take that router's lock (it queues behind the user), so the
+    user waits only for the step already running there. The holder of each
+    lock is recorded so a busy answer can say what is running on THIS router.
     """
 
     def __init__(self, max_concurrent: int = 3):
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._states: dict[str, _RouterLockState] = {}
         self._semaphore = asyncio.Semaphore(max_concurrent)
 
+    def _state(self, router_key: str) -> _RouterLockState:
+        state = self._states.get(router_key)
+        if state is None:
+            state = self._states[router_key] = _RouterLockState()
+        return state
+
     @asynccontextmanager
-    async def acquire(self, router_key: str):
+    async def _hold(self, router_key: str, holder: str | None, interactive: bool):
+        state = self._state(router_key)
+        if interactive:
+            state.interactive_waiting += 1
+            state.no_interactive.clear()
+            try:
+                await state.lock.acquire()
+            finally:
+                state.interactive_waiting -= 1
+                if state.interactive_waiting == 0:
+                    state.no_interactive.set()
+        else:
+            while True:
+                while state.interactive_waiting:
+                    await state.no_interactive.wait()
+                await state.lock.acquire()
+                if not state.interactive_waiting:
+                    break
+                # A user started waiting while we queued: let them go first.
+                state.lock.release()
+        state.holder = holder or BACKGROUND_HOLDER
+        state.held_since = time.monotonic()
+        try:
+            yield
+        finally:
+            state.holder = None
+            state.held_since = None
+            state.lock.release()
+
+    @asynccontextmanager
+    async def acquire(self, router_key: str, holder: str | None = None):
         async with self._semaphore:
-            if router_key not in self._locks:
-                self._locks[router_key] = asyncio.Lock()
-            async with self._locks[router_key]:
+            async with self._hold(router_key, holder, interactive=False):
                 yield
 
     @asynccontextmanager
-    async def acquire_in_lane(self, router_key: str, lane: asyncio.Semaphore):
+    async def acquire_in_lane(self, router_key: str, lane: asyncio.Semaphore,
+                              holder: str | None = None):
         """Serialize with other work on THIS router, taking a slot from *lane*
         instead of the shared fleet semaphore."""
         async with lane:
-            if router_key not in self._locks:
-                self._locks[router_key] = asyncio.Lock()
-            async with self._locks[router_key]:
+            async with self._hold(router_key, holder, interactive=False):
                 yield
 
     @asynccontextmanager
-    async def acquire_router_only(self, router_key: str):
+    async def acquire_router_only(self, router_key: str, holder: str | None = None):
         """Serialize with other work on THIS router, without a fleet slot.
 
         For single-router work that is already rate-limited by its caller (the
         real-time pilot's on-demand repair). Waiting for one of the shared
         slots put it behind fleet jobs retrying unreachable routers: on the
-        first pilot run it sat queued for 6+ minutes.
+        first pilot run it sat queued for 6+ minutes. Still yields to a user
+        waiting on the same router.
         """
-        if router_key not in self._locks:
-            self._locks[router_key] = asyncio.Lock()
-        async with self._locks[router_key]:
+        async with self._hold(router_key, holder, interactive=False):
             yield
+
+    @asynccontextmanager
+    async def acquire_interactive(self, router_key: str, holder: str | None = None):
+        """A dashboard action: no fleet slot, ahead of background work.
+
+        Mutual exclusion is unchanged: it still waits for whatever holds this
+        router's lock right now (at most the step in progress), never runs
+        alongside it.
+        """
+        async with self._hold(router_key, holder or "another dashboard action",
+                              interactive=True):
+            yield
+
+    def interactive_pending(self, router_key: str) -> bool:
+        """True while a user waits for this router (for cooperative yielding)."""
+        state = self._states.get(router_key)
+        return bool(state and state.interactive_waiting)
+
+    def busy_reason(self, router_key: str) -> str | None:
+        """What holds this router's lock right now, or None when nothing does."""
+        state = self._states.get(router_key)
+        if not state or not state.holder:
+            return None
+        seconds = int(time.monotonic() - (state.held_since or time.monotonic()))
+        return f"{state.holder} has been running on this router for {seconds}s"
 
 
 router_locks = RouterLockManager()
@@ -172,7 +252,9 @@ _expiry_cleanup_pool = ThreadPoolExecutor(
 
 async def _run_expiry_router_cleanup(router_key: str, sync_func, *args):
     """One router's expiry removal, in the expiry lane."""
-    async with router_locks.acquire_in_lane(router_key, expiry_cleanup_lane):
+    async with router_locks.acquire_in_lane(
+        router_key, expiry_cleanup_lane, holder="expired-user cleanup",
+    ):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             _expiry_cleanup_pool, functools.partial(sync_func, *args),
@@ -1055,7 +1137,7 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
                         and normalize_mac_address(b["mac"]) not in active_macs
                     },
                 }
-            async with router_locks.acquire(rk):
+            async with router_locks.acquire(rk, holder="safety-net bypass scan"):
                 candidates = await asyncio.to_thread(
                     _find_router_binding_cleanup_candidates_sync,
                     ri,
@@ -1104,7 +1186,7 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
             to_remove = group["candidates"] & confirmed_orphans
             if not to_remove:
                 return 0
-            async with router_locks.acquire(group["router_key"]):
+            async with router_locks.acquire(group["router_key"], holder="safety-net bypass removal"):
                 return await asyncio.to_thread(
                     _remove_router_bindings_sync,
                     group["router_info"],
@@ -1518,7 +1600,7 @@ async def reconcile_inactive_pppoe_access_background() -> dict:
             })
 
         async def _cleanup_group(router_key: str, group: dict):
-            async with router_locks.acquire(router_key):
+            async with router_locks.acquire(router_key, holder="inactive PPPoE reconcile"):
                 return await asyncio.to_thread(
                     _cleanup_single_router_pppoe_sync,
                     group["router"],
@@ -1602,7 +1684,7 @@ async def reconcile_inactive_pppoe_access_background() -> dict:
 
             async def _restore_customer(payload: dict):
                 router_key = f"{payload['router_ip']}:{payload['router_port']}"
-                async with router_locks.acquire(router_key):
+                async with router_locks.acquire(router_key, holder="inactive PPPoE reconcile"):
                     return await call_pppoe_provision(payload)
 
             restore_results = await asyncio.gather(
@@ -2664,7 +2746,7 @@ async def _reap_idle_access_credentials(db: AsyncSession) -> int:
     await db.commit()
 
     async def _scan(rid: int, bundle: dict):
-        async with router_locks.acquire(f"{bundle['router_info']['ip']}:{bundle['router_info']['port']}"):
+        async with router_locks.acquire(f"{bundle['router_info']['ip']}:{bundle['router_info']['port']}", holder="idle access-code reaper"):
             return rid, await asyncio.to_thread(
                 _scan_router_idle_credentials_sync,
                 bundle["router_info"],
@@ -2818,7 +2900,7 @@ async def repair_router_queues_now(router_id: int) -> dict:
         await db.commit()
 
     router_key = f"{router_info['ip']}:{router_info['port']}"
-    async with router_locks.acquire_router_only(router_key):
+    async with router_locks.acquire_router_only(router_key, holder="queue repair"):
         result = await asyncio.to_thread(
             _sync_single_router_queues_sync, router_info, items, True,
         )
@@ -3566,7 +3648,7 @@ async def sync_active_user_queues():
         # router and caps overall MikroTik connection load.
         async def _sync_router_task(rk, rd):
             try:
-                async with router_locks.acquire(rk):
+                async with router_locks.acquire(rk, holder="queue sync"):
                     # The fleet snapshot can wait behind another router job.
                     # Re-read entitlement while holding this router's lock, so
                     # a completed expiry cleanup cannot be undone by a stale
@@ -3968,7 +4050,7 @@ async def collect_bandwidth_snapshot():
                     # this moment (a push landing mid-visit) is fresher than
                     # what this visit fetched, and must win.
                     fetched_at = datetime.utcnow()
-                    async with router_locks.acquire(router_key):
+                    async with router_locks.acquire(router_key, holder="bandwidth stats collection"):
                         raw = await asyncio.to_thread(_fetch_bandwidth_data_sync_for_router, router_info)
                     if not raw:
                         logger.warning(f"Failed to connect to router {router.name} ({router.ip_address}) for bandwidth snapshot")
