@@ -122,6 +122,19 @@ _RENEW_INSTEAD = {
     EVENT_REMINDER: "Please renew to avoid disconnection.",
     EVENT_EXPIRY: "Please renew to restore service.",
 }
+# The ending of the default's payment sentence, for a till in its place.
+_PAY_PURPOSE = {
+    EVENT_REMINDER: "to avoid disconnection",
+    EVENT_EXPIRY: "to restore service",
+    EVENT_WELCOME: "to activate",
+}
+
+
+def _instead_of_paybill(event: str | None, context: dict[str, str]) -> str | None:
+    """The sentence that replaces a paybill sentence that cannot be filled."""
+    if context.get("till") and event in _PAY_PURPOSE:
+        return f"{_payment_instruction(context)} {_PAY_PURPOSE[event]}."
+    return _RENEW_INSTEAD.get(event)
 
 
 def _has_empty_field(sentence: str, context: dict[str, str]) -> bool:
@@ -151,7 +164,7 @@ def render_custom(body: str, context: dict[str, str], event: str | None = None) 
         sentence = parts[index]
         separator = parts[index + 1] if index + 1 < len(parts) else ""
         if _has_empty_field(sentence, context):
-            renew = _RENEW_INSTEAD.get(event)
+            renew = _instead_of_paybill(event, context)
             if renew and "{paybill}" in sentence and not renew_added:
                 kept.append(renew + (separator or " "))
                 renew_added = True
@@ -245,6 +258,7 @@ def build_context(
     reference: str | None = None,
     username: str | None = None,
     password: str | None = None,
+    till: str | None = None,
 ) -> dict[str, str]:
     return {
         "name": friendly_name(customer_name),
@@ -258,6 +272,9 @@ def build_context(
         "reference": (reference or "").strip(),
         "username": (username or "").strip(),
         "password": password or "",
+        # Not a template placeholder: a Buy Goods till replaces the paybill
+        # sentence (see render_custom and _payment_instruction).
+        "till": (till or "").strip(),
     }
 
 
@@ -266,9 +283,11 @@ def build_context(
 # ---------------------------------------------------------------------------
 
 def _payment_instruction(context: dict[str, str]) -> str | None:
-    if not context.get("paybill") or not context.get("account"):
-        return None
-    return f"Pay via M-Pesa Paybill {context['paybill']}, Account {context['account']}"
+    if context.get("paybill") and context.get("account"):
+        return f"Pay via M-Pesa Paybill {context['paybill']}, Account {context['account']}"
+    if context.get("till"):
+        return f"Pay via M-Pesa Buy Goods Till {context['till']}"
+    return None
 
 
 def default_expiry(context: dict[str, str]) -> str:

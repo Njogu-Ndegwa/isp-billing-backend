@@ -639,8 +639,9 @@ async def test_own_paybill_without_c2b_never_advertises_the_platform_paybill(
     body = await _expiry_body(db, session_factory, customer)
 
     assert PLATFORM_PAYBILL not in body
-    assert "Paybill" not in body  # unregistered own paybill: can't match the account
-    assert "Please renew" in body
+    # Not C2B-registered, so not matched automatically, but it is where the
+    # customer pays: always named (Dennis, 18 Nov).
+    assert "Pay via M-Pesa Paybill 4699342, Account 12345674" in body
 
 
 async def test_direct_settlement_router_without_a_method_uses_no_platform_paybill(
@@ -659,7 +660,7 @@ async def test_direct_settlement_router_without_a_method_uses_no_platform_paybil
     body = await _expiry_body(db, session_factory, customer)
 
     assert PLATFORM_PAYBILL not in body
-    assert "Paybill" not in body
+    assert "Pay via M-Pesa Paybill 4699342, Account 12345674" in body
 
 
 @pytest.mark.parametrize("registration", ["matching", "wrong_owner", "unregistered", "inactive", "different", "ambiguous"])
@@ -947,3 +948,62 @@ async def test_nearest_due_offset_normal_progression():
     assert customer_expiry_notifications.nearest_due_offset(
         [60], expiry=expiry, now=now, period_minutes=None
     ) is None
+
+
+async def test_direct_bank_paybill_is_named_with_the_bank_account(db, session_factory):
+    """Reseller 638: direct settlement into KCB 522522; customers must be told it (18 Nov)."""
+    reseller, router, customer = await _seed_expired_pppoe(db)
+    reseller.settlement_mode = "direct"
+    method = await _add_method(
+        db, reseller, ResellerPaymentMethodType.BANK_ACCOUNT,
+        bank_paybill_number="522522", bank_account_number="1266711562",
+    )
+    router.payment_method_id = method.id
+    await db.commit()
+
+    body = await _expiry_body(db, session_factory, customer)
+
+    assert PLATFORM_PAYBILL not in body
+    assert body == (
+        "Your internet has expired. Pay via M-Pesa Paybill 522522, Account "
+        "1266711562 to restore service. - Twork Links Limited"
+    )
+
+
+async def test_direct_till_is_named_as_buy_goods(db, session_factory):
+    reseller, router, customer = await _seed_expired_pppoe(db)
+    reseller.settlement_mode = "direct"
+    method = await _add_method(
+        db, reseller, ResellerPaymentMethodType.MPESA_TILL, mpesa_till_number="800138",
+    )
+    router.payment_method_id = method.id
+    await db.commit()
+
+    body = await _expiry_body(db, session_factory, customer)
+
+    assert body == (
+        "Your internet has expired. Pay via M-Pesa Buy Goods Till 800138 to "
+        "restore service. - Twork Links Limited"
+    )
+
+
+async def test_custom_template_names_the_direct_till(db, session_factory):
+    reseller, router, customer = await _seed_expired_pppoe(db)
+    reseller.settlement_mode = "direct"
+    method = await _add_method(
+        db, reseller, ResellerPaymentMethodType.MPESA_TILL, mpesa_till_number="800138",
+    )
+    router.payment_method_id = method.id
+    preferences = await db.get(CustomerExpirySmsSettings, reseller.id)
+    preferences.custom_templates = {"expiry": (
+        "Your internet has expired. Pay via M-Pesa Paybill {paybill}, "
+        "Account {account} to restore service. - {brand}"
+    )}
+    await db.commit()
+
+    body = await _expiry_body(db, session_factory, customer)
+
+    assert body == (
+        "Your internet has expired. Pay via M-Pesa Buy Goods Till 800138 to "
+        "restore service. - Twork Links Limited"
+    )

@@ -47,8 +47,9 @@ from app.services.customer_expiry_notifications import (
     create_customer_campaign,
     is_hotspot_customer,
     is_textable_phone,
+    payment_fields as _payment_fields,
     reseller_support_phone,
-    resolve_paybills,
+    resolve_payment_targets,
     spawn_expiry_campaign_dispatch,
 )
 from app.services.markets import reseller_market
@@ -217,7 +218,7 @@ async def _queue_reseller_receipts(
 
         market = reseller_market(reseller)
         support_phone = await reseller_support_phone(db, reseller)
-        paybills = await resolve_paybills(db, reseller, {row.router_id for row in rows})
+        targets = await resolve_payment_targets(db, reseller, {row.router_id for row in rows})
         recipients: list[tuple[int, str, str, str]] = []
         for row in rows:
             payment_account = (
@@ -231,9 +232,8 @@ async def _queue_reseller_receipts(
                 customer_name=row.name,
                 plan_name=row.plan_name,
                 expiry=row.expiry,
-                account_number=payment_account,
-                paybill=paybills.get(row.router_id) if payment_account else None,
                 support_phone=support_phone,
+                **_payment_fields(targets.get(row.router_id), payment_account),
                 amount=templates.format_amount(row.amount, market.currency),
                 reference=row.payment_reference,
             )
@@ -369,16 +369,15 @@ async def queue_welcome_message(
             return None
 
         market = reseller_market(reseller)
-        paybills = await resolve_paybills(db, reseller, {row.router_id})
+        targets = await resolve_payment_targets(db, reseller, {row.router_id})
         context = templates.build_context(
             reseller=reseller,
             tz_name=market.timezone,
             customer_name=row.name,
             plan_name=row.plan_name,
             expiry=row.expiry,
-            account_number=row.account_number,
-            paybill=paybills.get(row.router_id),
             support_phone=await reseller_support_phone(db, reseller),
+            **_payment_fields(targets.get(row.router_id), row.account_number),
             username=row.pppoe_username,
             password=row.pppoe_password,
         )

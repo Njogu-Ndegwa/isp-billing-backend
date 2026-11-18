@@ -442,6 +442,6 @@ async def test_preview_shows_no_platform_paybill_for_direct_settlement(db, clien
     assert resp.status_code == 200
     body = resp.json()
     assert "600980" not in body["text"]
-    assert "Paybill" not in body["text"]
-    assert body["paybill"] is None
-    assert "Register C2B" in body["paybill_note"]
+    assert "Paybill 4699342" in body["text"]
+    assert body["paybill"] == "4699342"
+    assert "not renewed automatically" in body["paybill_note"]
