@@ -150,7 +150,7 @@ async def reconcile_lb_paid_background():
             return
 
         async def _seed_task(bundle: dict):
-            async with router_locks.acquire(bundle["router_key"]):
+            async with router_locks.acquire(bundle["router_key"], holder="LB_PAID reconcile"):
                 return await asyncio.to_thread(
                     _seed_router_lb_paid_sync,
                     bundle["router_info"],

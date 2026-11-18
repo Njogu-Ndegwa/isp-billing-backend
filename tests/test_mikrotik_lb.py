@@ -217,6 +217,7 @@ def _no_settle(monkeypatch):
     monkeypatch.setattr(mikrotik_lb, "LB_CONVERT_SETTLE_SECONDS", 0)
     monkeypatch.setattr(mikrotik_lb, "LB_CONVERT_DHCP_BIND_DELAY_SECONDS", 0)
     monkeypatch.setattr(mikrotik_lb, "LB_CLASSIFY_RETRY_DELAY_SECONDS", 0)
+    monkeypatch.setattr(mikrotik_lb, "LB_LINK_SAMPLE_SECONDS", 0)
 
 
 def _commands(api, command):

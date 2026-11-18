@@ -43,7 +43,8 @@ LB_OP_TIMEOUT_SECONDS = 120
 # Enable runs preflight + apply (6s settle) + up to 3 port conversions
 # (40s DHCP wait + 8s settle each) + seed + verify on one connection.
 LB_ENABLE_TIMEOUT_SECONDS = 420
-# Max wait for the per-router lock / shared fleet slot before answering 429.
+# Max wait for this router's lock before answering 429. Background work yields
+# to a waiting user, so this only covers the step already running there.
 LB_LOCK_WAIT_SECONDS = 25
 
 
@@ -114,29 +115,36 @@ async def _run_locked_router_thread(
     sync_func,
     *args,
     timeout_seconds: float = LB_OP_TIMEOUT_SECONDS,
+    holder: str = "a load-balancing action",
 ) -> dict:
-    """One live router mutation at a time per router (mirrors router_operations)."""
-    from app.services.mikrotik_background import router_locks
+    """One live router change at a time per router, as a user action.
+
+    Runs in the interactive load-balancing lane (router_mutations): no fleet
+    slot, ahead of background work queued for this router. Waiting on the 3
+    shared fleet slots made a save on an idle router time out with "busy"
+    while safety-net / LB_PAID / bandwidth jobs held them (router 542,
+    2026-11-18). A request that times out keeps the router lock until its
+    worker really finishes, so two writers never overlap on one router.
+    """
+    from app.services.router_mutations import (
+        LANE_LOAD_BALANCING, RouterMutationBusy, run_router_mutation,
+    )
 
     router_key = f"{router_obj.ip_address}:{router_obj.port}"
-    # The lock manager's 3 fleet slots are shared with background jobs that can
-    # hold one for minutes. Waiting on them unbounded let a dashboard preflight
-    # sit until Cloudflare cut the request at ~100s ("An error occurred", no log
-    # line) — router 537, 2026-09-30. Give up early with a retryable 429.
-    lock_cm = router_locks.acquire(router_key)
-    try:
-        await asyncio.wait_for(lock_cm.__aenter__(), timeout=LB_LOCK_WAIT_SECONDS)
-    except asyncio.TimeoutError:
-        return {"error": "busy",
-                "detail": "Router is busy with background maintenance; retry in a minute"}
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(sync_func, *args), timeout=timeout_seconds
+            run_router_mutation(
+                router_key, sync_func, *args,
+                holder=holder,
+                lane=LANE_LOAD_BALANCING,
+                lock_wait_seconds=LB_LOCK_WAIT_SECONDS,
+            ),
+            timeout=LB_LOCK_WAIT_SECONDS + timeout_seconds,
         )
+    except RouterMutationBusy as exc:
+        return {"error": "busy", "detail": str(exc)}
     except asyncio.TimeoutError:
         return {"error": "timeout"}
-    finally:
-        await lock_cm.__aexit__(None, None, None)
 
 
 def _raise_for_router_error(result: dict, router_obj: Router) -> None:
@@ -260,10 +268,30 @@ def _lb_enable_sync(router_info: dict, wan_ports: List[str],
                 # onto the next WAN, so leaving it dormant is safe.
                 report["dormant_ports"].append(port)
 
+        # A converted line whose modem is up but has no internet behind it is
+        # saved as staged, not counted as working. v7 / v6-recursive routes
+        # already ignore it (check-gateway pings the probe through that line);
+        # v6 direct routes only ping the modem, so park the line's routes.
+        physically_converted = list(report["converted_ports"])
+        report["no_internet_ports"] = []
+        parked_direct = []
+        for port in physically_converted:
+            conv = report["convert"].get(port) or {}
+            mode = conv.get("route_mode")
+            if not mikrotik_lb.lb_port_internet_ok(api, wan_ports.index(port), mode):
+                report["no_internet_ports"].append(port)
+                if mode == "direct":
+                    parked_direct.append(port)
+        if parked_direct:
+            report["parked"] = mikrotik_lb.lb_park_ports_v6(api, wan_ports, parked_direct)
+        for port in report["no_internet_ports"]:
+            report["converted_ports"].remove(port)
+            report["dormant_ports"].append(port)
+
         report["seed"] = mikrotik_lb.lb_seed_paid(api, active_customers)
         report["verify"] = mikrotik_lb.lb_verify(api, wan_ports)
         if deadman and not deadman.get("aborted"):
-            armed_converted = [p for p in report["converted_ports"] if p in to_arm]
+            armed_converted = [p for p in physically_converted if p in to_arm]
             if armed_converted and not mikrotik_lb.lb_internet_ok(api):
                 report["deadman_left_armed"] = armed_converted
             else:
@@ -339,7 +367,8 @@ async def preflight_load_balancing(
     await db.commit()  # release the DB before router I/O
 
     result = await _run_locked_router_thread(
-        router_obj, _lb_preflight_sync, router_info, request.wan_ports
+        router_obj, _lb_preflight_sync, router_info, request.wan_ports,
+        holder="a load-balancing pre-check",
     )
     await _record_availability(router_id, result)
     _raise_for_router_error(result, router_obj)
@@ -404,6 +433,7 @@ async def enable_load_balancing(
         request.wan_ports,
         active_customers,
         timeout_seconds=LB_ENABLE_TIMEOUT_SECONDS,
+        holder="a load-balancing setup save",
     )
     await _record_availability(router_id, result)
 
@@ -455,6 +485,15 @@ async def enable_load_balancing(
             "Could not confirm the router's safety revert was cancelled; if the router "
             f"lost contact it reverts the converted ports within {minutes} minutes."
         )
+    no_internet = result.get("no_internet_ports", [])
+    if no_internet:
+        warnings.append(
+            f"{', '.join(no_internet)} {'are' if len(no_internet) > 1 else 'is'} connected "
+            "but the internet does not answer through "
+            f"{'them' if len(no_internet) > 1 else 'it'} yet. The setup is saved and "
+            "customers stay on the working line; press \"Finish setup\" "
+            "once the line works."
+        )
     converted = result.get("converted_ports", [])
     dormant = result.get("dormant_ports", [])
     # The rules are on the router, but if a configured WAN can't receive
@@ -469,6 +508,7 @@ async def enable_load_balancing(
         "wan_ports": request.wan_ports,
         "converted_ports": converted,
         "dormant_ports": dormant,
+        "no_internet_ports": no_internet,
         "applied_at": applied_at.isoformat(),
         "warnings": warnings,
         "preflight": preflight_report,
@@ -487,7 +527,8 @@ async def enable_load_balancing(
             )
             + (f"; converted: {', '.join(converted)}" if converted else "")
             + (
-                f"; dormant (no link yet, will fall back to WAN1): {', '.join(dormant)}"
+                f"; saved, not carrying traffic yet (no link or no internet; "
+                f"traffic stays on the working line): {', '.join(dormant)}"
                 if dormant
                 else ""
             )
@@ -519,7 +560,8 @@ async def disable_load_balancing(
     await db.commit()  # release the DB before router I/O
 
     result = await _run_locked_router_thread(
-        router_obj, _lb_rollback_sync, router_info
+        router_obj, _lb_rollback_sync, router_info,
+        holder="turning load balancing off",
     )
     await _record_availability(router_id, result)
     _raise_for_router_error(result, router_obj)
@@ -561,7 +603,8 @@ async def verify_load_balancing(
 
     wan_ports = list((config or {}).get("wan_ports") or []) if enabled else []
     result = await _run_locked_router_thread(
-        router_obj, _lb_verify_sync, router_info, wan_ports or None
+        router_obj, _lb_verify_sync, router_info, wan_ports or None,
+        holder="a load-balancing check",
     )
     await _record_availability(router_id, result)
     _raise_for_router_error(result, router_obj)

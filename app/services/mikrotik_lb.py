@@ -102,6 +102,11 @@ SUPPORTED_ROS_MAJORS = (6, 7)
 UPSTREAM_MAX_MACS = 2
 LB_CLASSIFY_RETRIES = 3
 LB_CLASSIFY_RETRY_DELAY_SECONDS = 3
+# Preflight reads each WAN port's link counters twice, this far apart, so a
+# flapping cable shows up instead of whatever one snapshot happened to see.
+LB_LINK_SAMPLE_SECONDS = 3
+# Cumulative link drops (since the router booted) worth mentioning on a spare port.
+LB_LINK_DOWNS_WARN = 10
 
 
 def _mark_comment(index: int) -> str:
@@ -338,6 +343,67 @@ def _port_macs_block(classified: dict) -> bool:
 
 # --- preflight ---------------------------------------------------------------
 
+_LINK_PROPLIST = ["name", "running", "link-downs", "rx-byte"]
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _link_stability(first: Optional[dict], second: Optional[dict]) -> dict:
+    """Compare two /interface samples of one port."""
+    first, second = first or {}, second or {}
+    downs_a, downs_b = _int_or_none(first.get("link-downs")), _int_or_none(second.get("link-downs"))
+    rx_a, rx_b = _int_or_none(first.get("rx-byte")), _int_or_none(second.get("rx-byte"))
+    out = {
+        "running_first": first.get("running"),
+        "running_second": second.get("running"),
+        "link_downs": downs_b if downs_b is not None else downs_a,
+        "link_downs_during_check": (
+            max(0, downs_b - downs_a) if downs_a is not None and downs_b is not None else None
+        ),
+        "rx_bytes": rx_b if rx_b is not None else rx_a,
+        "rx_bytes_during_check": (
+            max(0, rx_b - rx_a) if rx_a is not None and rx_b is not None else None
+        ),
+    }
+    out["flapping"] = bool(
+        (out["link_downs_during_check"] or 0) > 0
+        or (first.get("running") and second.get("running")
+            and first.get("running") != second.get("running"))
+    )
+    return out
+
+
+def _link_stability_warnings(port: str, st: dict) -> List[str]:
+    """Warnings only: a spare port may be saved in any link state."""
+    out: List[str] = []
+    later = "You can still save the setup; this port won't carry traffic while its link is down."
+    if st.get("flapping"):
+        drops = st.get("link_downs_during_check")
+        drops_txt = f"went down {drops} time(s)" if drops else "went up and down"
+        out.append(
+            f"{port}'s link is unstable: it {drops_txt} during the "
+            f"{LB_LINK_SAMPLE_SECONDS}s check ({st.get('link_downs')} drop(s) since the "
+            f"router started). Check the cable and the modem's power. {later}"
+        )
+    elif (st.get("running_second") or st.get("running_first")) == "true":
+        if st.get("rx_bytes") == 0:
+            out.append(
+                f"{port} shows a link but has never received any data — the modem "
+                f"may still be starting, or the cable may be faulty. {later}"
+            )
+        elif (st.get("link_downs") or 0) >= LB_LINK_DOWNS_WARN:
+            out.append(
+                f"{port} has dropped its link {st.get('link_downs')} times since the "
+                "router started; if that line keeps cutting out, check the cable."
+            )
+    return out
+
+
 def lb_preflight(api, wan_ports: List[str]) -> dict:
     """Read-only preflight, generalized to N WAN ports (wan_ports[0] is WAN1)."""
     report: dict = {"steps": [], "success": True, "blockers": [], "warnings": [],
@@ -377,8 +443,10 @@ def lb_preflight(api, wan_ports: List[str]) -> dict:
         report["blockers"].append(f"{wan1} has no bound DHCP client — WAN1 must work first")
     _step(report, "read.dhcp_clients", True, report["wan1_dhcp"])
 
-    ifs = _rd(api, "/interface/print", ["name", "running"])
-    links = {i.get("name"): i.get("running") for i in ifs if i.get("name") in wan_ports}
+    first_sample_at = time.monotonic()
+    ifs = _rd(api, "/interface/print", _LINK_PROPLIST)
+    first = {i.get("name"): i for i in ifs if i.get("name") in wan_ports}
+    links = {name: row.get("running") for name, row in first.items()}
     bps = _rd(api, "/interface/bridge/port/print", ["interface", "bridge"])
     fdb = _rd(api, "/interface/bridge/host/print", ["mac-address", "on-interface", "local"])
 
@@ -414,6 +482,20 @@ def lb_preflight(api, wan_ports: List[str]) -> dict:
                     "LAN and puts it back if the modem does not hand out DHCP."
                 )
     _step(report, "read.ports", True, report["per_port"])
+
+    # Second link sample: link drops / traffic during the check, not a snapshot.
+    if LB_LINK_SAMPLE_SECONDS:
+        remaining = LB_LINK_SAMPLE_SECONDS - (time.monotonic() - first_sample_at)
+        if remaining > 0:
+            time.sleep(remaining)
+    second = {i.get("name"): i for i in _rd(api, "/interface/print", _LINK_PROPLIST)
+              if i.get("name") in wan_ports}
+    for idx, port in enumerate(wan_ports):
+        stability = _link_stability(first.get(port), second.get(port))
+        report["per_port"][port]["link_stability"] = stability
+        if idx == 0:
+            continue
+        report["warnings"].extend(_link_stability_warnings(port, stability))
 
     dsn = _rd(api, "/ip/dhcp-server/network/print")
     report["dhcp_dns"] = [{k: n.get(k) for k in ("address", "dns-server")} for n in dsn]
@@ -620,13 +702,16 @@ def _v6_wan_route_plan(wan_ports: List[str], leases: Dict[str, dict]) -> tuple:
     return "direct", plan
 
 
-def _v6_reconcile_routes(api, report: dict, wan_ports: List[str]) -> str:
+def _v6_reconcile_routes(api, report: dict, wan_ports: List[str],
+                         exclude: Optional[List[str]] = None) -> str:
     """Make the router's managed v6 routes match the plan for the current leases.
 
     Wrong/stale managed routes are removed and re-added; matching ones are left
     alone, so re-running (or converting another port) is cheap and idempotent.
     """
     leases = _v6_wan_leases(api, wan_ports)
+    for port in exclude or ():
+        leases.pop(port, None)  # treated as dormant: no routes, tables fall back
     mode, plan = _v6_route_plan(wan_ports, leases, _v6_mgmt_endpoints(api))
     wanted = dict(plan)
     existing = _rd(api, "/ip/route/print", [".id", "comment"] + list(_V6_ROUTE_COMPARE))
@@ -1431,6 +1516,35 @@ def lb_internet_ok(api, targets=("8.8.8.8", "1.1.1.1")) -> bool:
         if rows and str(rows[-1].get("received") or "0") not in ("0", ""):
             return True
     return False
+
+
+def lb_port_internet_ok(api, wan_index: int, route_mode: Optional[str] = None) -> bool:
+    """True when the internet answers through WAN<wan_index+1> itself.
+
+    v7 and v6 "recursive" mode route the WAN's probe address only through its
+    own gateway, so pinging the probe tests that line alone. v6 "direct" mode
+    (two modems on one subnet) has no probe route; ping through the WAN's own
+    routing table instead.
+    """
+    args = {"address": PROBE_IPS[wan_index], "count": "3"}
+    if route_mode == "direct":
+        args["routing-table"] = _table_name(wan_index)
+    r = api.send_command("/ping", args)
+    rows = r.get("data", []) if r.get("success") else []
+    return bool(rows) and str(rows[-1].get("received") or "0") not in ("0", "")
+
+
+def lb_park_ports_v6(api, wan_ports: List[str], parked: List[str]) -> dict:
+    """RouterOS 6 direct mode: drop *parked* WANs' routes so their tables fall back.
+
+    Direct routes are checked by pinging the modem, which answers even when
+    the line behind it is dead; without this, connections PCC-marked for a
+    line with no internet would be black-holed. Re-enabling (or "Activate
+    connected lines") rebuilds them once the line works.
+    """
+    report: dict = {"steps": [], "success": True, "parked": list(parked)}
+    _v6_reconcile_routes(api, report, wan_ports, exclude=parked)
+    return report
 
 
 # --- verify ------------------------------------------------------------------
