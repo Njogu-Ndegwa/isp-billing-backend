@@ -756,3 +756,33 @@ async def test_usage_is_counted_per_account_and_reported_to_admins(client, owner
     report = (await client.get("/api/admin/assistant/usage?days=7", headers=auth(admin_token))).json()
     assert report["summary"]["today"]["questions"] == 2 and report["summary"]["today"]["accounts"] == 1
     assert report["top_accounts"][0]["questions"] == 2 and report["days"][-1]["model_calls"] == 3
+
+
+def test_index_spells_out_fixed_query_values():
+    import main
+
+    catalog = Catalog.from_openapi(main.app.openapi())
+    index = catalog.index_text(_caller())
+    stats = next(l for l in index.splitlines() if l.startswith("GET /api/dashboard/stats "))
+    assert "period:int" in stats                     # a number of days, not "today"
+    fixed = [a for a in catalog.actions for p in a.query_params if (p.get("schema") or {}).get("pattern", "").startswith("^(")]
+    assert fixed, "expected at least one query param with fixed values"
+    admin_index = catalog.index_text(_caller(role="admin"))
+    line = next(l for l in admin_index.splitlines() if l.startswith(f"{fixed[0].method} {fixed[0].template} "))
+    assert "=" in line and "|" in line
+
+
+def test_view_as_usage_is_the_admins_not_the_resellers():
+    viewer = _caller(user_id=487, viewer_sid=12, viewer_admin_id=1)
+    assert viewer.usage_owner == (1, None)
+    staff = _caller(user_id=487, staff_id=5)
+    assert staff.usage_owner == (487, 5)
+
+
+@pytest.mark.asyncio
+async def test_the_assistant_knows_bitwave_product_answers(client, owner):
+    _, token = owner
+    model = use_model([text_reply("Use Access Credentials.")])
+    await client.post("/api/assistant/chat", json={"message": "staff internet?"}, headers=auth(token))
+    system = model.requests[0]["system"][0]["text"]
+    assert "Access Credentials (/access-credentials" in system and "same Wi-Fi name (SSID)" in system

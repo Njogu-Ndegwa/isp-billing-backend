@@ -148,7 +148,8 @@ async def _run(turn: Turn, caller: Caller, conversation: dict, queue: asyncio.Qu
                     input_tokens=turn.input_tokens, output_tokens=turn.output_tokens, title=title,
                 )
                 try:
-                    await usage.record(caller.user_id, caller.staff_id, turn.usage, question=turn.is_question)
+                    owner_id, owner_staff = caller.usage_owner
+                    await usage.record(owner_id, owner_staff, turn.usage, question=turn.is_question)
                 except Exception:
                     logger.exception("[assistant] usage record failed (the answer was not affected)")
     except Exception:

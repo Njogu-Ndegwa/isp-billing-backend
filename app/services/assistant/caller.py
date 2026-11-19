@@ -28,6 +28,7 @@ class Caller:
     staff_permissions: frozenset = field(default_factory=frozenset)
     staff_is_account_admin: bool = False
     viewer_sid: Optional[int] = None   # View-as session (read-only)
+    viewer_admin_id: Optional[int] = None  # the admin doing the View-as
     ip: Optional[str] = None
     user_agent: str = ""
 
@@ -38,6 +39,17 @@ class Caller:
     @property
     def read_only(self) -> bool:
         return self.viewer_sid is not None
+
+    @property
+    def usage_owner(self) -> tuple:
+        """(user_id, staff_id) that a question's cost is counted against.
+
+        View-as questions are the viewing admin's, not the reseller's: an admin
+        testing or helping must not show up as the reseller using the chat.
+        """
+        if self.viewer_sid is not None and self.viewer_admin_id is not None:
+            return self.viewer_admin_id, None
+        return self.user_id, self.staff_id
 
     @property
     def owner_key(self) -> tuple:
@@ -68,8 +80,13 @@ async def caller_from_request(request: Request) -> Caller:
         if imp is None:
             raise HTTPException(status_code=401, detail="Not authenticated")
         claims = imp
+    viewer_admin_id = None
     if claims.get("imp_sid") is not None:
         viewer_sid = int(claims["imp_sid"])
+        try:
+            viewer_admin_id = int(claims.get("imp_by")) if claims.get("imp_by") is not None else None
+        except (TypeError, ValueError):
+            viewer_admin_id = None
     try:
         user_id = int(claims["user_id"])
         role = str(claims["role"])
@@ -106,6 +123,7 @@ async def caller_from_request(request: Request) -> Caller:
         staff_permissions=staff_perms,
         staff_is_account_admin=staff_admin,
         viewer_sid=viewer_sid,
+        viewer_admin_id=viewer_admin_id,
         ip=client_ip(request),
         user_agent=(request.headers.get("user-agent") or "")[:200],
     )
