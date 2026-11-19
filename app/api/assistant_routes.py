@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.services.assistant import store
-from app.services.assistant.agent import Turn, assistant_ready, conversation_lock
+from app.services.assistant.agent import Turn, assistant_ready, conversation_lock, model_name, provider
 from app.services.assistant.caller import Caller, caller_from_request
 from app.services.assistant.executor import ASSISTANT_HEADER
 
@@ -169,7 +169,8 @@ async def assistant_status(request: Request):
     return {
         "enabled": ready,
         "reason": reason or None,
-        "model": settings.ASSISTANT_MODEL if ready else None,
+        "model": model_name() if ready else None,
+        "provider": provider() if ready else None,
         "read_only": caller.read_only,
         "action_ttl_minutes": settings.ASSISTANT_ACTION_TTL_MINUTES,
         "retention_days": settings.ASSISTANT_RETENTION_DAYS,

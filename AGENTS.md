@@ -368,8 +368,7 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
 - `app/services/assistant/` + `app/api/assistant_routes.py`; screen at `/assistant`
   in `../isp-billing-admin`, Bitwave support view at `/admin/assistant`. Onboarding
   starts there (`/assistant?start=setup`) when the assistant is switched on.
-- The model (Anthropic, `ASSISTANT_MODEL`, key `ANTHROPIC_API_KEY` in the server env)
-  sees an index of every bearer-secured JSON route, built from `app.openapi()` and
+- The model sees an index of every bearer-secured JSON route, built from `app.openapi()` and
   filtered by role / staff permissions (`catalog.py`). It calls them through
   `executor.call_api`: an in-process ASGI request through ALL middleware with the
   caller's own token. Nothing in the assistant grants access; the guards decide.
@@ -378,12 +377,19 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   (single use, same identity, 15-min expiry). Read-only POSTs are listed in
   `catalog.READ_ONLY_POSTS`; a new POST that only reads belongs there.
 - Secrets never go through the chat: secret-looking fields are masked in results
-  and refused in requests (`shaping.py`). Photos go to the Files API once; history
-  keeps only the file id. Conversation history is append-only (thinking blocks).
+  and refused in requests (`shaping.py`). Conversation history is append-only
+  (thinking blocks).
 - New routes appear in the assistant automatically. Give them a clear docstring
   (it is the model's description) and, if staff may use them, a staff rule.
+- Model provider is configuration (`ASSISTANT_PROVIDER`): `deepseek` (default; DeepSeek's
+  Anthropic-compatible API, model `deepseek-flash`, key `DEEPSEEK_API_KEY`),
+  `openai_compatible` (any `/chat/completions` endpoint such as Tencent TokenHub, the way
+  the OVES Assets Assistant calls DeepSeek; `openai_compat.py` translates the history), or
+  `anthropic` (Claude, `ANTHROPIC_API_KEY`). History is stored in one format, so switching
+  keeps conversations. Thinking is off for DeepSeek unless `ASSISTANT_THINKING=enabled`.
+  With DeepSeek, photos stay inline in the history (its files expire after 30 days).
 - `/api/assistant/*` holds no DB session during model or API calls (Session
-  Discipline). Tests: `tests/test_assistant.py` (scripted fake model).
+  Discipline). Tests: `tests/test_assistant.py` (scripted fake model / fake HTTP stream).
 
 ## AWS Migration / Insurance Tunnel Handoff
 

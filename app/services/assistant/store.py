@@ -19,6 +19,12 @@ from app.services.assistant.caller import Caller
 TRANSCRIPT_LIMIT = 400  # UI events kept per conversation
 
 
+def _model_name() -> str:
+    from app.services.assistant.agent import model_name
+
+    return model_name()
+
+
 def _owner_filter(model, caller: Caller):
     return and_(
         model.user_id == caller.user_id,
@@ -34,7 +40,7 @@ async def create_conversation(caller: Caller, title: str) -> dict:
     conv = AssistantConversation(
         id=str(uuid.uuid4()), user_id=caller.user_id, staff_id=caller.staff_id,
         viewer_sid=caller.viewer_sid, title=(title or "New chat")[:200],
-        messages=[], transcript=[], model=settings.ASSISTANT_MODEL,
+        messages=[], transcript=[], model=_model_name(),
         created_at=now, updated_at=now,
     )
     async with db_module.async_session() as db:

@@ -135,11 +135,45 @@ API index ({count} actions)
 {index}"""
 
 
+# Providers. DeepSeek serves an Anthropic-compatible Messages API
+# (https://api-docs.deepseek.com/guides/anthropic_api): tools, streaming,
+# thinking blocks and base64 images all work through the same SDK calls.
+# Anthropic-only features (server-side fallbacks, top-level prompt caching,
+# the Files API with 90-day photos) are used only with provider "anthropic".
+PROVIDERS = {
+    "deepseek": {"model": "deepseek-flash", "base_url": "https://api.deepseek.com/anthropic"},
+    "anthropic": {"model": "claude-opus-5-5", "base_url": None},
+    # Any OpenAI-style /chat/completions endpoint; base URL and model must be set.
+    "openai_compatible": {"model": "", "base_url": None},
+}
+
+
+def provider() -> str:
+    name = (settings.ASSISTANT_PROVIDER or "deepseek").strip().lower()
+    return name if name in PROVIDERS else "deepseek"
+
+
+def model_name() -> str:
+    return settings.ASSISTANT_MODEL.strip() or PROVIDERS[provider()]["model"]
+
+
+def _api_key() -> str:
+    return settings.ANTHROPIC_API_KEY if provider() == "anthropic" else settings.DEEPSEEK_API_KEY
+
+
+def thinking_mode() -> str:
+    """DeepSeek: off unless switched on (quick answers; the tools do the work)."""
+    value = settings.ASSISTANT_THINKING.strip().lower()
+    return value if value in ("enabled", "disabled") else "disabled"
+
+
 def assistant_ready() -> tuple[bool, str]:
     if not settings.ASSISTANT_ENABLED:
         return False, "The assistant is switched off."
-    if not settings.ANTHROPIC_API_KEY:
+    if not _api_key():
         return False, "The assistant is not configured yet (no model key on the server)."
+    if provider() == "openai_compatible" and not (settings.ASSISTANT_BASE_URL.strip() and model_name()):
+        return False, "The assistant is not configured yet (model address or name missing)."
     try:
         import anthropic  # noqa: F401
     except ImportError:
@@ -155,14 +189,46 @@ def get_client():
     if _client is None:
         from anthropic import AsyncAnthropic
 
-        _client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY, max_retries=2, timeout=180.0)
+        base_url = settings.ASSISTANT_BASE_URL.strip() or PROVIDERS[provider()]["base_url"]
+        kwargs: dict[str, Any] = {"api_key": _api_key(), "max_retries": 2, "timeout": 180.0}
+        if base_url:
+            kwargs["base_url"] = base_url
+        _client = AsyncAnthropic(**kwargs)
     return _client
+
+
+def request_messages(messages: list) -> list:
+    """The history as sent: consecutive same-role turns merged into one.
+
+    The stored history is never edited. Anthropic merges consecutive user
+    turns itself; DeepSeek requires a tool_result turn to be a single message
+    whose tool results come first, which merging preserves.
+    """
+    out: list = []
+    for m in messages:
+        if out and out[-1]["role"] == m["role"]:
+            prev = out[-1]["content"]
+            prev = prev if isinstance(prev, list) else [{"type": "text", "text": prev}]
+            cur = m["content"] if isinstance(m["content"], list) else [{"type": "text", "text": m["content"]}]
+            out[-1] = {"role": m["role"], "content": prev + cur}
+        else:
+            out.append(m)
+    return out
 
 
 def set_client(client) -> None:
     """Tests inject a fake model here."""
     global _client
     _client = client
+
+
+_OPENAI_TRANSPORT = None
+
+
+def set_openai_transport(transport) -> None:
+    """Tests inject a fake HTTP transport for the openai_compatible provider."""
+    global _OPENAI_TRANSPORT
+    _OPENAI_TRANSPORT = transport
 
 
 _CONVERSATION_LOCKS: dict[str, asyncio.Lock] = {}
@@ -273,14 +339,20 @@ class Turn:
         await self._loop()
 
     async def _image_block(self, image: dict) -> dict:
-        """Store the photo once with the Files API; history then carries only its id.
+        """The photo as a content block.
 
-        Falls back to sending the photo inline if the upload fails.
+        Anthropic: stored once with the Files API (kept for the retention
+        period); history carries only its id. DeepSeek keeps uploaded files at
+        most 30 days, shorter than a chat lives, so the photo stays inline in
+        the history (the browser has already shrunk it). Inline is also the
+        fallback when an upload fails.
         """
         import base64
 
         media_type = image["media_type"]
         data = image["data"]
+        if provider() != "anthropic":
+            return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}
         try:
             import anthropic
 
@@ -396,21 +468,45 @@ class Turn:
                                    "message": "Stopped after many steps. Ask again to continue."})
 
     async def _model_call(self, system: list[dict]):
+        if provider() == "openai_compatible":
+            from app.services.assistant import openai_compat
+
+            async def on_text(delta: str) -> None:
+                self._text_parts.append(delta)
+                await self.queue.put({"type": "text", "delta": delta})
+
+            return await openai_compat.stream_chat(
+                base_url=settings.ASSISTANT_BASE_URL.strip(), api_key=_api_key(), model=model_name(),
+                system=system, messages=self.messages, tools=TOOLS, max_tokens=16000,
+                thinking=thinking_mode(), reasoning_effort=settings.ASSISTANT_EFFORT.strip(),
+                on_text=on_text, transport=_OPENAI_TRANSPORT,
+            )
         client = get_client()
+        model = model_name()
         kwargs: dict[str, Any] = dict(
-            model=settings.ASSISTANT_MODEL,
+            model=model,
             max_tokens=16000,
             system=system,
             tools=TOOLS,
-            messages=self.messages,
-            thinking={"type": "adaptive"},
-            output_config={"effort": settings.ASSISTANT_EFFORT},
-            cache_control={"type": "ephemeral"},
+            messages=request_messages(self.messages),
+            thinking={"type": "adaptive"} if provider() == "anthropic" else {"type": thinking_mode()},
+            # Not personal data: lets the provider keep one account's cache and
+            # scheduling together (DeepSeek) / attribute abuse (Anthropic).
+            metadata={"user_id": f"bitwave-{self.caller.user_id}"},
         )
-        if settings.ASSISTANT_MODEL in FALLBACK_MODELS:
+        effort = settings.ASSISTANT_EFFORT.strip()
+        if provider() == "anthropic":
+            kwargs["output_config"] = {"effort": effort or "medium"}
+            kwargs["cache_control"] = {"type": "ephemeral"}
+        elif effort:
+            kwargs["output_config"] = {"effort": effort}
+        if provider() == "anthropic" and model in FALLBACK_MODELS:
             kwargs["betas"] = [FALLBACK_BETA]
             kwargs["fallbacks"] = "default"
-        async with client.beta.messages.stream(**kwargs) as stream:
+            streamer = client.beta.messages.stream
+        else:
+            streamer = client.messages.stream
+        async with streamer(**kwargs) as stream:
             async for event in stream:
                 if getattr(event, "type", None) == "text" and getattr(event, "text", None):
                     self._text_parts.append(event.text)
@@ -428,6 +524,9 @@ class Turn:
     async def _run_tool(self, block: dict) -> dict:
         name = block.get("name")
         args = block.get("input") if isinstance(block.get("input"), dict) else {}
+        if "_invalid_arguments" in args:
+            return self._tool_result(block["id"], {"error": "The tool arguments were not valid JSON. "
+                                                   "Send the call again with a valid JSON object."}, True)
         try:
             if name == "describe_action":
                 return await self._describe(block["id"], args)

@@ -1,7 +1,7 @@
 """Dashboard assistant: a chat that can do everything the dashboard does.
 
 How it works, in one paragraph: the person types in the chat; the model
-(Anthropic, ``settings.ASSISTANT_MODEL``) reads a compact index of this app's
+(DeepSeek by default, or Claude; ``agent.provider()``) reads a compact index of this app's
 own API -- built from ``app.openapi()`` and filtered to what the caller may
 use -- and calls it through two tools. Reads run at once; anything that
 changes data is stored as a pending action and runs only when the person taps
