@@ -304,10 +304,17 @@ def test_reapply_skips_existing_objects():
 # (d) rollback: disable marks FIRST, then routes, guard/bypass only after
 # ---------------------------------------------------------------------------
 
-def _applied_api():
+# WAN1's own dynamic DHCP default (add-default-route=yes), as on most routers.
+WAN1_DHCP_DEFAULT = {".id": "*DD1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.1",
+                     "distance": "1", "active": "true", "dynamic": "true"}
+
+
+def _applied_api(wan1_dhcp_default=True):
     api = FakeLBAPI()
     report = mikrotik_lb.lb_apply(api, ["ether1", "ether2"])
     assert report["success"] is True
+    if wan1_dhcp_default:
+        api.routes.append(dict(WAN1_DHCP_DEFAULT))
     api.commands = []  # keep only rollback traffic
     return api
 
