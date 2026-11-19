@@ -384,6 +384,34 @@ class Settings(BaseSettings):
     FEEDBACK_REPLY_MODEL: str = "claude-opus-4-8"
     FEEDBACK_DAILY_POST_CAP: int = 15
 
+    # --- Dashboard assistant (chat that can do everything the dashboard does) --
+    # app/services/assistant/. Every action runs through this app's own API with
+    # the caller's token, so permissions, staff rules and View-as read-only
+    # apply unchanged. With no key for the chosen provider, /api/assistant/*
+    # answers "not configured" and nothing else changes.
+    #
+    # Provider "deepseek" (default) uses DeepSeek's Anthropic-compatible API
+    # (https://api.deepseek.com/anthropic) with DEEPSEEK_API_KEY; "anthropic"
+    # uses Claude with ANTHROPIC_API_KEY. Both keys live in the server env only.
+    ASSISTANT_ENABLED: bool = True
+    # Provider "openai_compatible" speaks plain Chat Completions to any
+    # OpenAI-style endpoint (e.g. DeepSeek on Tencent TokenHub, like the OVES
+    # Assets Assistant): set ASSISTANT_BASE_URL and ASSISTANT_MODEL; key in
+    # DEEPSEEK_API_KEY.
+    ASSISTANT_PROVIDER: str = "deepseek"        # deepseek | openai_compatible | anthropic
+    ASSISTANT_MODEL: str = ""                   # empty: deepseek-flash / claude-opus-5-5
+    ASSISTANT_BASE_URL: str = ""                # empty: the provider's default
+    ASSISTANT_EFFORT: str = ""                  # empty: the provider's default
+    ASSISTANT_THINKING: str = ""                # DeepSeek: empty = "disabled" (quick); "enabled"
+    # How much chat history the model sees (DeepSeek / OpenAI-style), in tokens,
+    # on top of the ~16k-token instructions. Old results are shortened first.
+    ASSISTANT_CONTEXT_TOKENS: int = 60000
+    DEEPSEEK_API_KEY: str = ""
+    ASSISTANT_MAX_STEPS: int = 14               # model calls per question
+    ASSISTANT_ACTION_TTL_MINUTES: int = 15      # an unconfirmed action expires
+    ASSISTANT_RETENTION_DAYS: int = 90          # conversations are deleted after
+    ASSISTANT_CALL_TIMEOUT_SECONDS: int = 150   # one API call made for the chat
+
     # --- Support desk snapshot (platform admin only) ----------------------
     # Dennis's laptop builds the WhatsApp support dashboard JSON and POSTs it
     # to /api/admin/support-desk/snapshot with this bearer token. Empty (the

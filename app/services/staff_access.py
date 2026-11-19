@@ -537,7 +537,7 @@ async def _enforce_staff(request: Request, call_next, claims: dict, method: str,
     finally:
         _current_staff.reset(token)
 
-    if method in WRITE_METHODS:
+    if method in WRITE_METHODS and not (rule is not None and rule.template in perms.UNLOGGED_TEMPLATES):
         await _after_write(
             request, owner_id=owner_id, staff_id=staff_id, actor=actor, rule=rule,
             params=params, method=method, path=path, status_code=response.status_code,

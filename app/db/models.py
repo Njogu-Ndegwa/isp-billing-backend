@@ -3416,3 +3416,108 @@ class CustomerCpeCredential(Base):
     updated_by_user_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AssistantConversation(Base):
+    """One dashboard-assistant chat (app/services/assistant/).
+
+    ``messages`` is the model's history, append-only (the API rejects edited
+    history once thinking blocks are in it); tool results in it are already
+    shaped -- secrets masked, long lists cut. ``transcript`` is what the chat
+    screen redraws when the conversation is reopened.
+
+    Owner key: ``user_id`` is the token's identity (the reseller for staff and
+    View-as tokens), ``staff_id`` the staff member, ``viewer_sid`` the View-as
+    session -- so a staff member or an admin viewing an account never sees the
+    owner's chats, nor the owner theirs. Deleted after
+    ``ASSISTANT_RETENTION_DAYS`` without activity.
+
+    Startup migration: run_assistant_migrations() in main.py.
+    """
+    __tablename__ = "assistant_conversations"
+    __table_args__ = (
+        Index("ix_assistant_conversations_owner", "user_id", "staff_id", "updated_at"),
+        Index("ix_assistant_conversations_updated", "updated_at"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    user_id = Column(Integer, nullable=False)
+    staff_id = Column(Integer, nullable=True)
+    viewer_sid = Column(Integer, nullable=True)
+    title = Column(String(200), nullable=False, default="New chat")
+    messages = Column(JSON, nullable=False, default=list)
+    transcript = Column(JSON, nullable=False, default=list)
+    model = Column(String(60), nullable=True)
+    input_tokens = Column(Integer, nullable=False, default=0, server_default="0")
+    output_tokens = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class AssistantAction(Base):
+    """A change the assistant proposed, waiting for the person to confirm it.
+
+    The exact request (method, concrete path, query, body) is stored when the
+    model proposes it and is what runs on confirmation -- the confirm card shows
+    these fields, not the model's wording. Single use: ``status`` moves
+    pending -> running -> done/failed, or pending -> declined/expired. Only the
+    same identity (user, staff member, View-as session) that proposed it may
+    decide it, and the call runs with the deciding request's own token, so a
+    permission removed in between is enforced.
+
+    Startup migration: run_assistant_migrations() in main.py.
+    """
+    __tablename__ = "assistant_actions"
+    __table_args__ = (
+        Index("ix_assistant_actions_conversation", "conversation_id", "created_at"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    conversation_id = Column(String(36), nullable=False)
+    user_id = Column(Integer, nullable=False)
+    staff_id = Column(Integer, nullable=True)
+    viewer_sid = Column(Integer, nullable=True)
+    method = Column(String(10), nullable=False)
+    path = Column(String(300), nullable=False)
+    template = Column(String(300), nullable=False)
+    query = Column(JSON, nullable=True)
+    body = Column(JSON, nullable=True)
+    title = Column(String(200), nullable=False)
+    permission = Column(String(40), nullable=True)
+    status = Column(String(12), nullable=False, default="pending")
+    tool_use_id = Column(String(80), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    decided_at = Column(DateTime, nullable=True)
+    result_status = Column(Integer, nullable=True)
+    result_summary = Column(String(500), nullable=True)
+
+
+class AssistantUsageDaily(Base):
+    """Assistant use per account per day: questions, tokens and estimated cost.
+
+    One row per (day, user_id, staff_id); staff_id 0 means the account owner or
+    an admin (not NULL, so the unique key also covers them). Written once per
+    answered question, in its own short session (app/services/assistant/usage.py).
+    cost_usd_micros is an estimate from the provider's list prices at the time
+    of each model call (DeepSeek peak hours priced double).
+
+    Startup migration: run_assistant_migrations() in main.py.
+    """
+    __tablename__ = "assistant_usage_daily"
+    __table_args__ = (
+        UniqueConstraint("day", "user_id", "staff_id", name="uq_assistant_usage_daily_owner"),
+        Index("ix_assistant_usage_daily_day", "day"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    day = Column(Date, nullable=False)
+    user_id = Column(Integer, nullable=False)
+    staff_id = Column(Integer, nullable=False, default=0, server_default="0")
+    questions = Column(Integer, nullable=False, default=0, server_default="0")
+    model_calls = Column(Integer, nullable=False, default=0, server_default="0")
+    input_tokens = Column(BigInteger, nullable=False, default=0, server_default="0")
+    cache_read_tokens = Column(BigInteger, nullable=False, default=0, server_default="0")
+    output_tokens = Column(BigInteger, nullable=False, default=0, server_default="0")
+    cost_usd_micros = Column(BigInteger, nullable=False, default=0, server_default="0")
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
