@@ -388,6 +388,23 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   `anthropic` (Claude, `ANTHROPIC_API_KEY`). History is stored in one format, so switching
   keeps conversations. Thinking is off for DeepSeek unless `ASSISTANT_THINKING=enabled`.
   With DeepSeek, photos stay inline in the history (its files expire after 30 days).
+- The page draws results, the model only picks how: `call_api` takes `show`
+  (`auto|table|card|none|tiles|trend|bars|share`) and an optional `fields` hint
+  (`{label, value[]}`, names of fields in the response; `agent.clean_fields` drops
+  anything malformed). Both ride on the `data` event; every number on screen comes
+  from the API result. A finished answer ends with a `NEXT: a | b | c` line that the
+  page turns into follow-up buttons (it is part of the stored text).
+- Home screen figures: `GET /api/assistant/briefing` (`briefing.py`). One short session
+  of COUNT/SUM queries, kept 60 s per person, never 500s. Each section is gated by the
+  dashboard route that shows the same thing (`briefing.GATES`), so staff permissions and
+  View-as follow the existing rules; "today" and revenue match `/api/dashboard/analytics`
+  (UTC days, `created_at`, `counts_as_revenue`). A new figure there needs a gate too.
+- Who starts on the assistant (`home.py`): a person's own choice
+  (`PUT /api/assistant/home`, table `assistant_home_choices`) wins; otherwise reseller
+  accounts are in when `crc32("assistant-home:{user_id}") % 100` is below
+  `app_settings.assistant_home_percent` (admins set it with
+  `PUT /api/admin/assistant/rollout`, default 0). Platform admins and View-as are never
+  moved by the percentage. `GET /api/assistant/status` reports `home` / `home_choice`.
 - `/api/assistant/*` holds no DB session during model or API calls (Session
   Discipline). Tests: `tests/test_assistant.py` (scripted fake model / fake HTTP stream).
 

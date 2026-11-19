@@ -160,6 +160,8 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     # in-process request with the same staff token, checked and logged by
     # these rules like any dashboard request -- so the chat grants nothing.
     ((R,), "/api/assistant/status", ANY_STAFF, None),
+    ((R,), "/api/assistant/briefing", ANY_STAFF, None),
+    (("PUT",), "/api/assistant/home", ANY_STAFF, None),
     ((R,), "/api/assistant/conversations", ANY_STAFF, None),
     ((R,), "/api/assistant/conversations/{conversation_id}", ANY_STAFF, None),
     (("POST",), "/api/assistant/chat", ANY_STAFF, None),
@@ -580,6 +582,7 @@ OWNER_ALERT_TEMPLATES = frozenset({
 # confirm routes. The actions they run are logged as their own requests.
 UNLOGGED_TEMPLATES = frozenset({
     "/api/assistant/chat",
+    "/api/assistant/home",  # the staff member's own start page, not a change to the account
     "/api/assistant/conversations/{conversation_id}/decide",
 })
 

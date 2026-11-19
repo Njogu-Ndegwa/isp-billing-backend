@@ -12,16 +12,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.services.assistant import store, usage
+from app.services.assistant import briefing, home, store, usage
 from app.services.assistant.agent import Turn, assistant_ready, conversation_lock, model_name, provider
 from app.services.assistant.caller import Caller, caller_from_request
+from app.services.assistant.catalog import get_catalog
 from app.services.assistant.executor import ASSISTANT_HEADER
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,14 @@ class Decision(BaseModel):
 
 class DecideRequest(BaseModel):
     decisions: list[Decision] = Field(..., min_length=1, max_length=20)
+
+
+class HomeRequest(BaseModel):
+    choice: Literal["assistant", "classic", "default"]
+
+
+class RolloutRequest(BaseModel):
+    percent: int = Field(..., ge=0, le=100)
 
 
 async def _caller(request: Request) -> Caller:
@@ -171,6 +180,11 @@ def _spawn(coro) -> None:
 async def assistant_status(request: Request):
     caller = await _caller(request)
     ready, reason = assistant_ready()
+    try:
+        is_home, choice = await home.home_for(caller, ready=ready)
+    except Exception:  # the start-page setting must never break the chat
+        logger.exception("[assistant] start-page lookup failed")
+        is_home, choice = False, None
     return {
         "enabled": ready,
         "reason": reason or None,
@@ -179,7 +193,28 @@ async def assistant_status(request: Request):
         "read_only": caller.read_only,
         "action_ttl_minutes": settings.ASSISTANT_ACTION_TTL_MINUTES,
         "retention_days": settings.ASSISTANT_RETENTION_DAYS,
+        "home": is_home,
+        "home_choice": choice,
     }
+
+
+@router.put("/home")
+async def set_home(payload: HomeRequest, request: Request):
+    """The person's own start page: the assistant, the classic dashboard, or no choice ("default")."""
+    caller = await _caller(request)
+    if caller.read_only:
+        raise HTTPException(status_code=403, detail="View-as is read-only: changes are disabled.")
+    await home.set_choice(caller, payload.choice)
+    ready, _ = assistant_ready()
+    is_home, choice = await home.home_for(caller, ready=ready)
+    return {"home": is_home, "home_choice": choice}
+
+
+@router.get("/briefing")
+async def get_briefing(request: Request):
+    """Live figures for the assistant's home screen; a section the caller may not see is left out."""
+    caller = await _caller(request)
+    return await briefing.build(get_catalog(request.app), caller)
 
 
 @router.get("/conversations")
@@ -286,6 +321,21 @@ async def admin_usage(request: Request, days: int = 30):
     """Questions, active accounts and estimated cost: per day, and the busiest accounts."""
     await _admin(request)
     return await usage.report(days=days)
+
+
+@admin_router.get("/rollout")
+async def admin_get_rollout(request: Request):
+    """Share of reseller accounts that start on the assistant instead of the classic dashboard."""
+    await _admin(request)
+    return await home.rollout_report()
+
+
+@admin_router.put("/rollout")
+async def admin_set_rollout(payload: RolloutRequest, request: Request):
+    """Set the share (0-100) of reseller accounts that start on the assistant. A person's own choice still wins."""
+    await _admin(request)
+    await home.set_percent(payload.percent)
+    return await home.rollout_report()
 
 
 @admin_router.post("/conversations/{conversation_id}/notes")
