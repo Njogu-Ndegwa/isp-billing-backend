@@ -660,3 +660,62 @@ async def test_a_change_must_be_looked_up_and_valid_before_a_card(client, owner,
     missing = tool_results(model.requests[4])[0]
     assert "'price' is required" in missing["error"]
     assert len((await db.execute(select(AssistantAction))).scalars().all()) == 1
+
+
+def _long_chat(turns: int, result_chars: int = 2000) -> list:
+    msgs = []
+    for i in range(turns):
+        msgs.append({"role": "user", "content": [{"type": "text", "text": f"question {i}"}]})
+        msgs.append({"role": "assistant", "content": [
+            {"type": "tool_use", "id": f"t{i}", "name": "call_api", "input": {"method": "GET", "path": "/api/plans"}}]})
+        msgs.append({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": f"t{i}", "content": "x" * result_chars}]})
+        msgs.append({"role": "assistant", "content": [{"type": "text", "text": f"answer {i}"}]})
+    return msgs
+
+
+def _pairs_intact(msgs: list) -> bool:
+    uses = {b["id"] for m in msgs if m["role"] == "assistant" for b in m["content"] if b.get("type") == "tool_use"}
+    results = {b["tool_use_id"] for m in msgs if m["role"] == "user" for b in m["content"]
+               if b.get("type") == "tool_result"}
+    return uses == results
+
+
+def test_long_chats_are_trimmed_for_the_model_only():
+    history = _long_chat(30)
+    before = json.dumps(history)
+    sent = agent_mod.fit_context(history, budget_tokens=1_000_000)
+    assert json.dumps(history) == before                       # stored chat untouched
+    results = [b["content"] for m in sent for b in m["content"] if b.get("type") == "tool_result"]
+    assert all(r.startswith("[Earlier result") for r in results[:-3])
+    assert all(r == "x" * 2000 for r in results[-3:])          # the last 3 questions keep theirs
+    assert _pairs_intact(sent)
+
+    tight = agent_mod.fit_context(history, budget_tokens=1500)
+    assert tight[0]["role"] == "user" and tight[0]["content"][0]["text"].startswith("[The earlier part")
+    assert tight[-1] == sent[-1] and _pairs_intact(tight)
+    assert len(tight) < len(sent)
+
+
+def test_trimming_keeps_the_cached_prefix_stable_as_the_chat_grows():
+    history = _long_chat(25)
+    first = agent_mod.fit_context(history, budget_tokens=1_000_000)
+    second = agent_mod.fit_context(history + _long_chat(1)[:1], budget_tokens=1_000_000)
+    # everything that was already shortened is byte-identical on the next call
+    cut = len(history) - 3 * 4
+    assert json.dumps(first[:cut]) == json.dumps(second[:cut])
+
+
+@pytest.mark.asyncio
+async def test_two_replies_in_one_answer_are_separate_paragraphs(client, owner):
+    _, token = owner
+    use_model([
+        _Message([{"type": "text", "text": "Checking."},
+                  {"type": "tool_use", "id": "tu_1", "name": "call_api",
+                   "input": {"method": "GET", "path": "/api/plans", "show": "none"}}], "tool_use"),
+        text_reply("No plans yet."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "plans?"},
+                                           headers=auth(token))).text)
+    streamed = "".join(e["delta"] for e in events if e["type"] == "text")
+    assert streamed == "Checking." + chr(10) * 2 + "No plans yet."

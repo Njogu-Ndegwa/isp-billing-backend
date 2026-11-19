@@ -216,6 +216,73 @@ def request_messages(messages: list) -> list:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Context budget: what the model sees of a long chat
+# ---------------------------------------------------------------------------
+# The chat re-reads live data for every question, so old results are mostly
+# dead weight: they cost money and time on every call and dilute attention.
+# Rules (request-time only; the stored chat and the screen stay complete):
+#   1. a tool result more than KEEP_RESULT_TURNS questions old is shortened to a
+#      one-line note, and a photo that old to "[photo sent earlier]";
+#   2. if the history is still over the budget, the oldest questions are left
+#      out in blocks of DROP_BLOCK_TURNS.
+# Both change a given message once and then leave it alone, so the prefix the
+# provider has cached stays the same from one call to the next.
+PARAGRAPH_BREAK = chr(10) * 2  # between replies of two model calls in one answer
+KEEP_RESULT_TURNS = 3
+DROP_BLOCK_TURNS = 10
+CHARS_PER_TOKEN = 3.2       # conservative for JSON-heavy, multilingual text
+SHORTEN_OVER_CHARS = 400
+
+
+def _is_turn_start(m: dict) -> bool:
+    if m.get("role") != "user":
+        return False
+    content = m.get("content")
+    return not (isinstance(content, list) and any(b.get("type") == "tool_result" for b in content))
+
+
+def _approx_tokens(messages: list) -> int:
+    return int(len(json.dumps(messages, ensure_ascii=False, default=str)) / CHARS_PER_TOKEN)
+
+
+def fit_context(messages: list, budget_tokens: int) -> list:
+    starts = [i for i, m in enumerate(messages) if _is_turn_start(m)]
+    if not starts:
+        return messages
+    old_before = starts[-KEEP_RESULT_TURNS] if len(starts) >= KEEP_RESULT_TURNS else 0
+    out: list = []
+    for i, m in enumerate(messages):
+        if i >= old_before or not isinstance(m.get("content"), list):
+            out.append(m)
+            continue
+        blocks = []
+        for b in m["content"]:
+            if b.get("type") == "tool_result":
+                text = b.get("content") if isinstance(b.get("content"), str) else json.dumps(b.get("content"), default=str)
+                if len(text) > SHORTEN_OVER_CHARS:
+                    b = {**b, "content": "[Earlier result, shortened to save space: " + text[:160]
+                         + "…] Look it up again if you need it."}
+            elif b.get("type") == "image" and m.get("role") == "user":
+                b = {"type": "text", "text": "[photo sent earlier]"}
+            blocks.append(b)
+        out.append({**m, "content": blocks})
+
+    if _approx_tokens(out) <= budget_tokens or len(starts) <= 1:
+        return out
+    # Leave out the oldest questions, DROP_BLOCK_TURNS at a time, never the last one.
+    for cut in range(DROP_BLOCK_TURNS, len(starts), DROP_BLOCK_TURNS):
+        trimmed = out[starts[cut]:]
+        if _approx_tokens(trimmed) <= budget_tokens or cut + DROP_BLOCK_TURNS >= len(starts):
+            break
+    else:
+        trimmed = out[starts[-1]:]
+    first = trimmed[0]
+    note = {"type": "text", "text": "[The earlier part of this chat was left out to save space.]"}
+    content = first["content"] if isinstance(first["content"], list) else [{"type": "text", "text": first["content"]}]
+    return [{**first, "content": [note] + content}] + trimmed[1:]
+
+
 def set_client(client) -> None:
     """Tests inject a fake model here."""
     global _client
@@ -289,6 +356,7 @@ class Turn:
         self.output_tokens = 0
         self.proposals = 0
         self._text_parts: list[str] = []
+        self._spoke = False
 
     def reload(self, conversation: dict) -> None:
         """Start from the stored history (taken under the conversation lock)."""
@@ -483,17 +551,43 @@ class Turn:
         await self.emit("notice", {"level": "info",
                                    "message": "Stopped after many steps. Ask again to continue."})
 
+    async def _emit_text(self, delta: str, state: dict) -> None:
+        """Stream text; a new reply after earlier text in this turn starts a new paragraph."""
+        if not state.get("started"):
+            state["started"] = True
+            if self._spoke:
+                await self.queue.put({"type": "text", "delta": PARAGRAPH_BREAK})
+        self._spoke = True
+        self._text_parts.append(delta)
+        await self.queue.put({"type": "text", "delta": delta})
+
+    def _history_for_model(self) -> list:
+        merged = request_messages(self.messages)
+        if provider() == "anthropic":
+            return merged  # editing Claude's history would break its thinking blocks
+        return fit_context(merged, max(8000, settings.ASSISTANT_CONTEXT_TOKENS))
+
     async def _model_call(self, system: list[dict]):
+        message = await self._model_call_inner(system)
+        usage = getattr(message, "usage", None)
+        if usage is not None:
+            logger.info("[assistant] usage user=%s provider=%s model=%s in=%s cache_read=%s out=%s",
+                        self.caller.user_id, provider(), model_name(),
+                        getattr(usage, "input_tokens", 0), getattr(usage, "cache_read_input_tokens", 0),
+                        getattr(usage, "output_tokens", 0))
+        return message
+
+    async def _model_call_inner(self, system: list[dict]):
+        state: dict = {}
         if provider() == "openai_compatible":
             from app.services.assistant import openai_compat
 
             async def on_text(delta: str) -> None:
-                self._text_parts.append(delta)
-                await self.queue.put({"type": "text", "delta": delta})
+                await self._emit_text(delta, state)
 
             return await openai_compat.stream_chat(
                 base_url=settings.ASSISTANT_BASE_URL.strip(), api_key=_api_key(), model=model_name(),
-                system=system, messages=self.messages, tools=TOOLS, max_tokens=16000,
+                system=system, messages=self._history_for_model(), tools=TOOLS, max_tokens=16000,
                 thinking=thinking_mode(), reasoning_effort=settings.ASSISTANT_EFFORT.strip(),
                 on_text=on_text, transport=_OPENAI_TRANSPORT,
             )
@@ -504,7 +598,7 @@ class Turn:
             max_tokens=16000,
             system=system,
             tools=TOOLS,
-            messages=request_messages(self.messages),
+            messages=self._history_for_model(),
             thinking={"type": "adaptive"} if provider() == "anthropic" else {"type": thinking_mode()},
             # Not personal data: lets the provider keep one account's cache and
             # scheduling together (DeepSeek) / attribute abuse (Anthropic).
@@ -525,8 +619,7 @@ class Turn:
         async with streamer(**kwargs) as stream:
             async for event in stream:
                 if getattr(event, "type", None) == "text" and getattr(event, "text", None):
-                    self._text_parts.append(event.text)
-                    await self.queue.put({"type": "text", "delta": event.text})
+                    await self._emit_text(event.text, state)
             return await stream.get_final_message()
 
     @staticmethod

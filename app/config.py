@@ -403,6 +403,9 @@ class Settings(BaseSettings):
     ASSISTANT_BASE_URL: str = ""                # empty: the provider's default
     ASSISTANT_EFFORT: str = ""                  # empty: the provider's default
     ASSISTANT_THINKING: str = ""                # DeepSeek: empty = "disabled" (quick); "enabled"
+    # How much chat history the model sees (DeepSeek / OpenAI-style), in tokens,
+    # on top of the ~16k-token instructions. Old results are shortened first.
+    ASSISTANT_CONTEXT_TOKENS: int = 60000
     DEEPSEEK_API_KEY: str = ""
     ASSISTANT_MAX_STEPS: int = 14               # model calls per question
     ASSISTANT_ACTION_TTL_MINUTES: int = 15      # an unconfirmed action expires
