@@ -325,9 +325,10 @@ async def test_a_change_waits_for_confirm_then_runs_once(client, owner, db):
     body = {"name": "Weekly 300", "speed": "5M/5M", "price": 300, "duration_value": 7,
             "duration_unit": "DAYS", "connection_type": "hotspot"}
     use_model([
+        tool_reply("describe_action", {"method": "POST", "path": "/api/plans/create"}, "tu_d"),
         tool_reply("call_api", {"method": "POST", "path": "/api/plans/create", "body": body,
                                 "summary": "Create Weekly 300 (KES 300, 7 days)"}),
-        text_reply("I will create Weekly 300. Tap Confirm."),
+        text_reply("Ready to create Weekly 300. Tap Confirm."),
     ])
     r = await client.post("/api/assistant/chat", json={"message": "Add a weekly plan for 300"},
                           headers=auth(token))
@@ -367,6 +368,7 @@ async def test_a_change_waits_for_confirm_then_runs_once(client, owner, db):
 async def test_only_the_proposer_can_confirm(client, owner, db):
     _, token = owner
     use_model([
+        tool_reply("describe_action", {"method": "DELETE", "path": "/api/plans/{plan_id}"}, "tu_d"),
         tool_reply("call_api", {"method": "DELETE", "path": "/api/plans/1"}),
         text_reply("Confirm to delete."),
     ])
@@ -620,3 +622,41 @@ def test_openai_messages_carry_photos_and_tool_results_in_order():
     assert msgs[1]["content"][0] == {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,QUJD"}}
     assert msgs[2]["reasoning_content"] == "hmm" and msgs[2]["content"] is None
     assert json.loads(msgs[2]["tool_calls"][0]["function"]["arguments"]) == {"a": 1}
+
+
+
+@pytest.mark.asyncio
+async def test_a_change_must_be_looked_up_and_valid_before_a_card(client, owner, db):
+    _, token = owner
+    good = {"name": "Hourly", "speed": "1M/1M", "price": 1, "duration_value": 1,
+            "duration_unit": "HOURS", "connection_type": "hotspot"}
+    model = use_model([
+        # 1. no describe_action yet -> refused
+        tool_reply("call_api", {"method": "POST", "path": "/api/plans/create", "body": good}, "tu_1"),
+        tool_reply("describe_action", {"method": "POST", "path": "/api/plans/create"}, "tu_2"),
+        # 2. a value the handler would reject after Confirm -> refused before the card
+        tool_reply("call_api", {"method": "POST", "path": "/api/plans/create",
+                                "body": {**good, "duration_unit": "hour", "speedd": "x"}}, "tu_3"),
+        # 3. missing required field
+        tool_reply("call_api", {"method": "POST", "path": "/api/plans/create",
+                                "body": {k: v for k, v in good.items() if k != "price"}}, "tu_4"),
+        # 4. correct -> card
+        tool_reply("call_api", {"method": "POST", "path": "/api/plans/create", "body": good,
+                                "summary": "Create Hourly"}, "tu_5"),
+        text_reply("Ready to create Hourly. Tap Confirm."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "hourly plan"},
+                                           headers=auth(token))).text)
+    cards = [e for e in events if e["type"] == "action"]
+    assert len(cards) == 1 and cards[0]["body"]["duration_unit"] == "HOURS"
+
+    no_lookup = tool_results(model.requests[1])[0]
+    assert no_lookup["_is_error"] and "describe_action" in no_lookup["error"]
+    described = json.loads(model.requests[2]["messages"][-1]["content"][0]["content"])
+    assert described["body"]["properties"]["duration_unit"]["allowed_values"] == ["MINUTES", "HOURS", "DAYS"]
+    bad_value = tool_results(model.requests[3])[0]
+    assert "'duration_unit' must be one of MINUTES, HOURS, DAYS (got 'hour')" in bad_value["error"]
+    assert "unknown field(s): speedd" in bad_value["error"]
+    missing = tool_results(model.requests[4])[0]
+    assert "'price' is required" in missing["error"]
+    assert len((await db.execute(select(AssistantAction))).scalars().all()) == 1

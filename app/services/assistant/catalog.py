@@ -314,11 +314,82 @@ class Catalog:
         if action.query_params:
             out["query_params"] = action.query_params
         if action.body_schema:
-            out["body"] = action.body_schema
+            out["body"] = with_allowed_values(action.body_schema)
             out["body_required"] = action.body_required
         if action.flags:
             out["dry_run_flags"] = list(action.flags)
         return out
+
+
+# ---------------------------------------------------------------------------
+# Field values the API schema does not spell out
+# ---------------------------------------------------------------------------
+# Many request models type a field as a plain string and convert it to a
+# database enum inside the handler (e.g. duration_unit -> DurationUnit), so the
+# OpenAPI schema cannot tell the model which values work. The database enums
+# can: a field named like an enum class (DurationUnit -> duration_unit) takes
+# that enum's values. Matched without regard to case, as the handlers convert.
+
+_ENUM_VALUES: Optional[dict[str, list[str]]] = None
+
+
+def enum_values() -> dict[str, list[str]]:
+    global _ENUM_VALUES
+    if _ENUM_VALUES is None:
+        import enum as _enum
+
+        from app.db import models
+
+        found: dict[str, list[str]] = {}
+        for name in dir(models):
+            obj = getattr(models, name)
+            if isinstance(obj, type) and issubclass(obj, _enum.Enum) and obj is not _enum.Enum:
+                snake = re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+                found[snake] = [str(m.value) for m in obj]
+        _ENUM_VALUES = found
+    return _ENUM_VALUES
+
+
+def with_allowed_values(schema: dict) -> dict:
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    if not props:
+        return schema
+    known = enum_values()
+    new_props = {}
+    for key, prop in props.items():
+        if isinstance(prop, dict) and "enum" not in prop and key in known:
+            prop = {**prop, "allowed_values": known[key]}
+        new_props[key] = prop
+    return {**schema, "properties": new_props}
+
+
+def body_problems(action: Action, body) -> list[str]:
+    """What is wrong with a change request before anyone is asked to confirm it."""
+    schema = action.body_schema
+    if not isinstance(schema, dict) or schema.get("type") not in (None, "object"):
+        return []
+    if body is None:
+        return ["this action needs a JSON body"] if action.body_required else []
+    if not isinstance(body, dict):
+        return ["the body must be a JSON object"]
+    problems = []
+    for field_name in schema.get("required") or []:
+        if body.get(field_name) in (None, ""):
+            problems.append(f"'{field_name}' is required")
+    props = schema.get("properties") or {}
+    known = enum_values()
+    for key, value in body.items():
+        prop = props.get(key)
+        if not isinstance(prop, dict) or value is None:
+            continue
+        allowed = prop.get("enum") or (known.get(key) if isinstance(value, str) else None)
+        if allowed and isinstance(value, str) and value.lower() not in {str(a).lower() for a in allowed}:
+            problems.append(f"'{key}' must be one of {', '.join(map(str, allowed))} (got '{value}')")
+    if props and not schema.get("additionalProperties"):
+        unknown = sorted(set(body) - set(props))
+        if unknown:
+            problems.append(f"unknown field(s): {', '.join(unknown)}")
+    return problems
 
 
 def build_path(action: Action, params: dict) -> Optional[str]:

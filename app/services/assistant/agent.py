@@ -23,7 +23,7 @@ from typing import Any, Optional
 from app.config import settings
 from app.services.assistant import executor, shaping, store
 from app.services.assistant.caller import Caller
-from app.services.assistant.catalog import Action, Catalog, build_path, get_catalog
+from app.services.assistant.catalog import Action, Catalog, body_problems, build_path, get_catalog
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ How to work
 - The API index at the end lists every action available to this person, one per line: METHOD path ?query-params — what it does. Lines marked ✎ change data.
 - Look things up before acting. Resolve names, phone numbers, router names and plan names to ids with a read (show "none" when it is only a lookup). Never guess or invent an id.
 - Before any ✎ action, call describe_action for it, then call call_api with a complete, correct request and a clear summary.
-- A ✎ call does not run when you make it. It becomes a confirmation card and the person taps Confirm or Cancel. After proposing, end your turn with one or two sentences saying what will happen and that it waits for their Confirm. Never say a change is done before you have its result.
+- A ✎ call does not run when you make it. It becomes a confirmation card and the person taps Confirm or Cancel. After proposing, end your turn with one or two sentences saying what is ready and that it runs when they tap Confirm, e.g. "Ready to create the plan — tap Confirm." Never say you created, changed, set up or sent anything until you have its result.
 - Confirmed and cancelled actions come back in a message that starts with [Confirmation results]. Report what happened plainly, failures included, then continue the task if more steps remain.
 - For a change to many records, use a bulk action if the index has one; otherwise propose one call per record, at most {max_proposals} per turn, and say how many remain.
 - Never ask for, repeat or send a password, API key or other secret. Results show them hidden. If an action needs one, tell the person which dashboard page to use instead.
@@ -295,6 +295,22 @@ class Turn:
         self.conversation = conversation
         self.messages = conversation["messages"]
         self.transcript = conversation["transcript"]
+
+    def _described(self) -> set:
+        """Actions whose fields the model has looked up in this conversation."""
+        keys = set()
+        for m in self.messages:
+            if m.get("role") != "assistant" or not isinstance(m.get("content"), list):
+                continue
+            for b in m["content"]:
+                if b.get("type") == "tool_use" and b.get("name") == "describe_action":
+                    args = b.get("input") or {}
+                    method = str(args.get("method") or "").upper()
+                    path = str(args.get("path") or "").split("?", 1)[0]
+                    action = self.catalog.get(method, path) or self.catalog.match(method, path)[0]
+                    if action is not None:
+                        keys.add(action.key)
+        return keys
 
     # -- events ---------------------------------------------------------------
 
@@ -592,6 +608,17 @@ class Turn:
 
         if action.is_read(query, body):
             return await self._read(tool_use_id, action, method, path, query, body, show, dropped)
+        if action.key not in self._described():
+            return self._tool_result(tool_use_id, {
+                "error": f"Before proposing a change, call describe_action for {action.method} "
+                         f"{action.template} to get its exact fields and allowed values, then send "
+                         "this call again.",
+            }, True)
+        problems = body_problems(action, body)
+        if problems:
+            return self._tool_result(tool_use_id, {
+                "error": "Not proposed, fix the request first: " + "; ".join(problems) + ".",
+            }, True)
         if self.caller.read_only:
             return self._tool_result(tool_use_id, {"error": "View-as is read-only: changes are disabled."}, True)
         if self.proposals >= MAX_PROPOSALS_PER_TURN:
