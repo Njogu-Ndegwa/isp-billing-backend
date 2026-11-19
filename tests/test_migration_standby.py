@@ -48,6 +48,14 @@ async def test_startup_kill_switch_leaves_scheduler_empty(monkeypatch):
 
     for name in MIGRATION_CALLS:
         monkeypatch.setattr(main, name, AsyncMock())
+    # And every other startup migration: this test is about the scheduler kill
+    # switch. A real migration here writes into whichever engine `main` was
+    # bound to when first imported -- with some test orders that is a pytest
+    # worker's Postgres schema, and the payment-history trigger it installs
+    # then makes every later TRUNCATE in that worker fail.
+    for name in dir(main):
+        if name.startswith("run_") and "migration" in name and callable(getattr(main, name)):
+            monkeypatch.setattr(main, name, AsyncMock())
 
     async def no_database_sessions():
         if False:
