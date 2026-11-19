@@ -384,6 +384,19 @@ class Settings(BaseSettings):
     FEEDBACK_REPLY_MODEL: str = "claude-opus-4-8"
     FEEDBACK_DAILY_POST_CAP: int = 15
 
+    # --- Dashboard assistant (chat that can do everything the dashboard does) --
+    # app/services/assistant/. Uses ANTHROPIC_API_KEY above; an empty key means
+    # /api/assistant/* answers "not configured" and nothing else changes.
+    # Every action runs through this app's own API with the caller's token, so
+    # permissions, staff rules and View-as read-only apply unchanged.
+    ASSISTANT_ENABLED: bool = True
+    ASSISTANT_MODEL: str = "claude-opus-5-5"
+    ASSISTANT_EFFORT: str = "medium"            # low | medium | high
+    ASSISTANT_MAX_STEPS: int = 14               # model calls per question
+    ASSISTANT_ACTION_TTL_MINUTES: int = 15      # an unconfirmed action expires
+    ASSISTANT_RETENTION_DAYS: int = 90          # conversations are deleted after
+    ASSISTANT_CALL_TIMEOUT_SECONDS: int = 150   # one API call made for the chat
+
     # --- Support desk snapshot (platform admin only) ----------------------
     # Dennis's laptop builds the WhatsApp support dashboard JSON and POSTs it
     # to /api/admin/support-desk/snapshot with this bearer token. Empty (the

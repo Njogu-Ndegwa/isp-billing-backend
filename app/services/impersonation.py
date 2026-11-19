@@ -69,6 +69,9 @@ READ_ONLY_POST_ALLOWLIST = (
     re.compile(r"/api/customers/usage/bulk"),
     re.compile(r"/api/messaging/customer-events/preview"),
     re.compile(r"/api/compensation/outage/preview"),
+    # The assistant's question route. Its reads run as separate requests with
+    # this same View-as token, so this guard still refuses every change.
+    re.compile(r"/api/assistant/chat"),
 )
 
 # Let a View-as token reach the start endpoint so the caller gets that

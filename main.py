@@ -176,6 +176,7 @@ from app.api.router_ap_routes import router as router_ap_router
 from app.api.router_wifi_routes import router as router_wifi_router
 from app.api.customer_cpe_routes import router as customer_cpe_router
 from app.api.pppoe_device_lock_routes import router as pppoe_device_lock_router
+from app.api.assistant_routes import router as assistant_router, admin_router as admin_assistant_router
 
 app.include_router(session_monitor_router)
 app.include_router(auth_router)
@@ -238,6 +239,8 @@ app.include_router(router_ap_router)
 app.include_router(router_wifi_router)
 app.include_router(customer_cpe_router)
 app.include_router(pppoe_device_lock_router)
+app.include_router(assistant_router)
+app.include_router(admin_assistant_router)
 
 # --- Background job imports ---
 from app.services.mikrotik_background import (
@@ -2802,6 +2805,22 @@ async def run_staff_migrations():
             await conn.execute(sa_text("ALTER TABLE reseller_staff ADD COLUMN IF NOT EXISTS is_account_admin BOOLEAN NOT NULL DEFAULT false"))
 
 
+async def run_assistant_migrations():
+    """Create the dashboard-assistant tables (conversations, pending actions).
+
+    New tables only, so create_all with an explicit list is enough; it never
+    alters an existing table. Non-fatal: without them only /api/assistant fails.
+    """
+    from app.db.models import AssistantAction, AssistantConversation
+
+    async with async_engine.begin() as conn:
+        await conn.run_sync(lambda sync_conn: Base.metadata.create_all(
+            sync_conn,
+            tables=[AssistantConversation.__table__, AssistantAction.__table__],
+            checkfirst=True,
+        ))
+
+
 async def run_free_setup_column_migration():
     """Add users.free_setup_until (nullable, so the previous release still runs).
 
@@ -4114,6 +4133,12 @@ async def startup_event():
         logger.info("Feedback board migrations completed successfully")
     except Exception as e:
         logger.error(f"Feedback board migration failed (non-fatal): {e}")
+
+    try:
+        await run_assistant_migrations()
+        logger.info("Assistant migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Assistant migration failed (non-fatal): {e}")
 
     try:
         await run_subscription_reminder_migrations()

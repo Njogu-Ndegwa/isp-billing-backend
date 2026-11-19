@@ -154,6 +154,18 @@ ADS_VIEW = ("portal.manage", "dashboard.view")
 _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     # --- every staff member -------------------------------------------------
     ((R,), "/api/staff/me", ANY_STAFF, None),
+
+    # --- dashboard assistant (app/services/assistant/) -----------------------
+    # Every staff member may chat. Each action the chat runs is a separate
+    # in-process request with the same staff token, checked and logged by
+    # these rules like any dashboard request -- so the chat grants nothing.
+    ((R,), "/api/assistant/status", ANY_STAFF, None),
+    ((R,), "/api/assistant/conversations", ANY_STAFF, None),
+    ((R,), "/api/assistant/conversations/{conversation_id}", ANY_STAFF, None),
+    (("POST",), "/api/assistant/chat", ANY_STAFF, None),
+    (("POST",), "/api/assistant/conversations/{conversation_id}/decide", ANY_STAFF, None),
+    (("DELETE",), "/api/assistant/conversations/{conversation_id}", ANY_STAFF,
+     "Deleted an assistant conversation"),
     ((R,), "/api/profile", ANY_STAFF, None),
     ((R,), "/api/subscription", ANY_STAFF, None),
     ((R,), "/api/plans", ("plans.manage", "customers.view", "customers.manage", "vouchers.generate", "routers.view", "routers.manage", "portal.manage"), None),
@@ -564,6 +576,13 @@ OWNER_ALERT_TEMPLATES = frozenset({
     "/api/reseller/payout-settings",
     "/api/reseller/settlement-mode",
 })
+# Staff POSTs that are not themselves changes: the chat's own message and
+# confirm routes. The actions they run are logged as their own requests.
+UNLOGGED_TEMPLATES = frozenset({
+    "/api/assistant/chat",
+    "/api/assistant/conversations/{conversation_id}/decide",
+})
+
 # Writes by the OWNER to these are logged too (staff writes are always logged).
 OWNER_LOGGED_TEMPLATES = OWNER_ALERT_TEMPLATES | frozenset({
     "/api/payment-methods/{method_id}/register-c2b",

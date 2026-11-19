@@ -33,3 +33,5 @@ python-dateutil
 
 # Background task scheduler
 apscheduler==3.10.4
+# Dashboard assistant (app/services/assistant/) and feedback triage
+anthropic

@@ -363,6 +363,28 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
 - Tests: `tests/test_feedback_routes.py`, `tests/test_admin_feedback_routes.py`,
   `tests/test_feedback_ai.py`.
 
+## Dashboard Assistant (chat that does everything the dashboard does)
+
+- `app/services/assistant/` + `app/api/assistant_routes.py`; screen at `/assistant`
+  in `../isp-billing-admin`, Bitwave support view at `/admin/assistant`. Onboarding
+  starts there (`/assistant?start=setup`) when the assistant is switched on.
+- The model (Anthropic, `ASSISTANT_MODEL`, key `ANTHROPIC_API_KEY` in the server env)
+  sees an index of every bearer-secured JSON route, built from `app.openapi()` and
+  filtered by role / staff permissions (`catalog.py`). It calls them through
+  `executor.call_api`: an in-process ASGI request through ALL middleware with the
+  caller's own token. Nothing in the assistant grants access; the guards decide.
+- Reads run at once. Anything else becomes an `assistant_actions` row and runs only
+  from `POST /api/assistant/conversations/{id}/decide` after the person taps Confirm
+  (single use, same identity, 15-min expiry). Read-only POSTs are listed in
+  `catalog.READ_ONLY_POSTS`; a new POST that only reads belongs there.
+- Secrets never go through the chat: secret-looking fields are masked in results
+  and refused in requests (`shaping.py`). Photos go to the Files API once; history
+  keeps only the file id. Conversation history is append-only (thinking blocks).
+- New routes appear in the assistant automatically. Give them a clear docstring
+  (it is the model's description) and, if staff may use them, a staff rule.
+- `/api/assistant/*` holds no DB session during model or API calls (Session
+  Discipline). Tests: `tests/test_assistant.py` (scripted fake model).
+
 ## AWS Migration / Insurance Tunnel Handoff
 
 **Status 2026-09-22: the cutover is done.** Hetzner `91.98.238.12` is the primary (app,
