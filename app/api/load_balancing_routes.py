@@ -577,15 +577,25 @@ async def disable_load_balancing(
 
     router_obj.lb_enabled = False
     router_obj.lb_applied_at = None  # KEEP lb_config for easy re-enable
+    if (router_obj.lb_config or {}).get("health"):
+        # The line health state belongs to the balancing that is now gone.
+        router_obj.lb_config = {k: v for k, v in router_obj.lb_config.items()
+                                if k != "health"}
     await db.commit()
 
+    kept = result.get("kept_failover_routes") or []
     return {
         "success": True,
         "router_id": router_id,
         "enabled": False,
         "config": router_obj.lb_config,
         "rollback": result,
-        "message": "Load balancing disabled; router back on plain WAN1",
+        "warnings": list(result.get("warnings") or []),
+        "message": (
+            "Load balancing disabled; the router stays on WAN1 with the other line as "
+            "backup (WAN1 adds no default route of its own, so the backup routes were kept)"
+            if kept else "Load balancing disabled; router back on plain WAN1"
+        ),
     }
 
 

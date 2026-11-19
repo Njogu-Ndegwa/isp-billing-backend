@@ -1694,6 +1694,9 @@ def lb_rollback(api) -> dict:
          (hand-added LB_SRC / LB_BYPASS_DST entries are kept)
 
     Leaves the router on plain WAN1 (its original dynamic DHCP default route).
+    If WAN1's DHCP client adds no default route (add-default-route=no), the
+    main-table managed routes (probes, checked defaults, VPN pins) are KEPT so
+    the router is never left without a default; only the to_wanX tables go.
     Secondary-WAN DHCP clients and interface-list memberships are left in place;
     they are harmless without the routes and make re-enable instant.
     """
@@ -1762,12 +1765,26 @@ def lb_rollback(api) -> dict:
     report["address_list_kept"] = kept
 
     # 5b: remove managed routes (probes, checked defaults, to_wan, vpn pins).
-    routes = _rd(api, "/ip/route/print", [".id", "comment"])
+    #     The main-table ones may only go when something else gives the router
+    #     a default route. WAN1's DHCP client is set to add-default-route=no on
+    #     routers whose WANs share a subnet (its route spread unmarked traffic
+    #     over both ports; ZEUS, router 671, 2026-11-19): removing the checked
+    #     defaults there left NO default route. Then keep them — checked WAN1
+    #     default, other lines as failover, exactly what rollback_lb.py leaves.
+    major = _read_ros_major(api)
+    routes = _rd(api, "/ip/route/print", [".id"] + _route_proplist(major))
+    keep_main = not lb_has_unmanaged_default(routes)
+    kept_routes = []
     for r in routes:
         comment = r.get("comment") or ""
-        if comment.startswith(COMMENT_PREFIX):
-            _wr(api, report, f"route.remove.{comment}", "/ip/route/remove",
-                {".id": r[".id"]})
+        if not comment.startswith(COMMENT_PREFIX):
+            continue
+        if keep_main and _is_main_table_route(r):
+            kept_routes.append(comment)
+            continue
+        _wr(api, report, f"route.remove.{comment}", "/ip/route/remove",
+            {".id": r[".id"]})
+    report["kept_failover_routes"] = kept_routes
 
     # 5c: remove the to_wanX routing tables.
     for t in _rd(api, "/routing/table/print", [".id", "name"]):
@@ -1775,9 +1792,36 @@ def lb_rollback(api) -> dict:
             _wr(api, report, f"routing_table.remove.{t.get('name')}",
                 "/routing/table/remove", {".id": t[".id"]})
 
-    report["state"] = ("LB off; router on plain WAN1. Secondary DHCP clients and "
-                       "interface-list memberships left in place (harmless).")
+    if kept_routes:
+        report["state"] = (
+            "LB off; WAN1 has no DHCP default route of its own, so the router stays "
+            "on its checked WAN1 default with the other line(s) as failover. "
+            "Secondary DHCP clients and interface-list memberships left in place.")
+        report.setdefault("warnings", []).append(
+            "WAN1's DHCP client adds no default route (add-default-route=no), so the "
+            "checked default routes were kept to keep the router online; balancing "
+            "is off.")
+    else:
+        report["state"] = ("LB off; router on plain WAN1. Secondary DHCP clients and "
+                           "interface-list memberships left in place (harmless).")
     return report
+
+
+def _is_main_table_route(row: dict) -> bool:
+    table = row.get("routing-table") or ""
+    return table in ("", "main") and not row.get("routing-mark")
+
+
+def lb_has_unmanaged_default(routes: List[dict]) -> bool:
+    """True when an active main-table default route exists that LB did not
+    add (normally WAN1's own DHCP default), so the managed ones can go."""
+    for r in routes:
+        if (r.get("dst-address") == "0.0.0.0/0" and r.get("active") == "true"
+                and r.get("disabled") != "true"
+                and not (r.get("comment") or "").startswith(COMMENT_PREFIX)
+                and _is_main_table_route(r)):
+            return True
+    return False
 
 
 # --- LB_PAID seeding + single-entry helpers ---------------------------------
