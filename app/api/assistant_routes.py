@@ -19,7 +19,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.services.assistant import store
+from app.services.assistant import store, usage
 from app.services.assistant.agent import Turn, assistant_ready, conversation_lock, model_name, provider
 from app.services.assistant.caller import Caller, caller_from_request
 from app.services.assistant.executor import ASSISTANT_HEADER
@@ -147,6 +147,10 @@ async def _run(turn: Turn, caller: Caller, conversation: dict, queue: asyncio.Qu
                     caller, conversation["id"], messages=turn.messages, transcript=turn.transcript,
                     input_tokens=turn.input_tokens, output_tokens=turn.output_tokens, title=title,
                 )
+                try:
+                    await usage.record(caller.user_id, caller.staff_id, turn.usage, question=turn.is_question)
+                except Exception:
+                    logger.exception("[assistant] usage record failed (the answer was not affected)")
     except Exception:
         logger.exception("[assistant] turn failed for conversation %s", conversation["id"])
         await queue.put({"type": "notice", "level": "error", "message": "Something went wrong. Try again."})
@@ -274,6 +278,13 @@ async def admin_get_conversation(conversation_id: str, request: Request):
     if conv is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return conv
+
+
+@admin_router.get("/usage")
+async def admin_usage(request: Request, days: int = 30):
+    """Questions, active accounts and estimated cost: per day, and the busiest accounts."""
+    await _admin(request)
+    return await usage.report(days=days)
 
 
 @admin_router.post("/conversations/{conversation_id}/notes")

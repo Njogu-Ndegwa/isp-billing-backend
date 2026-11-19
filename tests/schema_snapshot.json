@@ -250,6 +250,19 @@
   "user_id",
   "viewer_sid"
  ],
+ "assistant_usage_daily": [
+  "cache_read_tokens",
+  "cost_usd_micros",
+  "day",
+  "id",
+  "input_tokens",
+  "model_calls",
+  "output_tokens",
+  "questions",
+  "staff_id",
+  "updated_at",
+  "user_id"
+ ],
  "b2b_transactions": [
   "account_reference",
   "amount",

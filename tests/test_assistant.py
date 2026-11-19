@@ -719,3 +719,40 @@ async def test_two_replies_in_one_answer_are_separate_paragraphs(client, owner):
                                            headers=auth(token))).text)
     streamed = "".join(e["delta"] for e in events if e["type"] == "text")
     assert streamed == "Checking." + chr(10) * 2 + "No plans yet."
+
+
+def test_deepseek_peak_hours_cost_double():
+    from datetime import datetime as dt
+
+    from app.services.assistant.usage import call_cost_micros, deepseek_peak
+
+    tuesday_peak, tuesday_quiet, saturday = dt(2026, 11, 17, 7), dt(2026, 11, 17, 12), dt(2026, 11, 21, 7)
+    assert deepseek_peak(tuesday_peak) and not deepseek_peak(tuesday_quiet) and not deepseek_peak(saturday)
+    args = dict(input_tokens=1_000_000, cache_read_tokens=1_000_000, output_tokens=1_000_000)
+    assert call_cost_micros("deepseek-flash", "deepseek", at=tuesday_quiet, **args) == 753_000   # $0.15+0.003+0.60
+    assert call_cost_micros("deepseek-flash", "deepseek", at=tuesday_peak, **args) == 1_506_000
+    assert call_cost_micros("claude-opus-5-5", "anthropic", at=tuesday_peak, **args) == 24_200_000
+
+
+@pytest.mark.asyncio
+async def test_usage_is_counted_per_account_and_reported_to_admins(client, owner, db):
+    from app.db.models import AssistantUsageDaily
+
+    _, token = owner
+    use_model([
+        tool_reply("call_api", {"method": "GET", "path": "/api/plans", "show": "none"}),
+        text_reply("None yet."),
+    ])
+    await client.post("/api/assistant/chat", json={"message": "plans?"}, headers=auth(token))
+    use_model([text_reply("Still none.")])
+    await client.post("/api/assistant/chat", json={"message": "and now?"}, headers=auth(token))
+    row = (await db.execute(select(AssistantUsageDaily))).scalar_one()
+    assert (row.questions, row.model_calls, row.input_tokens, row.output_tokens) == (2, 3, 300, 60)
+    assert row.staff_id == 0 and row.cost_usd_micros > 0
+
+    assert (await client.get("/api/admin/assistant/usage", headers=auth(token))).status_code == 403
+    admin = await make_admin(db, email="usage-admin@example.com")
+    admin_token = create_access_token(login_token_claims(admin), timedelta(hours=1))
+    report = (await client.get("/api/admin/assistant/usage?days=7", headers=auth(admin_token))).json()
+    assert report["summary"]["today"]["questions"] == 2 and report["summary"]["today"]["accounts"] == 1
+    assert report["top_accounts"][0]["questions"] == 2 and report["days"][-1]["model_calls"] == 3

@@ -3491,3 +3491,33 @@ class AssistantAction(Base):
     decided_at = Column(DateTime, nullable=True)
     result_status = Column(Integer, nullable=True)
     result_summary = Column(String(500), nullable=True)
+
+
+class AssistantUsageDaily(Base):
+    """Assistant use per account per day: questions, tokens and estimated cost.
+
+    One row per (day, user_id, staff_id); staff_id 0 means the account owner or
+    an admin (not NULL, so the unique key also covers them). Written once per
+    answered question, in its own short session (app/services/assistant/usage.py).
+    cost_usd_micros is an estimate from the provider's list prices at the time
+    of each model call (DeepSeek peak hours priced double).
+
+    Startup migration: run_assistant_migrations() in main.py.
+    """
+    __tablename__ = "assistant_usage_daily"
+    __table_args__ = (
+        UniqueConstraint("day", "user_id", "staff_id", name="uq_assistant_usage_daily_owner"),
+        Index("ix_assistant_usage_daily_day", "day"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    day = Column(Date, nullable=False)
+    user_id = Column(Integer, nullable=False)
+    staff_id = Column(Integer, nullable=False, default=0, server_default="0")
+    questions = Column(Integer, nullable=False, default=0, server_default="0")
+    model_calls = Column(Integer, nullable=False, default=0, server_default="0")
+    input_tokens = Column(BigInteger, nullable=False, default=0, server_default="0")
+    cache_read_tokens = Column(BigInteger, nullable=False, default=0, server_default="0")
+    output_tokens = Column(BigInteger, nullable=False, default=0, server_default="0")
+    cost_usd_micros = Column(BigInteger, nullable=False, default=0, server_default="0")
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)

@@ -2806,17 +2806,18 @@ async def run_staff_migrations():
 
 
 async def run_assistant_migrations():
-    """Create the dashboard-assistant tables (conversations, pending actions).
+    """Create the dashboard-assistant tables (conversations, pending actions, usage).
 
     New tables only, so create_all with an explicit list is enough; it never
     alters an existing table. Non-fatal: without them only /api/assistant fails.
     """
-    from app.db.models import AssistantAction, AssistantConversation
+    from app.db.models import AssistantAction, AssistantConversation, AssistantUsageDaily
 
     async with async_engine.begin() as conn:
         await conn.run_sync(lambda sync_conn: Base.metadata.create_all(
             sync_conn,
-            tables=[AssistantConversation.__table__, AssistantAction.__table__],
+            tables=[AssistantConversation.__table__, AssistantAction.__table__,
+                    AssistantUsageDaily.__table__],
             checkfirst=True,
         ))
 

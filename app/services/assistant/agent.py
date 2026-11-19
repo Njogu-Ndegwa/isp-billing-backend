@@ -22,6 +22,7 @@ from typing import Any, Optional
 
 from app.config import settings
 from app.services.assistant import executor, shaping, store
+from app.services.assistant.usage import TurnUsage
 from app.services.assistant.caller import Caller
 from app.services.assistant.catalog import Action, Catalog, body_problems, build_path, get_catalog
 
@@ -357,6 +358,8 @@ class Turn:
         self.proposals = 0
         self._text_parts: list[str] = []
         self._spoke = False
+        self.usage = TurnUsage()
+        self.is_question = False
 
     def reload(self, conversation: dict) -> None:
         """Start from the stored history (taken under the conversation lock)."""
@@ -409,6 +412,7 @@ class Turn:
     # -- entry points ---------------------------------------------------------
 
     async def user_message(self, text: str, images: Optional[list[dict]] = None) -> None:
+        self.is_question = True
         images = images or []
         content: list[dict] = []
         for image in images:
@@ -571,6 +575,7 @@ class Turn:
         message = await self._model_call_inner(system)
         usage = getattr(message, "usage", None)
         if usage is not None:
+            self.usage.add_call(usage, model_name(), provider())
             logger.info("[assistant] usage user=%s provider=%s model=%s in=%s cache_read=%s out=%s",
                         self.caller.user_id, provider(), model_name(),
                         getattr(usage, "input_tokens", 0), getattr(usage, "cache_read_input_tokens", 0),
