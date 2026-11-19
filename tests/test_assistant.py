@@ -1054,3 +1054,61 @@ async def test_who_starts_on_the_assistant(client, owner, db, monkeypatch):
     monkeypatch.setattr(settings, "DEEPSEEK_API_KEY", "")
     off = await status(token)
     assert off["enabled"] is False and off["home"] is False and off["home_choice"] == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_briefing_draws_each_router_with_what_it_last_reported(client, owner, db):
+    """The home screen's network section: every router, trouble first, with its own live report."""
+    from datetime import datetime
+
+    from app.db.models import CustomerStatus
+    from app.services import realtime_state
+
+    reseller, token = owner
+    now = datetime.utcnow()
+    plan = await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    shop = await make_router(db, reseller, name="Shop", last_status=True, last_checked_at=now,
+                             availability_checks=200, availability_successes=199)
+    estate = await make_router(db, reseller, name="Estate", last_status=False, last_checked_at=now,
+                               last_online_at=now - timedelta(hours=2))
+    quiet = await make_router(db, reseller, name="Quiet", last_status=True, last_checked_at=now)
+    shop_id, estate_id, quiet_id = shop.id, estate.id, quiet.id
+    for i, router_id in enumerate((shop_id, shop_id, estate_id)):
+        await make_customer(db, reseller, plan, status=CustomerStatus.ACTIVE, expiry=now + timedelta(days=1),
+                            name=f"C{i}", phone=f"25470000010{i}", router_id=router_id)
+    await make_customer(db, reseller, plan, status=CustomerStatus.INACTIVE, expiry=now - timedelta(days=1),
+                        name="Gone", phone="254700000109", router_id=shop_id)
+
+    total = 256 * 1024 * 1024
+    realtime_state._routers[shop_id] = realtime_state.RouterLive(
+        router_id=shop_id, received_at=now, interval_seconds=60, cpu_load=41, free_memory=total // 4,
+        total_memory=total, uptime="3d04:14:07", version="7.16.1", board="hAP ax2",
+        wan_rx_bps=12_400_000.0, wan_tx_bps=2_100_000.0, hotspot_active=14, pppoe_active=3)
+    # a report from long ago is not "live"
+    realtime_state._routers[quiet_id] = realtime_state.RouterLive(
+        router_id=quiet_id, received_at=now - timedelta(hours=2), interval_seconds=60, cpu_load=5)
+    try:
+        b = (await client.get("/api/assistant/briefing", headers=auth(token))).json()
+    finally:
+        realtime_state._routers.pop(shop_id, None)
+        realtime_state._routers.pop(quiet_id, None)
+
+    network = b["routers"]["list"]
+    assert [r["name"] for r in network] == ["Estate", "Shop", "Quiet"]          # down first, then reporting
+    by_name = {r["name"]: r for r in network}
+    assert by_name["Shop"]["live"] == {
+        "cpu": 41, "memory_pct": 75, "uptime": "3d04:14:07", "version": "7.16.1", "board": "hAP ax2",
+        "down_bps": 12_400_000.0, "up_bps": 2_100_000.0, "hotspot_online": 14, "pppoe_online": 3,
+        "age_seconds": by_name["Shop"]["live"]["age_seconds"],
+    }
+    assert by_name["Shop"]["reachable_pct"] == 99.5 and by_name["Shop"]["active_customers"] == 2
+    assert by_name["Estate"]["status"] == "offline" and by_name["Estate"]["active_customers"] == 1
+    assert by_name["Estate"]["live"] is None and by_name["Estate"]["last_online_at"].endswith("Z")
+    assert by_name["Quiet"]["live"] is None and by_name["Quiet"]["active_customers"] == 0
+
+    # someone who may see routers but not customers gets no customer counts
+    briefing_mod.reset_cache()
+    _, staff_token = await _staff_token(db, reseller, ["routers.view"])
+    s = (await client.get("/api/assistant/briefing", headers=auth(staff_token))).json()
+    assert "routers" in s and "customers" not in s
+    assert all(r["active_customers"] is None for r in s["routers"]["list"])

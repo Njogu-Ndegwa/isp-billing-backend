@@ -39,6 +39,8 @@ MAX_CACHED = 1000
 DAYS = 14
 LIST_LIMIT = 5
 EXPIRING_LIST_DAYS = 7     # the "next to expire" list looks this far ahead
+NETWORK_LIMIT = 12         # routers drawn one by one on the home screen (trouble first)
+LIVE_MAX_AGE_SECONDS = 600  # a router's own report older than this is not "live"
 
 # section -> the dashboard route(s) whose access decides it (any one is enough)
 GATES: dict[str, tuple[tuple[str, str], ...]] = {
@@ -156,23 +158,77 @@ async def _routers(db, user_id: int, now: datetime) -> dict:
     from app.services.router_availability import derive_router_status
 
     rows = (await db.execute(
-        select(Router.id, Router.name, Router.last_status, Router.last_checked_at, Router.last_online_at)
+        select(Router.id, Router.name, Router.identity, Router.last_status, Router.last_checked_at,
+               Router.last_online_at, Router.availability_checks, Router.availability_successes)
         .where(Router.user_id == user_id).order_by(Router.id).limit(1000)
     )).all()
     counts = {"online": 0, "offline": 0, "unknown": 0}
     down = []
-    for rid, name, last_status, last_checked_at, last_online_at in rows:
+    network = []
+    for rid, name, identity, last_status, last_checked_at, last_online_at, checks, successes in rows:
         status = derive_router_status(
             SimpleNamespace(last_status=last_status, last_checked_at=last_checked_at), now=now)
         counts[status] = counts.get(status, 0) + 1
         if status == "offline":
             down.append((last_online_at or datetime.min, rid, name, last_online_at))
+        network.append({
+            "id": rid, "name": name, "identity": identity, "status": status,
+            "last_online_at": _iso(last_online_at),
+            "reachable_pct": round(successes * 100 / checks, 1) if checks else None,
+            "active_customers": None,   # filled in when the caller may see customers
+            "live": _live(rid, now),
+        })
     down.sort(key=lambda item: item[0], reverse=True)  # the most recent outage first
+    network.sort(key=lambda r: (r["status"] != "offline", r["live"] is None, r["id"]))  # trouble first
     return {
         "total": len(rows), **counts,
         "down": [{"id": rid, "name": name, "last_online_at": _iso(last_online_at)}
                  for _, rid, name, last_online_at in down[:LIST_LIMIT]],
+        "list": network[:NETWORK_LIMIT],
     }
+
+
+def _live(router_id: int, now: datetime) -> Optional[dict]:
+    """What the router itself last reported (CPU, memory, people online, WAN traffic).
+
+    Read from memory: the usage-push report the router sends on its own. Nothing here
+    contacts the router. None when the router does not report or its report is old.
+    """
+    try:
+        from app.services import realtime_state
+
+        state = realtime_state.get_router_live(router_id)
+        if state is None:
+            return None
+        age = (now - state.received_at).total_seconds()
+        if age > LIVE_MAX_AGE_SECONDS:
+            return None
+        total, free = state.total_memory, state.free_memory
+        return {
+            "cpu": state.cpu_load,
+            "memory_pct": round((total - free) * 100 / total) if total and free is not None else None,
+            "uptime": state.uptime or None,
+            "version": state.version or None,
+            "board": state.board or None,
+            "down_bps": state.wan_rx_bps,
+            "up_bps": state.wan_tx_bps,
+            "hotspot_online": state.hotspot_active,
+            "pppoe_online": state.pppoe_active,
+            "age_seconds": round(max(0.0, age)),
+        }
+    except Exception:
+        logger.exception("[assistant] live report read failed for router %s", router_id)
+        return None
+
+
+async def _active_by_router(db, user_id: int, now: datetime) -> dict:
+    """Customers with paid time left, per router (one grouped count)."""
+    rows = (await db.execute(
+        select(Customer.router_id, func.count(Customer.id))
+        .where(Customer.user_id == user_id, Customer.status == CustomerStatus.ACTIVE, Customer.expiry >= now)
+        .group_by(Customer.router_id)
+    )).all()
+    return {router_id: int(count) for router_id, count in rows if router_id is not None}
 
 
 async def _plans(db, user_id: int, now: datetime) -> list:
@@ -317,6 +373,16 @@ async def _build(catalog: Catalog, caller: Caller) -> dict:
                 value = await section(name, name, lambda work=work: work(db, user_id, now))
                 if value is not None:
                     out[name] = value
+
+            # how many paying customers sit on each router: only for someone who may see customers
+            if out.get("routers") and out["routers"]["list"] and may["customers"]:
+                try:
+                    per_router = await _active_by_router(db, user_id, now)
+                    for item in out["routers"]["list"]:
+                        item["active_customers"] = per_router.get(item["id"], 0)
+                except Exception:
+                    logger.exception("[assistant] briefing customers-per-router failed for user %s", user_id)
+                    await db.rollback()
 
             out["attention"] = {
                 "failed_payments_24h": await section(

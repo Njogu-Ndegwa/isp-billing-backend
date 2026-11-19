@@ -399,6 +399,10 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   dashboard route that shows the same thing (`briefing.GATES`), so staff permissions and
   View-as follow the existing rules; "today" and revenue match `/api/dashboard/analytics`
   (UTC days, `created_at`, `counts_as_revenue`). A new figure there needs a gate too.
+  `routers.list` is the network section: each router with its status, reachability, paying
+  customers on it (only for someone who may see customers) and `live`, the CPU / memory /
+  people online / WAN traffic from the router's own usage-push report held in memory
+  (`realtime_state`). It never contacts a router; a report older than 10 minutes is not live.
 - Who starts on the assistant (`home.py`): a person's own choice
   (`PUT /api/assistant/home`, table `assistant_home_choices`) wins; otherwise reseller
   accounts are in when `crc32("assistant-home:{user_id}") % 100` is below
