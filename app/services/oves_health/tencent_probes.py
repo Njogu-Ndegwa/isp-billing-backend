@@ -17,8 +17,16 @@ TENCENT_PROBES: list[Probe] = [
       "All device telemetry + code delivery (ble-app hard-codes 1883)", critical=True),
     P("mqtt_8883", "MQTT TLS :8883", "tencent", "tcp", "mqtt.omnivoltaic.com:8883",
       "TLS devices (chain is self-signed: known defect)"),
-    P("wvapp", "wvapp (field app web layer)", "tencent", "http", "https://wvapp.omnivoltaic.com/",
+    # Since ble-app #25 (2026-11-09) portal.omnivoltaic.com is the app's address and
+    # wvapp.omnivoltaic.com answers page loads with a 307 to it, so the app check
+    # targets portal (the id stays "wvapp" for the dashboard) and a second check
+    # makes sure the old address, which older oves-app installs still open, keeps redirecting.
+    P("wvapp", "Field app web layer (portal.omnivoltaic.com)", "tencent", "http",
+      "https://portal.omnivoltaic.com/",
       "Every field-staff applet in oves-app", expect_text="/_next/static/", critical=True),
+    P("wvapp_legacy", "wvapp.omnivoltaic.com redirect", "tencent", "http",
+      "https://wvapp.omnivoltaic.com/",
+      "Older oves-app installs start here", expect_status=(307, 308)),
     P("abs_dev", "ABS platform", "tencent", "http",
       "https://abs-platform-dev.omnivoltaic.com/graphql",
       "ble-app identify / serviceTopup, rider activity", method="POST",
