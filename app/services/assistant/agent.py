@@ -34,6 +34,48 @@ FALLBACK_MODELS = frozenset({
     "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5", "claude-fable-5-2", "claude-fable-5-1",
 })
 
+# How the page may draw a read's result. The model only chooses the drawing and,
+# optionally, which fields of the result to draw; every number on screen comes
+# from the result itself.
+SHOW_VALUES = ("auto", "table", "card", "none", "tiles", "trend", "bars", "share")
+MAX_VALUE_FIELDS = 4
+MAX_FIELD_NAME = 60
+
+
+def clean_fields(raw: Any) -> Optional[dict]:
+    """The model's field hint, kept only where it is well formed.
+
+    A drawing hint must never fail a read, so anything odd is dropped rather
+    than reported: names are plain strings of at most MAX_FIELD_NAME characters,
+    and at most MAX_VALUE_FIELDS value fields are kept.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    def name(value) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        return value if 0 < len(value) <= MAX_FIELD_NAME else None
+
+    out: dict = {}
+    label = name(raw.get("label"))
+    if label:
+        out["label"] = label
+    values = raw.get("value")
+    if isinstance(values, str):
+        values = [values]
+    if isinstance(values, list):
+        kept: list[str] = []
+        for value in values:
+            value = name(value)
+            if value and value not in kept:
+                kept.append(value)
+        if kept:
+            out["value"] = kept[:MAX_VALUE_FIELDS]
+    return out or None
+
+
 TOOLS = [
     {
         "name": "describe_action",
@@ -70,9 +112,27 @@ TOOLS = [
                 "query": {"type": "object", "description": "Query parameters, if any."},
                 "body": {"description": "JSON body for POST/PUT/PATCH, if the action takes one."},
                 "show": {
-                    "type": "string", "enum": ["table", "card", "none"],
-                    "description": ("How the chat shows this result to the person: table for lists, "
-                                    "card for one record, none for lookups only you need."),
+                    "type": "string", "enum": list(SHOW_VALUES),
+                    "description": (
+                        "How the page draws this result for the person: tiles for a few totals, "
+                        "table for a list, card for one record, trend for figures per day, week or "
+                        "month, bars for a top-N or a comparison between names, share for a split of "
+                        "one whole (by status, plan, method), none for lookups only you need, auto "
+                        "to let the page choose."),
+                },
+                "fields": {
+                    "type": "object",
+                    "description": (
+                        "Optional, for trend, bars and share: which fields of the result rows to "
+                        "draw, by their exact names in the response. Leave it out when unsure; the "
+                        "page then picks them itself."),
+                    "properties": {
+                        "label": {"type": "string",
+                                  "description": "The field that names each row: the date, the name, the status."},
+                        "value": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_VALUE_FIELDS,
+                                  "description": "The numeric field(s) to draw, e.g. [\"revenue\"]."},
+                    },
+                    "additionalProperties": False,
                 },
                 "summary": {
                     "type": "string",
@@ -113,6 +173,20 @@ Getting started (onboarding)
 - Plans: ask for name, price, duration and speed if not given; describe the plan action to see the exact fields. Payments: M-Pesa Paybill (paybill number), M-Pesa Till (a 4–9 digit Buy Goods number, never a phone number: a phone number cannot receive payouts) or bank (bank paybill + account number). After creating the first payment method, link it to the router with the router payment-method action if the index has it.
 - If they stay stuck, the Bitwave team can take over: they can send their RustDesk ID on WhatsApp to +254795635364 and Bitwave sets the router up remotely. The Bitwave team can also read this chat and add notes to it.
 
+Product facts (Bitwave support's own answers to resellers; check live data for numbers)
+- Staff or special people who need internet without buying: create them under Access Credentials (/access-credentials, the access-credentials actions): a username and password they type on the hotspot login page, any time, without paying. Dashboard staff (/settings/staff) are logins to this dashboard, not internet access.
+- Devices per plan: normally 1; more lets several people share one purchase.
+- Editing a plan that customers are on is risky; say so before proposing it.
+- PPPoE payments work two ways: customers pay the reseller directly and the reseller activates them (they still expire automatically), or customers pay through Bitwave, which activates and expires them itself and pays the reseller out. PPPoE customers are cut off automatically at expiry.
+- A customer with a TV or several devices: send them the connect link; it asks for their number and gives a code, or add the device to the customer by its MAC address.
+- SMS "can't send" or "shows zero": a send needs credits for every recipient × message part; check the balance and how many people they want to reach.
+- A new access point or router should show up by itself once it is added and provisioned; if it does not, check its provisioning.
+- Speed complaints (often Starlink): the billing system lets customers in and out; Starlink slows down at peak hours. Still check the router's CPU and queues: a hAP lite struggles with many users, an RB951 handles about 30–50.
+- Sessions dropping: first ask whether every access point uses the same Wi-Fi name (SSID), then check the router log (keepalive timeouts) and CPU.
+- Paid but no internet: find the customer (by phone), check their status and expiry, then their router's uptime: a router going on and offline is the common cause.
+- STK prompts failing for many customers at once: usually a Safaricom-wide problem, not the reseller's setup.
+- Bitwave can set routers up remotely (RustDesk, AnyDesk or UltraViewer) for resellers who are stuck.
+
 Photos
 - The person can send photos or screenshots (a Winbox terminal, an error, a router label, an M-Pesa message). Read them carefully: quote the exact error text you see, say what it means and give the next step. If a photo is unreadable, say so and ask for a closer or clearer one.
 
@@ -120,7 +194,9 @@ Bitwave support notes
 - A message starting with [Bitwave support note from …] was written by the Bitwave team into this chat. Follow it, and tell the person what support said when it matters.
 
 Showing results
-- The chat draws each read's result for the person as a table or card (choose with "show"). Do not repeat the table in your text: give the answer, the key numbers and what stands out.
+- The page draws each read's result for the person, and you choose how with "show": tiles for a few totals, table for a list, card for one record, trend for figures per day, week or month, bars for a top-N or a comparison between names, share for a split of one whole (by status, plan or payment method), none for a lookup only you need. Pick the drawing that answers the question, and prefer an action that already returns the grouping you need (per day, per plan, per router) over a long raw list.
+- For trend, bars and share you may add "fields" naming the fields of the result rows to draw (label and value). Leave it out when you are unsure of the names; the page then picks them itself.
+- The numbers on screen always come from the data, never from you. So say the answer in one or two sentences, the headline figure and what stands out, and never repeat rows, lists or tables in your text.
 - Every figure you state must come from a result in this conversation. If you do not have it, look it up or say you do not know.
 - Money: use the amounts and currency in the data; do not convert. Times from the API are UTC unless marked.
 - You may link to dashboard pages with relative links, e.g. [Jane Wanjiru](/customers/1234), /routers/12/live, /customers, /routers, /plans, /vouchers, /transactions, /messaging, /settings.
@@ -131,6 +207,11 @@ Safety
 
 Style
 - Short and plain. Reply in the language the person writes in (English, Kiswahili and French are common).
+
+What next
+- End a finished answer with one last line in exactly this form: NEXT: question one | question two | question three
+- That is two or three short questions this person is likely to ask next, in their language, each one something you can answer or do with the index. The page shows them as buttons, so write them as the person would ask them.
+- Leave the NEXT line out when a Confirm card is waiting, when you asked the person a question, or when something failed.
 
 API index ({count} actions)
 {index}"""
@@ -667,7 +748,8 @@ class Turn:
         raw_path = str(args.get("path") or "")
         query = args.get("query")
         body = args.get("body")
-        show = args.get("show") if args.get("show") in ("table", "card", "none") else "auto"
+        show = args.get("show") if args.get("show") in SHOW_VALUES else "auto"
+        fields = clean_fields(args.get("fields"))
 
         if query is not None and not isinstance(query, dict):
             return self._tool_result(tool_use_id, {"error": "query must be an object"}, True)
@@ -705,7 +787,7 @@ class Turn:
             query = {k: v for k, v in query.items() if k in known}
 
         if action.is_read(query, body):
-            return await self._read(tool_use_id, action, method, path, query, body, show, dropped)
+            return await self._read(tool_use_id, action, method, path, query, body, show, dropped, fields)
         if action.key not in self._described():
             return self._tool_result(tool_use_id, {
                 "error": f"Before proposing a change, call describe_action for {action.method} "
@@ -744,7 +826,8 @@ class Turn:
             **({"ignored_query_params": dropped} if dropped else {}),
         })
 
-    async def _read(self, tool_use_id, action: Action, method, path, query, body, show, dropped) -> dict:
+    async def _read(self, tool_use_id, action: Action, method, path, query, body, show, dropped,
+                    fields: Optional[dict] = None) -> dict:
         call_id = uuid.uuid4().hex[:12]
         await self.emit("step", {"call_id": call_id, "label": action.title, "phase": "start",
                                  "method": method, "path": path}, keep=False)
@@ -756,7 +839,8 @@ class Turn:
         if show != "none":
             await self.emit("data", {
                 "call_id": call_id, "title": action.title, "method": method, "path": path,
-                "query": query or None, "show": show, "payload": shaping.for_screen(result.data),
+                "query": query or None, "show": show, **({"fields": fields} if fields else {}),
+                "payload": shaping.for_screen(result.data),
             })
         out: dict = {"status": result.status, "data": shaping.for_model(result.data)}
         if dropped:

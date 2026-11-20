@@ -18,4 +18,6 @@ Modules:
     executor   the in-process API call
     store      conversations and pending actions (short DB sessions only)
     agent      the model loop and its two tools
+    briefing   live figures for the home screen (aggregates, cached a minute)
+    home       who starts on the assistant: own choice, else the rollout share
 """

@@ -250,6 +250,13 @@
   "user_id",
   "viewer_sid"
  ],
+ "assistant_home_choices": [
+  "choice",
+  "id",
+  "staff_id",
+  "updated_at",
+  "user_id"
+ ],
  "assistant_usage_daily": [
   "cache_read_tokens",
   "cost_usd_micros",

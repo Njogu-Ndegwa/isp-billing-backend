@@ -22,11 +22,15 @@ from app.db.models import (
 )
 from app.services import staff_access
 from app.services.assistant import agent as agent_mod
+from app.services.assistant import briefing as briefing_mod
+from app.services.assistant import home as home_mod
 from app.services.assistant import shaping
 from app.services.assistant.caller import Caller
 from app.services.assistant.catalog import Catalog, build_path, reset_catalog
 from app.services.auth import create_access_token, pwd_context
-from tests.factories import make_admin, make_plan, make_reseller
+from tests.factories import (
+    make_admin, make_customer, make_plan, make_reseller, make_router, make_sms_account,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +168,8 @@ async def client(engine, monkeypatch):
 
     staff_access.reset_cache()
     reset_catalog()
+    briefing_mod.reset_cache()   # the home figures are kept per person for a minute
+    home_mod.reset_cache()       # ...and the rollout percentage for half a minute
     await invalidate_plan_cache()  # GET /api/plans is cached per user id; every test's DB reuses id 1
     monkeypatch.setattr(settings, "ASSISTANT_PROVIDER", "deepseek")
     monkeypatch.setattr(settings, "DEEPSEEK_API_KEY", "test-key")
@@ -756,3 +762,353 @@ async def test_usage_is_counted_per_account_and_reported_to_admins(client, owner
     report = (await client.get("/api/admin/assistant/usage?days=7", headers=auth(admin_token))).json()
     assert report["summary"]["today"]["questions"] == 2 and report["summary"]["today"]["accounts"] == 1
     assert report["top_accounts"][0]["questions"] == 2 and report["days"][-1]["model_calls"] == 3
+
+
+def test_index_spells_out_fixed_query_values():
+    import main
+
+    catalog = Catalog.from_openapi(main.app.openapi())
+    index = catalog.index_text(_caller())
+    stats = next(l for l in index.splitlines() if l.startswith("GET /api/dashboard/stats "))
+    assert "period:int" in stats                     # a number of days, not "today"
+    fixed = [a for a in catalog.actions for p in a.query_params if (p.get("schema") or {}).get("pattern", "").startswith("^(")]
+    assert fixed, "expected at least one query param with fixed values"
+    admin_index = catalog.index_text(_caller(role="admin"))
+    line = next(l for l in admin_index.splitlines() if l.startswith(f"{fixed[0].method} {fixed[0].template} "))
+    assert "=" in line and "|" in line
+
+
+def test_view_as_usage_is_the_admins_not_the_resellers():
+    viewer = _caller(user_id=487, viewer_sid=12, viewer_admin_id=1)
+    assert viewer.usage_owner == (1, None)
+    staff = _caller(user_id=487, staff_id=5)
+    assert staff.usage_owner == (487, 5)
+
+
+@pytest.mark.asyncio
+async def test_the_assistant_knows_bitwave_product_answers(client, owner):
+    _, token = owner
+    model = use_model([text_reply("Use Access Credentials.")])
+    await client.post("/api/assistant/chat", json={"message": "staff internet?"}, headers=auth(token))
+    system = model.requests[0]["system"][0]["text"]
+    assert "Access Credentials (/access-credentials" in system and "same Wi-Fi name (SSID)" in system
+
+
+# ---------------------------------------------------------------------------
+# The home screen: live figures, richer drawings, and who starts there
+# ---------------------------------------------------------------------------
+
+async def _pay(db, reseller, amount, when, *, plan=None, customer=None, revenue=True):
+    from app.db.models import CustomerPayment
+
+    db.add(CustomerPayment(reseller_id=reseller.id, amount=amount, days_paid_for=1, created_at=when,
+                           plan_id=plan.id if plan else None,
+                           customer_id=customer.id if customer else None, counts_as_revenue=revenue))
+    await db.commit()
+
+
+async def _staff_token(db, reseller, permissions, email="jo@example.com"):
+    member = ResellerStaff(parent_reseller_id=reseller.id, name="Cashier Jo", email=email,
+                           password_hash="not-a-real-hash", permissions=permissions)
+    db.add(member)
+    await db.commit()
+    return member, create_access_token(staff_access.staff_token_claims(member, reseller), timedelta(hours=1))
+
+
+@pytest.mark.asyncio
+async def test_briefing_gives_the_home_screen_its_figures(client, owner, db):
+    from datetime import datetime
+
+    from app.db.models import CustomerStatus
+
+    reseller, token = owner
+    now = datetime.utcnow()
+    today = datetime(now.year, now.month, now.day)
+    daily = await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    monthly = await make_plan(db, reseller, name="Monthly 1500", price=1500)
+    soon = now + timedelta(minutes=2)
+    jane = await make_customer(db, reseller, daily, status=CustomerStatus.ACTIVE, expiry=soon, name="Jane")
+    await make_customer(db, reseller, monthly, status=CustomerStatus.ACTIVE, expiry=now + timedelta(days=2),
+                        name="Otieno", phone="254700000002")
+    await make_customer(db, reseller, monthly, status=CustomerStatus.ACTIVE, expiry=now + timedelta(days=20),
+                        name="Far away", phone="254700000003")
+    await make_customer(db, reseller, daily, status=CustomerStatus.INACTIVE, expiry=now - timedelta(days=2),
+                        name="Ran out", phone="254700000004")
+    await make_customer(db, reseller, daily, status=CustomerStatus.INACTIVE, expiry=now - timedelta(days=2),
+                        name="Paused", phone="254700000005", paused_at=now - timedelta(days=2))
+    await make_router(db, reseller, name="Shop", last_status=True, last_checked_at=now)
+    await make_router(db, reseller, name="Estate", last_status=False, last_checked_at=now,
+                      last_online_at=now - timedelta(hours=2))
+    await make_router(db, reseller, name="New box")
+    await make_sms_account(db, reseller, balance=120)
+
+    await _pay(db, reseller, 50, now, plan=daily, customer=jane)
+    await _pay(db, reseller, 1500, now, plan=monthly)
+    await _pay(db, reseller, 70, now, plan=daily, revenue=False)        # a comp: a payment, not revenue
+    await _pay(db, reseller, 200, today - timedelta(hours=1), plan=daily)  # yesterday
+    await _pay(db, reseller, 300, today - timedelta(days=9), plan=daily)   # the week before
+    await _pay(db, reseller, 999, today - timedelta(days=20), plan=daily)  # outside the 14 days
+    other = await make_reseller(db, email="other@example.com")
+    await _pay(db, other, 5000, now)                                     # somebody else's money
+
+    r = await client.get("/api/assistant/briefing", headers=auth(token))
+    assert r.status_code == 200
+    b = r.json()
+    assert b["audience"] == "reseller" and b["name"] == "Kwetu WiFi" and b["currency"] == "KES"
+    assert b["unavailable"] == [] and b["not_allowed"] == []
+
+    money = b["money"]
+    assert money["today"] == 1550 and money["payments_today"] == 3      # the comp counts as a payment only
+    assert money["yesterday"] == 200 and money["last7"] == 1750 and money["prev7"] == 300
+    assert len(money["daily"]) == 14 and money["daily"][-1]["partial"] is True
+    assert money["daily"][-1]["day"] == today.strftime("%Y-%m-%d") and money["daily"][0]["partial"] is False
+    assert [d["day"] for d in money["daily"]] == sorted(d["day"] for d in money["daily"])
+    assert money["month"] >= 1550
+
+    customers = b["customers"]
+    assert customers["total"] == 5 and customers["active"] == 3
+    assert customers["expiring_today"] == (1 if soon < today + timedelta(days=1) else 0)
+    assert customers["expiring_3d"] == 2 and customers["expired_7d"] == 1 and customers["new_7d"] == 5
+    assert [c["name"] for c in customers["expiring"]] == ["Jane", "Otieno"]     # soonest first, within a week
+    assert customers["expiring"][0]["plan"] == "Daily 50" and customers["expiring"][0]["expiry"].endswith("Z")
+
+    routers = b["routers"]
+    assert (routers["total"], routers["online"], routers["offline"], routers["unknown"]) == (3, 1, 1, 1)
+    assert [d["name"] for d in routers["down"]] == ["Estate"] and routers["down"][0]["last_online_at"]
+
+    assert b["plans"][0] == {"name": "Monthly 1500", "revenue": 1500, "sales": 1}
+    assert b["plans"][1] == {"name": "Daily 50", "revenue": 250, "sales": 3}
+    assert b["attention"] == {"failed_payments_24h": 0, "unmatched_payments": 0, "sms_credits": 120,
+                              "subscription": b["attention"]["subscription"]}
+    assert set(b["attention"]["subscription"]) == {"status", "expires_at", "amount_due"}
+    assert b["setup"] == {"routers": 3, "plans": 2, "payment_methods": 0, "customers": 5}
+
+    # Kept for a minute: a new payment shows only once the cache is dropped.
+    await _pay(db, reseller, 100, now, plan=daily)
+    again = (await client.get("/api/assistant/briefing", headers=auth(token))).json()
+    assert again["as_of"] == b["as_of"] and again["money"]["today"] == 1550
+    briefing_mod.reset_cache()
+    fresh = (await client.get("/api/assistant/briefing", headers=auth(token))).json()
+    assert fresh["money"]["today"] == 1650
+
+    # A new account has nothing, and says so with zeros rather than errors.
+    other_token = create_access_token(login_token_claims(other), timedelta(hours=1))
+    empty = (await client.get("/api/assistant/briefing", headers=auth(other_token))).json()
+    assert empty["setup"] == {"routers": 0, "plans": 0, "payment_methods": 0, "customers": 0}
+    assert empty["money"]["today"] == 5000 and empty["customers"]["expiring"] == [] and empty["plans"] == []
+
+
+@pytest.mark.asyncio
+async def test_briefing_follows_staff_permissions_view_as_and_admins(client, owner, db):
+    import main
+
+    reseller, _ = owner
+    _, staff_token = await _staff_token(db, reseller, ["customers.view"])
+    b = (await client.get("/api/assistant/briefing", headers=auth(staff_token))).json()
+    assert b["name"] == "Cashier Jo" and "customers" in b and "routers" in b
+    assert "money" not in b and "plans" not in b                        # revenue is not this cashier's to see
+    assert {"money", "plans"} <= set(b["unavailable"]) and {"money", "plans"} <= set(b["not_allowed"])
+    assert "customers" not in b["unavailable"]
+    assert b["attention"]["sms_credits"] is None and b["attention"]["failed_payments_24h"] is None
+    assert b["setup"] == {"routers": 0, "plans": 0, "payment_methods": None, "customers": 0}
+    # Reading the figures is not an activity-log entry.
+    assert (await db.execute(select(StaffActivityLog))).scalars().all() == []
+
+    catalog = Catalog.from_openapi(main.app.openapi())
+    viewer = await briefing_mod.build(catalog, _caller(user_id=reseller.id, viewer_sid=9, viewer_admin_id=1,
+                                                       organization="Kwetu WiFi"))
+    assert viewer["audience"] == "reseller" and "money" in viewer and viewer["unavailable"] == []
+
+    admin = await make_admin(db, email="home-admin@example.com")
+    admin_token = create_access_token(login_token_claims(admin), timedelta(hours=1))
+    a = (await client.get("/api/assistant/briefing", headers=auth(admin_token))).json()
+    assert set(a) == {"as_of", "audience", "name", "unavailable"} and a["audience"] == "admin"
+    assert (await client.get("/api/assistant/briefing")).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_briefing_survives_a_failing_section(client, owner, db, monkeypatch):
+    _, token = owner
+
+    async def broken(db, user_id, now):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(briefing_mod, "_money", broken)
+    b = (await client.get("/api/assistant/briefing", headers=auth(token))).json()
+    assert "money" not in b and b["unavailable"] == ["money"] and b["not_allowed"] == []
+    assert b["customers"]["total"] == 0 and b["routers"]["total"] == 0  # the rest still answers
+
+
+def test_field_hints_are_kept_only_when_well_formed():
+    clean = agent_mod.clean_fields
+    assert clean({"label": "date", "value": ["revenue", "transactions"]}) == {
+        "label": "date", "value": ["revenue", "transactions"]}
+    assert clean({"label": " name ", "value": "revenue"}) == {"label": "name", "value": ["revenue"]}
+    assert clean({"value": ["a", "b", "c", "d", "e", "a"]}) == {"value": ["a", "b", "c", "d"]}   # at most four
+    assert clean({"label": "x" * 61, "value": [7, None, {"k": 1}]}) is None                    # too long, not names
+    assert clean("revenue") is None and clean(None) is None and clean({}) is None
+    show = next(t for t in agent_mod.TOOLS if t["name"] == "call_api")["input_schema"]["properties"]["show"]
+    assert show["enum"] == ["auto", "table", "card", "none", "tiles", "trend", "bars", "share"]
+
+
+@pytest.mark.asyncio
+async def test_the_model_chooses_the_drawing_never_the_numbers(client, owner, db):
+    reseller, token = owner
+    await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    model = use_model([
+        tool_reply("call_api", {"method": "GET", "path": "/api/plans", "show": "bars",
+                                "fields": {"label": "name", "value": ["price", "x" * 80]}}, "tu_1"),
+        tool_reply("call_api", {"method": "GET", "path": "/api/plans", "show": "pie-chart",
+                                "fields": "price"}, "tu_2"),
+        text_reply("Daily 50 is your only plan." + chr(10) + "NEXT: Which plan sells most? | Add a weekly plan"),
+    ])
+    r = await client.post("/api/assistant/chat", json={"message": "compare my plans"}, headers=auth(token))
+    events = sse_events(r.text)
+    first, second = [e for e in events if e["type"] == "data"]
+    assert first["show"] == "bars" and first["fields"] == {"label": "name", "value": ["price"]}
+    assert "Daily 50" in json.dumps(first["payload"])              # the figures are the API's
+    assert second["show"] == "auto" and "fields" not in second     # an unknown drawing falls back to the page's choice
+    assert all(not res["_is_error"] for req in model.requests[1:] for res in tool_results(req))
+
+    stored = (await client.get(f"/api/assistant/conversations/{events[0]['id']}", headers=auth(token))).json()
+    kept = [t for t in stored["transcript"] if t["type"] == "data"]
+    assert kept[0]["show"] == "bars" and kept[0]["fields"] == {"label": "name", "value": ["price"]}
+    assert stored["transcript"][-1]["text"].splitlines()[-1].startswith("NEXT: ")
+
+    system = model.requests[0]["system"][0]["text"]
+    assert "NEXT: question one | question two | question three" in system
+    assert "trend for figures per day" in system and "never repeat rows" in system
+
+
+def test_rollout_buckets_are_fixed_per_account():
+    assert not any(home_mod.in_rollout(uid, 0) for uid in range(1, 400))
+    assert all(home_mod.in_rollout(uid, 100) for uid in range(1, 400))
+    at_30 = {uid for uid in range(1, 2001) if home_mod.in_rollout(uid, 30)}
+    at_60 = {uid for uid in range(1, 2001) if home_mod.in_rollout(uid, 60)}
+    assert at_30 < at_60                                  # raising the share only adds accounts
+    assert 450 < len(at_30) < 750 and 1050 < len(at_60) < 1350
+
+
+@pytest.mark.asyncio
+async def test_who_starts_on_the_assistant(client, owner, db, monkeypatch):
+    from app.db.models import AppSetting, AssistantHomeChoice
+
+    reseller, token = owner
+    admin = await make_admin(db, email="rollout-admin@example.com")
+    admin_token = create_access_token(login_token_claims(admin), timedelta(hours=1))
+    _, staff_token = await _staff_token(db, reseller, ["customers.view"])
+    reseller_id, admin_id = reseller.id, admin.id   # read before expire_all() below
+
+    async def status(tok):
+        return (await client.get("/api/assistant/status", headers=auth(tok))).json()
+
+    # Nobody is moved until an admin says so.
+    assert (await status(token))["home"] is False and (await status(token))["home_choice"] is None
+    assert (await client.get("/api/admin/assistant/rollout", headers=auth(admin_token))).json() == {
+        "percent": 0, "chose_assistant": 0, "chose_classic": 0}
+    assert (await client.put("/api/admin/assistant/rollout", json={"percent": 50},
+                             headers=auth(token))).status_code == 403
+    assert (await client.put("/api/admin/assistant/rollout", json={"percent": 101},
+                             headers=auth(admin_token))).status_code == 422
+
+    r = await client.put("/api/admin/assistant/rollout", json={"percent": 100}, headers=auth(admin_token))
+    assert r.status_code == 200 and r.json()["percent"] == 100
+    db.expire_all()
+    assert (await db.get(AppSetting, home_mod.ROLLOUT_KEY)).value == "100"
+    assert (await status(token))["home"] is True              # the account...
+    assert (await status(staff_token))["home"] is True        # ...and its staff, together
+    assert (await status(admin_token))["home"] is False       # a platform admin is never moved
+
+    # A person's own choice wins, and is theirs alone.
+    r = await client.put("/api/assistant/home", json={"choice": "classic"}, headers=auth(token))
+    assert r.json() == {"home": False, "home_choice": "classic"}
+    assert (await status(staff_token))["home"] is True
+    r = await client.put("/api/assistant/home", json={"choice": "default"}, headers=auth(token))
+    assert r.json() == {"home": True, "home_choice": None}
+    db.expire_all()
+    assert (await db.execute(select(AssistantHomeChoice))).scalars().all() == []
+
+    await client.put("/api/admin/assistant/rollout", json={"percent": 0}, headers=auth(admin_token))
+    assert (await status(token))["home"] is False
+    assert (await client.put("/api/assistant/home", json={"choice": "assistant"},
+                             headers=auth(staff_token))).json() == {"home": True, "home_choice": "assistant"}
+    assert (await client.put("/api/assistant/home", json={"choice": "assistant"},
+                             headers=auth(admin_token))).json() == {"home": True, "home_choice": "assistant"}
+    assert (await status(token))["home"] is False             # the owner did not choose
+    assert (await client.put("/api/assistant/home", json={"choice": "nope"},
+                             headers=auth(token))).status_code == 422
+    report = (await client.get("/api/admin/assistant/rollout", headers=auth(admin_token))).json()
+    assert report == {"percent": 0, "chose_assistant": 2, "chose_classic": 0}
+    # The staff member's choice is not an activity-log entry.
+    logs = (await db.execute(select(StaffActivityLog))).scalars().all()
+    assert not any("/api/assistant/home" in (entry.path or "") for entry in logs)
+
+    # A View-as session is the admin looking in: never moved, and without the reseller's choice.
+    await client.put("/api/assistant/home", json={"choice": "assistant"}, headers=auth(token))
+    viewer = _caller(user_id=reseller_id, viewer_sid=9, viewer_admin_id=admin_id)
+    assert await home_mod.home_for(viewer, ready=True) == (False, None)
+    await client.put("/api/admin/assistant/rollout", json={"percent": 100}, headers=auth(admin_token))
+    assert await home_mod.home_for(viewer, ready=True) == (False, None)
+
+    # Nobody starts on an assistant that is not ready.
+    monkeypatch.setattr(settings, "DEEPSEEK_API_KEY", "")
+    off = await status(token)
+    assert off["enabled"] is False and off["home"] is False and off["home_choice"] == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_briefing_draws_each_router_with_what_it_last_reported(client, owner, db):
+    """The home screen's network section: every router, trouble first, with its own live report."""
+    from datetime import datetime
+
+    from app.db.models import CustomerStatus
+    from app.services import realtime_state
+
+    reseller, token = owner
+    now = datetime.utcnow()
+    plan = await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    shop = await make_router(db, reseller, name="Shop", last_status=True, last_checked_at=now,
+                             availability_checks=200, availability_successes=199)
+    estate = await make_router(db, reseller, name="Estate", last_status=False, last_checked_at=now,
+                               last_online_at=now - timedelta(hours=2))
+    quiet = await make_router(db, reseller, name="Quiet", last_status=True, last_checked_at=now)
+    shop_id, estate_id, quiet_id = shop.id, estate.id, quiet.id
+    for i, router_id in enumerate((shop_id, shop_id, estate_id)):
+        await make_customer(db, reseller, plan, status=CustomerStatus.ACTIVE, expiry=now + timedelta(days=1),
+                            name=f"C{i}", phone=f"25470000010{i}", router_id=router_id)
+    await make_customer(db, reseller, plan, status=CustomerStatus.INACTIVE, expiry=now - timedelta(days=1),
+                        name="Gone", phone="254700000109", router_id=shop_id)
+
+    total = 256 * 1024 * 1024
+    realtime_state._routers[shop_id] = realtime_state.RouterLive(
+        router_id=shop_id, received_at=now, interval_seconds=60, cpu_load=41, free_memory=total // 4,
+        total_memory=total, uptime="3d04:14:07", version="7.16.1", board="hAP ax2",
+        wan_rx_bps=12_400_000.0, wan_tx_bps=2_100_000.0, hotspot_active=14, pppoe_active=3)
+    # a report from long ago is not "live"
+    realtime_state._routers[quiet_id] = realtime_state.RouterLive(
+        router_id=quiet_id, received_at=now - timedelta(hours=2), interval_seconds=60, cpu_load=5)
+    try:
+        b = (await client.get("/api/assistant/briefing", headers=auth(token))).json()
+    finally:
+        realtime_state._routers.pop(shop_id, None)
+        realtime_state._routers.pop(quiet_id, None)
+
+    network = b["routers"]["list"]
+    assert [r["name"] for r in network] == ["Estate", "Shop", "Quiet"]          # down first, then reporting
+    by_name = {r["name"]: r for r in network}
+    assert by_name["Shop"]["live"] == {
+        "cpu": 41, "memory_pct": 75, "uptime": "3d04:14:07", "version": "7.16.1", "board": "hAP ax2",
+        "down_bps": 12_400_000.0, "up_bps": 2_100_000.0, "hotspot_online": 14, "pppoe_online": 3,
+        "age_seconds": by_name["Shop"]["live"]["age_seconds"],
+    }
+    assert by_name["Shop"]["reachable_pct"] == 99.5 and by_name["Shop"]["active_customers"] == 2
+    assert by_name["Estate"]["status"] == "offline" and by_name["Estate"]["active_customers"] == 1
+    assert by_name["Estate"]["live"] is None and by_name["Estate"]["last_online_at"].endswith("Z")
+    assert by_name["Quiet"]["live"] is None and by_name["Quiet"]["active_customers"] == 0
+
+    # someone who may see routers but not customers gets no customer counts
+    briefing_mod.reset_cache()
+    _, staff_token = await _staff_token(db, reseller, ["routers.view"])
+    s = (await client.get("/api/assistant/briefing", headers=auth(staff_token))).json()
+    assert "routers" in s and "customers" not in s
+    assert all(r["active_customers"] is None for r in s["routers"]["list"])

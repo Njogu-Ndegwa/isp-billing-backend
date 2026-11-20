@@ -3521,3 +3521,25 @@ class AssistantUsageDaily(Base):
     output_tokens = Column(BigInteger, nullable=False, default=0, server_default="0")
     cost_usd_micros = Column(BigInteger, nullable=False, default=0, server_default="0")
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class AssistantHomeChoice(Base):
+    """A person's own choice of start page: the assistant or the classic dashboard.
+
+    One row per (user_id, staff_id); staff_id 0 means the account owner or an
+    admin, as in assistant_usage_daily. No row means "no choice": the rollout
+    percentage decides (app_settings key assistant_home_percent, see
+    app/services/assistant/home.py).
+
+    Startup migration: run_assistant_migrations() in main.py.
+    """
+    __tablename__ = "assistant_home_choices"
+    __table_args__ = (
+        UniqueConstraint("user_id", "staff_id", name="uq_assistant_home_choices_owner"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=False)
+    staff_id = Column(Integer, nullable=False, default=0, server_default="0")
+    choice = Column(String(12), nullable=False)  # "assistant" | "classic"
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)

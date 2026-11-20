@@ -162,6 +162,29 @@ def _title(summary: Optional[str]) -> str:
     return re.sub(r"^(Api|Admin Api)\s+", "", title).strip()
 
 
+_ALTERNATION = re.compile(r"\^\(([A-Za-z0-9_.-]+(?:\|[A-Za-z0-9_.-]+)+)\)\$")
+
+
+def _query_hint(param: dict) -> str:
+    """name, or name=a|b|c when the value is one of a fixed few (enum or ^(a|b)$ pattern).
+
+    Spelling the values out in the index keeps the model from guessing
+    ("period=today") and burning a failed call.
+    """
+    name = param.get("name", "")
+    schema = param.get("schema") or {}
+    values = schema.get("enum")
+    if not values and isinstance(schema.get("pattern"), str):
+        m = _ALTERNATION.fullmatch(schema["pattern"])
+        values = m.group(1).split("|") if m else None
+    if values and len(values) <= 8:
+        return f"{name}={'|'.join(map(str, values))}"
+    kind = {"integer": "int", "number": "num", "boolean": "bool"}.get(schema.get("type"))
+    if kind is None and schema.get("format") in ("date", "date-time"):
+        kind = schema["format"]
+    return f"{name}:{kind}" if kind else name
+
+
 def _tag(template: str) -> str:
     parts = [p for p in template.split("/") if p and p != "api" and "{" not in p]
     if not parts:
@@ -287,7 +310,7 @@ class Catalog:
         """One line per action, grouped. ✎ = changes data, runs only after Confirm."""
         groups: dict[str, list[str]] = {}
         for a in self.for_caller(caller):
-            q = [p["name"] for p in a.query_params]
+            q = [_query_hint(p) for p in a.query_params]
             qs = f" ?{','.join(q[:8])}" if q else ""
             mark = "" if a.always_reads else " ✎"
             desc = a.description if a.description and a.description.lower() != a.title.lower() else ""
