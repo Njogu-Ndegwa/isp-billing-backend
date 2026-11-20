@@ -3,7 +3,8 @@
 The admin app (isp-frontend-admin `app/lib/portalThemes.ts`) and the captive
 portal (isp-frontend `script.js` THEMES) offer:
 
-    sunset_orange, ocean_blue, emerald_green, bright_violet, rose_gold, slate_gray
+    sunset_orange, ocean_blue, emerald_green, bright_violet, rose_gold, slate_gray,
+    teal_lagoon, royal_blue, cherry_red, amber_gold, hot_pink, charcoal_black
 
 The backend still only knew the old name `midnight_purple`, so a reseller who
 picked "Bright Violet" and pressed Save got a 422 (ChapNET, 2026-10-22).
@@ -41,6 +42,12 @@ ADMIN_APP_THEMES = {
     "bright_violet",
     "rose_gold",
     "slate_gray",
+    "teal_lagoon",
+    "royal_blue",
+    "cherry_red",
+    "amber_gold",
+    "hot_pink",
+    "charcoal_black",
 }
 
 

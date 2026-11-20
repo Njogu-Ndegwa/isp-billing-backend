@@ -34,6 +34,12 @@ OFFERED_THEMES = {
     "bright_violet",
     "rose_gold",
     "slate_gray",
+    "teal_lagoon",
+    "royal_blue",
+    "cherry_red",
+    "amber_gold",
+    "hot_pink",
+    "charcoal_black",
 }
 
 # Still accepted so rows saved before the rename keep validating when the
