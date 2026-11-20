@@ -30,11 +30,10 @@ TENCENT_PROBES: list[Probe] = [
     P("dev_gateway_login", "Dev gateway login", "tencent", "login",
       "https://dev-federated-graphql-api.omnivoltaic.com/graphql",
       "ble-app on non-wvapp origins, ERM preview"),
-    P("tencent_mongo", "Tencent MongoDB rs0", "tencent", "mongo_rs",
-      "mongo-0.dev.global.omnivoltaic.com:27017,mongo-1.dev.global.omnivoltaic.com:27017,"
-      "mongo-2.dev.global.omnivoltaic.com:27017", "Tencent-hosted services"),
-    P("tencent_postgres", "Postgres pooler", "tencent", "tcp",
-      "dev.postgres.global.omnivoltaic.com:5432", "Tencent-hosted services"),
+    # tencent_mongo and tencent_postgres were removed on 2026-11-20: their public CLBs
+    # (mongo-N.dev.global, dev.postgres.global) were closed. Mongo health is still
+    # covered by mqtt_broker (EMQX authenticates every device against it) and
+    # dev_gateway_login; exposed_tencent_mongo now checks the port stays closed.
     P("memo_cos", "Memo / deck site (COS + EdgeOne)", "tencent", "http",
       "https://memo.omnivoltaic.cn/", "Company memos", expect_status=(401,)),
 ]
