@@ -1,8 +1,9 @@
 """Tests for the combined admin earnings metric.
 
-Covers the two revenue streams the admin actually earns from:
+Covers the revenue streams the admin actually earns from:
   1. SaaS charges other resellers pay us, split hotspot vs PPPoE by invoice
-  2. Gross collections of the reseller accounts the admin runs themselves
+  2. SMS credit sales and Bitwave's 20% of ads resellers sold
+  3. Gross collections of the reseller accounts the admin runs themselves
 
 TDD order:
   1. own-reseller ID setting round-trips and rejects non-resellers
@@ -443,10 +444,11 @@ async def test_a_cold_load_costs_a_bounded_number_of_queries(db):
     counting = _CountingSession(db)
     await svc.compute_earnings(counting, period="month")
 
-    # One aggregate per source covering BOTH windows, two lifetime sums, and
-    # the account names. (The settings read goes through db.get, not execute.)
-    # Fetching current and previous separately would make it 6.
-    assert counting.queries == 5, f"expected 5 queries, got {counting.queries}"
+    # One aggregate per source (subscriptions, SMS orders, ad payments, own
+    # collections) covering BOTH windows, two lifetime sums, and the account
+    # names. (The settings read goes through db.get, not execute.) Fetching
+    # current and previous separately would make it 11.
+    assert counting.queries == 7, f"expected 7 queries, got {counting.queries}"
 
 
 async def test_query_count_does_not_grow_with_the_window(db):
@@ -527,3 +529,104 @@ async def test_changing_accounts_invalidates_the_cache(db):
     after = await svc.compute_earnings(db, period="month")
 
     assert after["totals"]["reseller"] == 700
+
+
+# ---------------------------------------------------------------------------
+# 7. SMS credit sales and ad commission are Bitwave money too
+# ---------------------------------------------------------------------------
+
+async def _add_sms_order(db, user_id, amount, *, at=None, status=None):
+    from app.db.models import SmsCreditOrder, SmsCreditOrderStatus
+
+    db.add(SmsCreditOrder(
+        user_id=user_id, quantity=amount, unit_price=1, amount=amount,
+        phone_number="254700000000",
+        status=status or SmsCreditOrderStatus.COMPLETED,
+        created_at=at or _in_current(),
+    ))
+    await db.commit()
+
+
+_ad_seq = 0
+
+
+async def _add_ad_payment(db, reseller_id, *, fee, refunded=None, credited_at=None,
+                          duplicate=False):
+    """A paid ad whose weeks started running at `credited_at` (None = not yet)."""
+    from app.db.models import AdSale, AdSalePayment
+
+    global _ad_seq
+    _ad_seq += 1
+    sale = AdSale(
+        ad_id=900_000 + _ad_seq, reseller_user_id=reseller_id,
+        business_name="Shop", business_phone="254700000000",
+        price_per_week=fee * 5, weeks=1, share_token=f"tok-{_ad_seq}",
+    )
+    db.add(sale)
+    await db.commit()
+    db.add(AdSalePayment(
+        sale_id=sale.id, ad_id=sale.ad_id, reseller_user_id=reseller_id,
+        kind="initial", order_key=f"order-{_ad_seq}", weeks=1,
+        price_per_week=fee * 5, amount=fee * 5, bitwave_fee=fee,
+        reseller_share=fee * 4, phone="254700000000", status="paid",
+        paid_at=credited_at or _in_current(), credited_at=credited_at,
+        bitwave_refund_part=refunded, is_duplicate=duplicate,
+    ))
+    await db.commit()
+
+
+async def test_sms_credit_sales_count_as_bitwave_earnings(db):
+    from app.db.models import SmsCreditOrderStatus
+
+    other = await make_reseller(db)
+    await _add_sms_order(db, other.id, 500)
+    await _add_sms_order(db, other.id, 300, status=SmsCreditOrderStatus.PENDING)
+    await _add_sms_order(db, other.id, 200, status=SmsCreditOrderStatus.FAILED)
+
+    result = await svc.compute_earnings(db, period="month")
+
+    assert result["totals"]["sms_credits"] == 500
+    assert result["totals"]["system"] == 500
+    assert result["totals"]["combined"] == 500
+    assert result["all_time"]["system"] == 500
+    assert "sms_credits" in {s["key"] for s in result["streams"]}
+    populated = [p for p in result["series"] if p["total"] > 0]
+    assert populated[0]["sms_credits"] == 500
+
+
+async def test_our_own_sms_purchases_are_excluded(db):
+    mine = await make_reseller(db)
+    await svc.set_own_reseller_ids(db, [mine.id])
+    await _add_sms_order(db, mine.id, 400)
+
+    result = await svc.compute_earnings(db, period="month")
+
+    assert result["totals"]["sms_credits"] == 0
+    assert result["all_time"]["system"] == 0
+
+
+async def test_previous_window_sms_sales_drive_the_change(db):
+    other = await make_reseller(db)
+    await _add_sms_order(db, other.id, 100, at=_in_previous())
+    await _add_sms_order(db, other.id, 200)
+
+    result = await svc.compute_earnings(db, period="month")
+
+    assert result["previous_totals"]["sms_credits"] == 100
+    assert result["change_percent"]["system"] == 100.0
+
+
+async def test_ad_commission_counts_once_running_net_of_refunds(db):
+    other = await make_reseller(db)
+    await _add_ad_payment(db, other.id, fee=100, credited_at=_in_current())
+    await _add_ad_payment(db, other.id, fee=80, refunded=30, credited_at=_in_current())
+    # Paid but not running yet, and a duplicate payment: neither is earned.
+    await _add_ad_payment(db, other.id, fee=500, credited_at=None)
+    await _add_ad_payment(db, other.id, fee=700, credited_at=_in_current(), duplicate=True)
+
+    result = await svc.compute_earnings(db, period="month")
+
+    assert result["totals"]["ad_commission"] == 150
+    assert result["totals"]["system"] == 150
+    assert result["all_time"]["system"] == 150
+    assert "ad_commission" in {s["key"] for s in result["streams"]}

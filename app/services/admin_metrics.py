@@ -22,6 +22,8 @@ from app.db.models import (
     SubscriptionPayment, SubscriptionPaymentStatus,
     ResellerTransactionCharge,
     GrowthTarget,
+    SmsCreditOrder, SmsCreditOrderStatus,
+    AdSalePayment,
 )
 from app.services.app_settings import get_setting, set_setting
 from app.services.subscription import FREE_SETUP_DAYS
@@ -1564,9 +1566,11 @@ EARNING_STREAMS: list[dict[str, str]] = [
     {"key": "saas_hotspot", "label": "Hotspot commission", "group": "system"},
     {"key": "saas_pppoe", "label": "PPPoE / static per-user fees", "group": "system"},
     {"key": "saas_other", "label": "Subscription payments without an invoice", "group": "system"},
+    {"key": "sms_credits", "label": "SMS credit sales", "group": "system"},
+    {"key": "ad_commission", "label": "Ad commission (20% of ads sold)", "group": "system"},
     {"key": "reseller", "label": "My reseller collections", "group": "reseller"},
 ]
-_SYSTEM_KEYS = ("saas_hotspot", "saas_pppoe", "saas_other")
+_SYSTEM_KEYS = ("saas_hotspot", "saas_pppoe", "saas_other", "sms_credits", "ad_commission")
 
 
 async def get_own_reseller_ids(db: AsyncSession) -> list[int]:
@@ -1697,7 +1701,10 @@ _EARNINGS_COMPARISON_LABEL = {
 
 
 def _zero_streams() -> dict[str, float]:
-    return {"saas_hotspot": 0.0, "saas_pppoe": 0.0, "saas_other": 0.0, "reseller": 0.0}
+    return {
+        "saas_hotspot": 0.0, "saas_pppoe": 0.0, "saas_other": 0.0,
+        "sms_credits": 0.0, "ad_commission": 0.0, "reseller": 0.0,
+    }
 
 
 async def _earnings_daily(
@@ -1759,6 +1766,47 @@ async def _earnings_daily(
         target["saas_hotspot"] += float(row.hotspot or 0)
         target["saas_pppoe"] += float(row.pppoe or 0)
         target["saas_other"] += float(row.other or 0)
+
+    # SMS credit sales: cash resellers paid us for credits (KES, M-Pesa).
+    # Admin grants and send-failure refunds are ledger moves, not sales, and
+    # never create an order, so completed orders are exactly the sales. Our
+    # own accounts buying credits is paying ourselves.
+    sms_stmt = (
+        select(
+            func.date(SmsCreditOrder.created_at).label("d"),
+            func.coalesce(func.sum(SmsCreditOrder.amount), 0).label("amt"),
+        )
+        .where(
+            SmsCreditOrder.status == SmsCreditOrderStatus.COMPLETED,
+            SmsCreditOrder.created_at >= start,
+            SmsCreditOrder.created_at < end,
+        )
+        .group_by(func.date(SmsCreditOrder.created_at))
+    )
+    if own_ids:
+        sms_stmt = sms_stmt.where(SmsCreditOrder.user_id.notin_(own_ids))
+    for row in (await db.execute(sms_stmt)).all():
+        bucket(row.d)["sms_credits"] += float(row.amt or 0)
+
+    # Bitwave's 20% of ads resellers sold, counted when the paid weeks start
+    # running (credited_at) and net of any refunded part — the same rule as
+    # app/services/ad_sales.ad_commission_totals.
+    ad_kept = AdSalePayment.bitwave_fee - func.coalesce(AdSalePayment.bitwave_refund_part, 0)
+    ad_rows = (await db.execute(
+        select(
+            func.date(AdSalePayment.credited_at).label("d"),
+            func.coalesce(func.sum(ad_kept), 0).label("amt"),
+        )
+        .where(
+            AdSalePayment.credited_at.is_not(None),
+            AdSalePayment.is_duplicate == False,  # noqa: E712
+            AdSalePayment.credited_at >= start,
+            AdSalePayment.credited_at < end,
+        )
+        .group_by(func.date(AdSalePayment.credited_at))
+    )).all()
+    for row in ad_rows:
+        bucket(row.d)["ad_commission"] += float(row.amt or 0)
 
     if own_ids:
         reseller_rows = (await db.execute(
@@ -1823,12 +1871,26 @@ def _earnings_series(
 
 
 async def _earnings_all_time(db: AsyncSession, own_ids: list[int]) -> dict[str, float]:
-    system_stmt = select(
-        func.coalesce(func.sum(_sub_kes()), 0)
-    ).where(SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED)
+    # Every Bitwave stream's lifetime sum as a scalar subquery: one round trip.
+    subs_q = select(func.coalesce(func.sum(_sub_kes()), 0)).where(
+        SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
+    )
+    sms_q = select(func.coalesce(func.sum(SmsCreditOrder.amount), 0)).where(
+        SmsCreditOrder.status == SmsCreditOrderStatus.COMPLETED,
+    )
     if own_ids:
-        system_stmt = system_stmt.where(SubscriptionPayment.user_id.notin_(own_ids))
-    system = float((await db.execute(system_stmt)).scalar() or 0)
+        subs_q = subs_q.where(SubscriptionPayment.user_id.notin_(own_ids))
+        sms_q = sms_q.where(SmsCreditOrder.user_id.notin_(own_ids))
+    ads_q = select(func.coalesce(func.sum(
+        AdSalePayment.bitwave_fee - func.coalesce(AdSalePayment.bitwave_refund_part, 0)
+    ), 0)).where(
+        AdSalePayment.credited_at.is_not(None),
+        AdSalePayment.is_duplicate == False,  # noqa: E712
+    )
+    row = (await db.execute(select(
+        subs_q.scalar_subquery(), sms_q.scalar_subquery(), ads_q.scalar_subquery(),
+    ))).one()
+    system = sum(float(v or 0) for v in row)
 
     reseller = 0.0
     if own_ids:
@@ -1856,14 +1918,17 @@ async def compute_earnings(db: AsyncSession, period: str = "month") -> dict[str,
     """Combined view of every way the platform makes money.
 
     Streams: the SaaS charges other resellers pay us (split into the hotspot
-    commission and the per-PPPoE-user fee), and the gross collections of the
-    reseller accounts we run ourselves.
+    commission and the per-PPPoE-user fee), SMS credit sales, Bitwave's 20% of
+    ads resellers sold, and the gross collections of the reseller accounts we
+    run ourselves.
 
     Windows are calendar periods-to-date compared against the same point in the
     previous period, matching the rest of the admin dashboard.
 
-    Costs five queries on a cache miss: the settings lookup, one aggregate per
-    source covering both windows, two lifetime sums, and the account names.
+    Costs seven queries on a cache miss: the settings lookup (db.get), one
+    aggregate per source (subscriptions, SMS orders, ad payments, own
+    collections) covering both windows, two lifetime sums (Bitwave's streams in
+    one, own collections in the other), and the account names.
     Results are cached briefly — the dashboard refetches on every range change
     and the numbers do not move second to second.
     """
