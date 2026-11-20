@@ -15,14 +15,15 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import datetime, timedelta
 
 import pytest
 
 from app.config import settings
-from app.db.models import ConnectionType
+from app.db.models import ConnectionType, CustomerStatus
 from app.services.assistant import agent as agent_mod
 from tests.factories import make_customer, make_plan, make_router
-from tests.test_assistant import auth, client, owner, sse_events  # noqa: F401  (fixtures)
+from tests.test_assistant import auth, client, owner, sse_events, visible_text  # noqa: F401  (fixtures)
 
 KEY = os.environ.get("ASSISTANT_EVAL_KEY", "")
 pytestmark = pytest.mark.skipif(not KEY, reason="needs ASSISTANT_EVAL_KEY (a real model key)")
@@ -51,6 +52,50 @@ async def _with_customer(db, reseller):
     router = await make_router(db, reseller, name="Main Tower")
     plan = await make_plan(db, reseller, name="Weekly 300", price=300, duration_value=7)
     await make_customer(db, reseller, plan, router, name="Amina Wanjiru", phone="254712345678")
+
+
+async def _messaging(db, reseller, credits=200):
+    from app.db.models import MessageTemplate
+    from tests.factories import make_sms_account
+
+    router = await make_router(db, reseller, name="Main Tower")
+    weekly = await make_plan(db, reseller, name="Weekly 300", price=300, duration_value=7)
+    daily = await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    now = datetime.utcnow()
+    await make_customer(db, reseller, daily, router, name="Amina Wanjiru", phone="254711000001",
+                        status=CustomerStatus.ACTIVE, expiry=now + timedelta(hours=5))
+    await make_customer(db, reseller, weekly, router, name="Brian Otieno", phone="254711000002",
+                        status=CustomerStatus.ACTIVE, expiry=now + timedelta(days=4))
+    await make_customer(db, reseller, weekly, router, name="George Kamau", phone="254711000007",
+                        status=CustomerStatus.INACTIVE, expiry=now - timedelta(days=2))
+    await make_sms_account(db, reseller, balance=credits)
+    db.add(MessageTemplate(user_id=reseller.id, name="Promo", body="Get 10% off Weekly this week!"))
+
+
+async def _no_credits(db, reseller):
+    await _messaging(db, reseller, credits=0)
+
+
+async def _owing(db, reseller, status, expires_in):
+    from app.db.models import InvoiceStatus, SubscriptionInvoice
+
+    await _with_customer(db, reseller)
+    now = datetime.utcnow()
+    reseller.subscription_status = status
+    reseller.subscription_expires_at = now + expires_in
+    db.add(SubscriptionInvoice(user_id=reseller.id, period_start=now - timedelta(days=30), period_end=now,
+                               final_charge=1500, currency="KES", due_date=now + expires_in,
+                               status=InvoiceStatus.OVERDUE if expires_in < timedelta(0) else InvoiceStatus.PENDING))
+
+
+async def _suspended(db, reseller):
+    from app.db.models import SubscriptionStatus
+    await _owing(db, reseller, SubscriptionStatus.SUSPENDED, timedelta(days=-2))
+
+
+async def _ending_soon(db, reseller):
+    from app.db.models import SubscriptionStatus
+    await _owing(db, reseller, SubscriptionStatus.ACTIVE, timedelta(hours=20))
 
 
 # -- what counts as right -----------------------------------------------------------
@@ -92,6 +137,13 @@ def card_for(method: str, path_part: str):
 def answers_without_a_card(row):
     """A question about the router: answered from reads, nothing proposed, nothing claimed."""
     return None if not row["card"] else f"proposed {row['path']} for a question"
+
+
+def all_of(*checks):
+    def check(row):
+        results = [r for r in (c(row) for c in checks) if r]
+        return " / ".join(results) or None
+    return check
 
 
 def any_of(*checks):
@@ -150,6 +202,31 @@ CASES = [
      form_for("/api/access-credentials")),
     (_full, "Add a staff member who can only see customers", form_for("/api/staff")),
     (_full, "Add an M-Pesa till for my payments", form_for("/api/payment-methods")),
+    # messaging: texting customers, templates, automatic messages, credits, own provider
+    (_messaging, "Send an SMS to all my active customers saying we have maintenance tonight from 10pm",
+     form_for("/api/messaging/send", filter="active")),
+    (_messaging, "Text Amina that her internet ends today", form_for("/api/messaging/send", customer_ids=...)),
+    (_messaging, "Tuma ujumbe kwa wateja wote kuwa bei ya Weekly imepanda", form_for("/api/messaging/send")),
+    (_messaging, "Remind the customers whose time ends this week to renew", form_for("/api/messaging/send")),
+    (_messaging, "Send a message to everyone on the Weekly 300 plan", form_for("/api/messaging/send", plan_id=...)),
+    (_messaging, "Create an SMS template for payment reminders", form_for("/api/messaging/templates")),
+    (_messaging, "Delete my Promo template", delete_card("/api/messaging/templates/")),
+    (_messaging, "Send customers a reminder 1 hour before their time ends", form_for("/api/messaging/expiry-settings")),
+    # welcome SMS is off by default: saying so is as right as a form
+    (_messaging, "Stop the welcome SMS for new customers",
+     any_of(form_for("/api/messaging/customer-events"), guides_to("already"))),
+    (_messaging, "Buy 500 SMS credits", form_for("/api/messaging/credits/purchase", quantity=500)),
+    (_messaging, "How many SMS credits do I have?", all_of(answers_without_a_card, guides_to("200"))),
+    (_messaging, "Use my own Africa's Talking account to send SMS", form_for("/api/messaging/provider-accounts")),
+    (_no_credits, "Send an SMS to all my customers about a price change",
+     all_of(any_of(form_for("/api/messaging/credits/purchase"), form_for("/api/messaging/send")), guides_to("credit"))),
+    # the Bitwave subscription: suspended or about to end, and paying it here
+    (_suspended, "Why can't my customers buy internet?", guides_to("subscription", "suspend")),
+    (_suspended, "Pay my Bitwave subscription", form_for("/api/subscription/pay")),
+    (_suspended, "Lipia subscription yangu ya Bitwave", form_for("/api/subscription/pay")),
+    (_suspended, "Add a new plan", form_for("/api/plans/create")),
+    (_ending_soon, "How many customers do I have?", all_of(answers_without_a_card, guides_to("subscription"))),
+    (_ending_soon, "How much do I owe Bitwave?", guides_to("1,500", "1500")),
 ]
 
 
@@ -187,7 +264,7 @@ async def test_add_and_edit_requests_come_back_as_forms(client, owner, db, monke
     r = await client.post("/api/assistant/chat", json={"message": question}, headers=auth(token), timeout=180)
     events = sse_events(r.text)
     cards = [e for e in events if e["type"] == "action"]
-    text = "".join(e.get("delta", "") for e in events if e["type"] == "text")
+    text = visible_text(events)
     form_card = next((c for c in reversed(cards) if c.get("form")), None)
     card = form_card or (cards[-1] if cards else None)
     row = {

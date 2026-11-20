@@ -18,7 +18,7 @@ import re
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from app.config import settings
@@ -205,8 +205,18 @@ Photos
 Bitwave support notes
 - A message starting with [Bitwave support note from …] was written by the Bitwave team into this chat. Follow it, and tell the person what support said when it matters.
 
+Answering
+- Answer exactly what was asked, nothing around it. Lead with the answer itself (the count, the names, the figure) in one or two sentences, then at most one line on anything that needs attention.
+- Say the answer once, after your last lookup. Words you write next to a tool call are not shown, so do not narrate ("I'll look that up"): the page already shows that you are checking.
+- Never mention database ids ("id 1", "#34") unless the person asked for one; use names.
+- Times: each moment in a result already comes with the person's own clock and how far from now ("... = Sat 21 Nov 05:12 EAT, in 5 h"). Say that local time as it is, with "in 5 hours" or "2 days ago" for anything near; never convert times yourself and never write "UTC" unless asked.
+- [Account now: ...] before a message lists facts about the account itself: a Bitwave subscription that is suspended, lapsed or about to end, and SMS credits that have run out. When the question touches it (customers who cannot buy or connect, sending SMS, renewals, money) or it is the first answer in the chat, add one short line about it and offer to fix it here: paying the subscription (the subscription invoice and pay actions) or buying SMS credits. Otherwise do not repeat it. Never refuse or hold back anything else because of it.
+- When something the account lacks stands in the way of what was asked (no SMS credits for a send, no plan for a customer, no router for a plan), say so in one line and open the form that fixes it, then carry on with what they asked once it is done.
+- Look things up quietly: a read is drawn only when you set "show". While you are working something out, leave show out. Draw only the one result that answers the question (two at most); if a quiet lookup turned out to be the answer, call it again with show set. Never draw the same list twice, and never draw a lookup that turned out not to help.
+- Prefer the action or filter that answers the question directly (the API index lists each action's query parameters) over fetching everything and sifting through it.
+
 Showing results
-- The page draws each read's result for the person, and you choose how with "show": tiles for a few totals, table for a list, card for one record, trend for figures per day, week or month, bars for a top-N or a comparison between names, share for a split of one whole (by status, plan or payment method), none for a lookup only you need. Pick the drawing that answers the question, and prefer an action that already returns the grouping you need (per day, per plan, per router) over a long raw list.
+- The page draws a read's result for the person when you choose how with "show": tiles for a few totals, table for a list, card for one record, trend for figures per day, week or month, bars for a top-N or a comparison between names, share for a split of one whole (by status, plan or payment method), none for a lookup only you need. Pick the drawing that answers the question, and prefer an action that already returns the grouping you need (per day, per plan, per router) over a long raw list.
 - For trend, bars and share you may add "fields" naming the fields of the result rows to draw (label and value). Leave it out when you are unsure of the names; the page then picks them itself.
 - The numbers on screen always come from the data, never from you. So say the answer in one or two sentences, the headline figure and what stands out, and never repeat rows, lists or tables in your text.
 - Every figure you state must come from a result in this conversation. If you do not have it, look it up or say you do not know.
@@ -406,8 +416,129 @@ def conversation_lock(conversation_id: str) -> asyncio.Lock:
     return lock
 
 
-def _now_label() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+def _now_label(tz_name: Optional[str] = None) -> str:
+    """The moment of a message: UTC (what the API uses), and the person's own clock."""
+    from app.services.subscription_reminders import to_local, zone_abbreviation
+
+    now = datetime.utcnow()
+    if not tz_name:
+        return now.strftime("%Y-%m-%d %H:%M UTC")
+    local = to_local(now, tz_name)
+    offset = round((local - now).total_seconds() / 3600, 1)
+    sign = "+" if offset >= 0 else "-"
+    return (f"{now:%Y-%m-%d %H:%M} UTC = {local:%a %d %b %H:%M} {zone_abbreviation(tz_name, now)} "
+            f"(UTC{sign}{abs(offset):g}) for this person")
+
+
+_ISO_TIME = re.compile(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$")
+
+
+def localize_times(data: Any, tz_name: Optional[str], now: Optional[datetime] = None) -> Any:
+    """Every moment in a result, on the person's own clock and how far from now.
+
+    "2026-11-21T02:12:00" (UTC, as the API stores it) becomes
+    "2026-11-21T02:12:00 = Sat 21 Nov 05:12 EAT, in 5 h". The model reads the time
+    as it is instead of converting it (which it gets wrong). Dates alone stay as
+    they are. Strings that are not a moment are left alone.
+    """
+    if not tz_name:
+        return data
+    from datetime import timezone as _tz
+
+    from app.services.subscription_reminders import to_local, zone_abbreviation
+
+    now = now or datetime.utcnow()
+
+    def one(value: str) -> str:
+        m = _ISO_TIME.match(value.strip())
+        if not m:
+            return value
+        try:
+            when = datetime.fromisoformat(value.strip().replace("Z", "+00:00").replace(" ", "T"))
+        except ValueError:
+            return value
+        if when.tzinfo is not None:
+            when = when.astimezone(_tz.utc).replace(tzinfo=None)
+        local = to_local(when, tz_name)
+        secs = (when - now).total_seconds()
+        span = abs(secs)
+        if span < 90:
+            rel = "now"
+        else:
+            amount = (f"{round(span / 60)} min" if span < 3600 else
+                      f"{round(span / 3600)} h" if span < 48 * 3600 else f"{round(span / 86400)} days")
+            rel = f"in {amount}" if secs > 0 else f"{amount} ago"
+        return f"{value} = {local:%a %d %b %Y %H:%M} {zone_abbreviation(tz_name, when)}, {rel}"
+
+    def walk(v: Any) -> Any:
+        if isinstance(v, str):
+            return one(v) if len(v) <= 40 else v
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        if isinstance(v, dict):
+            return {k: walk(x) for k, x in v.items()}
+        return v
+
+    return walk(data)
+
+
+async def account_state(caller: Caller) -> tuple[Optional[str], list[str]]:
+    """The account's time zone, and what about the account itself needs saying.
+
+    Facts, not instructions: a subscription that is suspended, inactive or about
+    to run out (and what is owed), and SMS credits that have run out. Nothing is
+    listed when all is well. One short read; never fails the question.
+    """
+    if caller.role == "admin" and caller.viewer_sid is None:
+        return None, []
+    try:
+        from sqlalchemy import select
+
+        from app.db.database import async_session
+        from app.db.models import SmsCreditAccount, User
+        from app.services.markets import reseller_market
+        from app.services.subscription import get_invoice_amount_paid, get_pending_invoice
+
+        async with async_session() as db:
+            user = (await db.execute(select(User).where(User.id == caller.user_id))).scalar_one_or_none()
+            if user is None:
+                return None, []
+            market = reseller_market(user)
+            status = getattr(user.subscription_status, "value", user.subscription_status) or ""
+            expires = user.subscription_expires_at
+            invoice = await get_pending_invoice(db, user.id)
+            due, invoice_currency = None, None
+            if invoice is not None:
+                invoice_currency = getattr(invoice, "currency", None)
+                due = max(float(invoice.final_charge or 0) - float(await get_invoice_amount_paid(db, invoice.id) or 0), 0.0)
+            credits = (await db.execute(
+                select(SmsCreditAccount.balance).where(SmsCreditAccount.user_id == user.id))).scalar()
+    except Exception as e:  # the question still gets answered
+        logger.warning("assistant account state unavailable: %s", e)
+        return None, []
+
+    from app.services.subscription_reminders import to_local, zone_abbreviation
+    tz = market.timezone
+    currency = invoice_currency or market.currency or ""
+    owed = f"{currency} {due:,.0f}".strip() if due else None
+    when = (f"{to_local(expires, tz):%a %d %b %H:%M} {zone_abbreviation(tz, expires)}" if expires else None)
+    notes: list[str] = []
+    now = datetime.utcnow()
+    if status in ("suspended", "inactive"):
+        notes.append(f"Bitwave subscription {status}" + (f" since {when}" if when else "")
+                     + (f", {owed} to pay" if owed else "")
+                     + ": until it is paid, hotspot customers cannot buy internet.")
+    elif expires and expires - now < timedelta(days=3):
+        left = expires - now
+        notes.append(f"Bitwave subscription ({status}) ends {when}"
+                     + (f" (in {max(int(left.total_seconds() // 3600), 0)} h)" if left.total_seconds() > 0 else " (already passed)")
+                     + (f", {owed} to pay" if owed else "")
+                     + ": once it lapses, hotspot customers cannot buy internet.")
+    elif owed:
+        notes.append(f"Bitwave subscription invoice open: {owed} to pay.")
+    if credits is not None and credits <= 0:
+        notes.append("SMS credits: 0, so no SMS can be sent until credits are bought.")
+    return tz, notes
 
 
 def _block_dicts(message) -> list[dict]:
@@ -451,8 +582,13 @@ class Turn:
         self.input_tokens = 0
         self.output_tokens = 0
         self.proposals = 0
+        self.drawn: dict[str, str] = {}  # action key -> call_id of what is on screen for this answer
         self._text_parts: list[str] = []
         self._spoke = False
+        self._streamed = ""     # what this model call has put on screen so far
+        self._aside = ""        # the last working note taken back, in case no answer follows
+        self._tz: Optional[str] = None
+        self._tz_known = False
         self.usage = TurnUsage()
         self.is_question = False
 
@@ -513,7 +649,10 @@ class Turn:
         for image in images:
             content.append(await self._image_block(image))
         label = text or ("(photo)" if len(images) == 1 else "(photos)")
-        content.append({"type": "text", "text": f"[{_now_label()}] {label}"})
+        tz_name, notes = await account_state(self.caller)
+        self._tz, self._tz_known = tz_name, True
+        account = f"\n[Account now: {' '.join(notes)}]" if notes else ""
+        content.append({"type": "text", "text": f"[{_now_label(tz_name)}]{account} {label}"})
         self.transcript.append({
             "type": "user", "at": datetime.utcnow().isoformat() + "Z", "text": text,
             **({"images": [i.get("thumbnail") for i in images if i.get("thumbnail")]} if images else {}),
@@ -587,6 +726,14 @@ class Turn:
         server still checks the id on Confirm, as with any value.
         """
         for f in fields:
+            people = _PEOPLE_SOURCES.get(f["name"])
+            if people and f["kind"] == "list" and isinstance(f.get("value"), list) and f["value"]:
+                # the customers already chosen, by name, to untick; adding more is asked in the chat
+                names = dict(await self._choices(people))
+                picked = [str(v) for v in f["value"]][:100]
+                f.update(options=picked, option_labels={v: names.get(v, f"Customer {v}") for v in picked},
+                         value=picked)
+                continue
             source = _CHOICE_SOURCES.get(f["name"])
             if source is None or f["kind"] not in ("integer", "text"):
                 continue
@@ -624,6 +771,11 @@ class Turn:
             return True
         body, typed_secrets, problems = apply_form_values(spec, action.get("body"), values)
         problems += body_problems(spec, {**body, **typed_secrets})
+        before = action.get("body") if isinstance(action.get("body"), dict) else {}
+        for name in ("customer_ids",):
+            # unticking everyone must not turn "these people" into "everyone"
+            if before.get(name) and not body.get(name):
+                problems.append("pick at least one customer (to message a whole group, ask for that group instead)")
         stray = shaping.secret_fields(body)  # a secret the model put in: never
         if stray:
             problems.append("secrets cannot go through the chat (" + ", ".join(stray[:3]) + ")")
@@ -666,7 +818,7 @@ class Turn:
         if isinstance(action.get("body"), dict) and action["body"]:
             out["sent"] = shaping.mask(action["body"])  # what really ran, form edits included
         if result.ok:
-            out["result"] = shaping.for_model(result.data, limit_chars=6000)
+            out["result"] = localize_times(shaping.for_model(result.data, limit_chars=6000), await self._zone())
         else:
             out["error"] = detail
         return out
@@ -677,6 +829,7 @@ class Turn:
         system = self.system_blocks()
         checked_claim = False
         for step in range(max(1, settings.ASSISTANT_MAX_STEPS)):
+            spoke_before, self._streamed = self._spoke, ""
             try:
                 message = await self._model_call(system)
             except Exception as exc:
@@ -685,8 +838,18 @@ class Turn:
                 await self.emit("notice", {"level": "error",
                                            "message": "The assistant could not answer just now. Try again."})
                 return
-            await self._flush_text()
             content = _block_dicts(message)
+            if self._streamed and any(b.get("type") == "tool_use" for b in content):
+                # Words written next to a lookup are the model thinking aloud ("I'll check
+                # the plans"), not the answer, which comes after the last lookup. Take them
+                # back off the screen; keep them only if no answer follows.
+                await self.queue.put({"type": "retract", "chars": len(self._streamed)})
+                self._aside = "".join(self._text_parts).strip() or self._aside
+                self._text_parts, self._spoke = [], spoke_before
+            elif not self._spoke and self._aside and not any(b.get("type") == "tool_use" for b in content):
+                await self._emit_text(self._aside, {})  # nothing else was said: the note is the answer
+                self._aside = ""
+            await self._flush_text()
             self.messages.append({"role": "assistant", "content": content})
             usage = getattr(message, "usage", None)
             if usage is not None:
@@ -735,8 +898,10 @@ class Turn:
             state["started"] = True
             if self._spoke:
                 await self.queue.put({"type": "text", "delta": PARAGRAPH_BREAK})
+                self._streamed += PARAGRAPH_BREAK
         self._spoke = True
         self._text_parts.append(delta)
+        self._streamed += delta
         await self.queue.put({"type": "text", "delta": delta})
 
     def _history_for_model(self) -> list:
@@ -744,6 +909,12 @@ class Turn:
         if provider() == "anthropic":
             return merged  # editing Claude's history would break its thinking blocks
         return fit_context(merged, max(8000, settings.ASSISTANT_CONTEXT_TOKENS))
+
+    async def _zone(self) -> Optional[str]:
+        if not self._tz_known:
+            self._tz, _ = await account_state(self.caller)
+            self._tz_known = True
+        return self._tz
 
     async def _model_call(self, system: list[dict]):
         message = await self._model_call_inner(system)
@@ -841,7 +1012,10 @@ class Turn:
         raw_path = str(args.get("path") or "")
         query = args.get("query")
         body = args.get("body")
-        show = args.get("show") if args.get("show") in SHOW_VALUES else "auto"
+        # A lookup is drawn only when the model asks for it; one it makes to work things
+        # out is not. A drawing it names that the page does not know falls back to "auto".
+        requested = args.get("show")
+        show = requested if requested in SHOW_VALUES else ("auto" if requested else "none")
         fields = clean_fields(args.get("fields"))
 
         if query is not None and not isinstance(query, dict):
@@ -944,16 +1118,45 @@ class Turn:
                                  "ok": result.ok, "status": result.status}, keep=False)
         if not result.ok:
             return self._tool_result(tool_use_id, {"status": result.status, "error": result.detail()}, True)
+        note = None
         if show != "none":
-            await self.emit("data", {
-                "call_id": call_id, "title": action.title, "method": method, "path": path,
-                "query": query or None, "show": show, **({"fields": fields} if fields else {}),
-                "payload": shaping.for_screen(result.data),
-            })
-        out: dict = {"status": result.status, "data": shaping.for_model(result.data)}
+            # What reaches the screen is the answer, not the search for it: an empty
+            # result is said in words, the same lookup again replaces the first one,
+            # and an answer shows at most MAX_DRAWN results.
+            replaces = self.drawn.get(action.key)
+            if _is_empty(result.data):
+                show, note = "none", "Empty, so not drawn: say so in words."
+            elif replaces is None and len(self.drawn) >= MAX_DRAWN:
+                show, note = "none", (f"Not drawn: {MAX_DRAWN} results are already on screen for this answer. "
+                                      "Draw only what answers the question.")
+            else:
+                self.drawn[action.key] = call_id
+                await self.emit("data", {
+                    "call_id": call_id, "title": action.title, "method": method, "path": path,
+                    "query": query or None, "show": show, **({"fields": fields} if fields else {}),
+                    **({"replaces": replaces} if replaces else {}),
+                    "payload": shaping.for_screen(result.data),
+                })
+        out: dict = {"status": result.status, "data": localize_times(shaping.for_model(result.data), await self._zone())}
+        if note:
+            out["display"] = note
         if dropped:
             out["ignored_query_params"] = dropped
         return self._tool_result(tool_use_id, out)
+
+
+# At most this many results are drawn for one answer.
+MAX_DRAWN = 2
+
+
+def _is_empty(data) -> bool:
+    """A list with nothing in it, bare or as a page ({"data": [], "total": 0})."""
+    if isinstance(data, list):
+        return not data
+    if isinstance(data, dict):
+        lists = [v for v in data.values() if isinstance(v, list)]
+        return bool(lists) and all(not v for v in lists) and not data.get("total")
+    return data is None
 
 
 # Words that tell the person a card is waiting for them ("tap Confirm", "fill it in").
@@ -963,6 +1166,8 @@ _CLAIMS_A_CARD = re.compile(
 
 # Form fields that pick one of the person's own records, and where to list them from.
 _CHOICE_SOURCES = {"plan_id": "/api/plans", "router_id": "/api/routers"}
+# lists of customers in a form (who gets an SMS): shown by name
+_PEOPLE_SOURCES = {"customer_ids": "/api/customers", "exclude_customer_ids": "/api/customers"}
 
 
 def _sensitive() -> frozenset:

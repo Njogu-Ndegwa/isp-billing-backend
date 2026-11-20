@@ -146,6 +146,17 @@ def sse_events(body: str) -> list[dict]:
     return events
 
 
+def visible_text(events: list[dict]) -> str:
+    """The words left on screen: text, minus what was taken back as working notes."""
+    out = ""
+    for e in events:
+        if e["type"] == "text":
+            out += e.get("delta", "")
+        elif e["type"] == "retract":
+            out = out[: max(0, len(out) - e["chars"])]
+    return out.strip()
+
+
 def tool_results(request: dict) -> list[dict]:
     last = request["messages"][-1]
     return [json.loads(b["content"]) | {"_is_error": b.get("is_error", False)}
@@ -575,7 +586,7 @@ async def test_openai_compatible_provider_like_the_assets_assistant(client, owne
             {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
                                                                  "function": {"name": "call_api", "arguments": ""}}]}}]},
             {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": '{"method":"GET",'}}]}}]},
-            {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": '"path":"/api/plans"}'}}]},
+            {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": '"path":"/api/plans","show":"table"}'}}]},
                           "finish_reason": "tool_calls"}],
              "usage": {"prompt_tokens": 9000, "completion_tokens": 20, "prompt_cache_hit_tokens": 8000}},
         ]),
@@ -713,7 +724,7 @@ def test_trimming_keeps_the_cached_prefix_stable_as_the_chat_grows():
 
 
 @pytest.mark.asyncio
-async def test_two_replies_in_one_answer_are_separate_paragraphs(client, owner):
+async def test_a_note_before_a_lookup_gives_way_to_the_answer(client, owner):
     _, token = owner
     use_model([
         _Message([{"type": "text", "text": "Checking."},
@@ -723,8 +734,9 @@ async def test_two_replies_in_one_answer_are_separate_paragraphs(client, owner):
     ])
     events = sse_events((await client.post("/api/assistant/chat", json={"message": "plans?"},
                                            headers=auth(token))).text)
-    streamed = "".join(e["delta"] for e in events if e["type"] == "text")
-    assert streamed == "Checking." + chr(10) * 2 + "No plans yet."
+    assert visible_text(events) == "No plans yet."
+    # the answer starts its own text, with no stray paragraph break in front
+    assert not any(e["type"] == "text" and e["delta"] == chr(10) * 2 for e in events)
 
 
 def test_deepseek_peak_hours_cost_double():
@@ -1322,3 +1334,134 @@ async def test_saying_a_form_is_ready_without_one_is_sent_back_once(client, owne
                                            headers=auth(token))).text)
     assert any(e["type"] == "action" and e.get("form") for e in events)
     assert "[Check]" in json.dumps(model.requests[1]["messages"][-1])
+
+
+@pytest.mark.asyncio
+async def test_only_what_answers_the_question_is_drawn(client, owner, db):
+    reseller, token = owner
+    await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    await make_router(db, reseller, name="Main Tower")
+    await db.commit()
+    model = use_model([
+        tool_reply("call_api", {"method": "GET", "path": "/api/dashboard/analytics"}, "tu_1"),          # working it out: hidden
+        tool_reply("call_api", {"method": "GET", "path": "/api/customers/active", "show": "table"}, "tu_2"),  # empty: said in words
+        tool_reply("call_api", {"method": "GET", "path": "/api/plans", "show": "table"}, "tu_3"),         # drawn
+        tool_reply("call_api", {"method": "GET", "path": "/api/plans", "show": "bars"}, "tu_4"),          # same list: replaces it
+        tool_reply("call_api", {"method": "GET", "path": "/api/routers", "show": "table"}, "tu_5"),       # drawn (second)
+        tool_reply("call_api", {"method": "GET", "path": "/api/dashboard/analytics", "show": "tiles"}, "tu_6"),  # a third: refused
+        text_reply("You have one plan, Daily 50."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "which plans do I have?"},
+                                           headers=auth(token))).text)
+    drawn = [e for e in events if e["type"] == "data"]
+    paths = [e["path"] for e in drawn]
+    assert paths == ["/api/plans", "/api/plans", "/api/routers"], paths
+    assert drawn[1]["replaces"] == drawn[0]["call_id"]  # the page keeps only the newer one
+    told = [res for req in model.requests for res in tool_results(req)]
+    assert any("Empty, so not drawn" in r.get("display", "") for r in told)
+    assert any("results are already on screen" in r.get("display", "") for r in told)
+
+
+@pytest.mark.asyncio
+async def test_active_customers_can_be_filtered_by_when_their_time_ends(client, owner, db):
+    from datetime import datetime, timedelta as td
+
+    from app.db.models import CustomerStatus
+
+    reseller, token = owner
+    plan = await make_plan(db, reseller, name="Weekly 300", price=300, duration_value=7)
+    now = datetime.utcnow()
+    for name, hours in (("Soon", 5), ("In two days", 47), ("Next week", 24 * 6)):
+        await make_customer(db, reseller, plan, name=name, phone=f"2547000000{hours % 100:02d}",
+                            status=CustomerStatus.ACTIVE, expiry=now + td(hours=hours))
+    await db.commit()
+    r = await client.get("/api/customers/active?expires_within_hours=72", headers=auth(token))
+    assert r.status_code == 200
+    assert sorted(c["name"] for c in r.json()) == ["In two days", "Soon"]
+    everyone = await client.get("/api/customers/active", headers=auth(token))
+    assert len(everyone.json()) == 3
+
+
+@pytest.mark.asyncio
+async def test_the_model_is_told_the_local_time_and_what_is_wrong_with_the_account(client, owner, db):
+    from datetime import datetime, timedelta as td
+
+    from app.db.models import InvoiceStatus, SubscriptionInvoice, SubscriptionStatus
+    from tests.factories import make_sms_account
+
+    reseller, token = owner
+    # all well: the local clock, and nothing else
+    model = use_model([text_reply("Fine.")])
+    await client.post("/api/assistant/chat", json={"message": "hi"}, headers=auth(token))
+    said = json.dumps(model.requests[0]["messages"][-1])
+    assert "EAT" in said and "Account now" not in said
+
+    # suspended with an invoice open, and no SMS credits left
+    reseller.subscription_status = SubscriptionStatus.SUSPENDED
+    reseller.subscription_expires_at = datetime.utcnow() - td(days=2)
+    now = datetime.utcnow()
+    db.add(SubscriptionInvoice(user_id=reseller.id, period_start=now - td(days=32), period_end=now - td(days=2),
+                               final_charge=1500, currency="KES", status=InvoiceStatus.OVERDUE, due_date=now - td(days=2)))
+    await make_sms_account(db, reseller, balance=0)
+    await db.commit()
+    model = use_model([text_reply("Your account is suspended.")])
+    await client.post("/api/assistant/chat", json={"message": "why can't customers buy?"}, headers=auth(token))
+    said = json.dumps(model.requests[0]["messages"][-1])
+    assert "subscription suspended" in said and "KES 1,500 to pay" in said
+    assert "cannot buy internet" in said and "SMS credits: 0" in said
+
+
+@pytest.mark.asyncio
+async def test_an_sms_form_names_the_chosen_customers_and_never_widens_to_everyone(client, owner, db):
+    reseller, token = owner
+    plan = await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    amina = await make_customer(db, reseller, plan, name="Amina Wanjiru", phone="254711000001")
+    await db.commit()
+    use_model([
+        tool_reply("describe_action", {"method": "POST", "path": "/api/messaging/send"}, "tu_1"),
+        tool_reply("call_api", {"method": "POST", "path": "/api/messaging/send", "form": True,
+                                "body": {"body": "Hi Amina, your time ends today.", "customer_ids": [amina.id]}}, "tu_2"),
+        text_reply("Check the message and tap Confirm."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "text Amina"}, headers=auth(token))).text)
+    card = next(e for e in events if e["type"] == "action")
+    fields = {f["name"]: f for f in card["form"]}
+    assert fields["customer_ids"]["option_labels"] == {str(amina.id): "Amina Wanjiru"}
+    assert fields["filter"]["kind"] == "select" and "active" in fields["filter"]["options"]
+    # unticking her must not send to everyone
+    use_model([text_reply("ok")])
+    r = await client.post(f"/api/assistant/conversations/{events[0]['id']}/decide", headers=auth(token), json={
+        "decisions": [{"action_id": card["action_id"], "approve": True, "values": {"customer_ids": []}}]})
+    assert "pick at least one customer" in r.text
+
+
+@pytest.mark.asyncio
+async def test_words_written_next_to_a_lookup_are_taken_back_and_times_come_local(client, owner, db):
+    from datetime import datetime, timedelta as td
+
+    from app.db.models import CustomerStatus
+
+    reseller, token = owner
+    plan = await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    await make_customer(db, reseller, plan, name="Amina", status=CustomerStatus.ACTIVE,
+                        expiry=datetime.utcnow() + td(hours=5))
+    await db.commit()
+    model = use_model([
+        tool_reply("call_api", {"method": "GET", "path": "/api/customers/active"}, "tu_1", text="I'll check who is active."),
+        text_reply("Amina is active until 05:12, in about 5 hours."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "who is active?"},
+                                           headers=auth(token))).text)
+    assert visible_text(events) == "Amina is active until 05:12, in about 5 hours."
+    assert any(e["type"] == "retract" for e in events)
+    told = json.dumps([res for req in model.requests for res in tool_results(req)])
+    assert " EAT, in 5 h" in told  # the model reads the time on the person's clock
+
+    # a lookup and then nothing more to say: the note stays as the answer
+    use_model([
+        tool_reply("call_api", {"method": "GET", "path": "/api/plans", "show": "table"}, "tu_1", text="Here are your plans."),
+        text_reply(""),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "my plans"},
+                                           headers=auth(token))).text)
+    assert visible_text(events) == "Here are your plans."
