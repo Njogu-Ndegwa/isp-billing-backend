@@ -14,6 +14,7 @@ earlier message. No DB session is held across a model or API call.
 from __future__ import annotations
 
 import asyncio
+import re
 import json
 import logging
 import uuid
@@ -24,7 +25,7 @@ from app.config import settings
 from app.services.assistant import executor, shaping, store
 from app.services.assistant.usage import TurnUsage
 from app.services.assistant.caller import Caller
-from app.services.assistant.catalog import Action, Catalog, body_problems, build_path, get_catalog
+from app.services.assistant.catalog import Action, Catalog, apply_form_values, body_problems, build_path, form_fields, get_catalog
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +112,14 @@ TOOLS = [
                          "description": "Concrete path with real ids filled in, e.g. /api/customers/1234"},
                 "query": {"type": "object", "description": "Query parameters, if any."},
                 "body": {"description": "JSON body for POST/PUT/PATCH, if the action takes one."},
+                "form": {
+                    "type": "boolean",
+                    "description": (
+                        "For creating or editing a record: show the change as a form the person "
+                        "completes or corrects before Confirm. Put in body only what you know (for an "
+                        "edit, the record's current values for the fields being changed); required "
+                        "fields may be left out and the person fills them in."),
+                },
                 "show": {
                     "type": "string", "enum": list(SHOW_VALUES),
                     "description": (
@@ -155,6 +164,9 @@ How to work
 - The API index at the end lists every action available to this person, one per line: METHOD path ?query-params — what it does. Lines marked ✎ change data.
 - Look things up before acting. Resolve names, phone numbers, router names and plan names to ids with a read (show "none" when it is only a lookup). Never guess or invent an id.
 - Before any ✎ action, call describe_action for it, then call call_api with a complete, correct request and a clear summary.
+- To create or edit something (a plan, a customer, a router setting, a payment method...), never ask for the fields in text. Call describe_action, then call_api with form: true and a body holding what you already know: values the person gave, sensible defaults, and for an edit the record's current values (read it first). The person sees a form, fills in or corrects it and taps Confirm; leave out what you do not know. In your words, say only what the form is for, e.g. "Fill in the plan and tap Confirm." When the plan or router is not clear, leave plan_id or router_id out: the form lets the person pick from their own plans and routers. Ask in text only when it is unclear which record or which action is meant.
+- When what a change needs does not exist yet (no plan to put vouchers or a customer on), say so in one sentence and open the form for that first. A router is added with the setup command, not a form.
+- Never say a form or a change is ready unless call_api answered "waiting_for_confirmation". If it returned an error, fix the request and send it again, or say plainly what went wrong.
 - A ✎ call does not run when you make it. It becomes a confirmation card and the person taps Confirm or Cancel. After proposing, end your turn with one or two sentences saying what is ready and that it runs when they tap Confirm, e.g. "Ready to create the plan — tap Confirm." Never say you created, changed, set up or sent anything until you have its result.
 - Confirmed and cancelled actions come back in a message that starts with [Confirmation results]. Report what happened plainly, failures included, then continue the task if more steps remain.
 - For a change to many records, use a bulk action if the index has one; otherwise propose one call per record, at most {max_proposals} per turn, and say how many remain.
@@ -170,7 +182,7 @@ Getting started (onboarding)
 - Router not connecting, check in this order: internet cable in port 1 (`/ping 8.8.8.8 count=3` should get replies); the router's date and time are today (`/system clock print`, fix under System > Clock); the whole command was pasted (it must end with `/import provision.rsc;`); the code has not expired (codes last about 24 hours; make a new one if so).
 - "not allowed by device-mode" or "hotspot feature unavailable" on RouterOS 7: run `/system/device-mode/update fetch=yes scheduler=yes hotspot=yes`, then within 5 minutes tap the router's reset or mode button once (a quick tap; holding it can erase the router); wait for the restart, log in again and paste the setup command again. `/system/device-mode/print` should show hotspot: yes. "bad command name" means that version has no device-mode, so skip this. "too many unsuccessful attempts": unplug the power once and start again.
 - Hotspot package missing (hAP lite / hAP mini, `/ip hotspot` menus absent, or "hotspot feature unavailable" while device-mode shows hotspot: yes): check `/system package print` and `/system resource print` (version and architecture-name), download the matching package, e.g. `/tool fetch url="https://download.mikrotik.com/routeros/<version>/hotspot-<version>-<architecture>.npk"`, then `/system reboot`, then paste the setup command again.
-- Plans: ask for name, price, duration and speed if not given; describe the plan action to see the exact fields. Payments: M-Pesa Paybill (paybill number), M-Pesa Till (a 4–9 digit Buy Goods number, never a phone number: a phone number cannot receive payouts) or bank (bank paybill + account number). After creating the first payment method, link it to the router with the router payment-method action if the index has it.
+- Plans: open the plan form (form: true) with what the person said filled in; do not ask for name, price, duration and speed in text. Payments: M-Pesa Paybill (paybill number), M-Pesa Till (a 4–9 digit Buy Goods number, never a phone number: a phone number cannot receive payouts) or bank (bank paybill + account number). After creating the first payment method, link it to the router with the router payment-method action if the index has it.
 - If they stay stuck, the Bitwave team can take over: they can send their RustDesk ID on WhatsApp to +254795635364 and Bitwave sets the router up remotely. The Bitwave team can also read this chat and add notes to it.
 
 Product facts (Bitwave support's own answers to resellers; check live data for numbers)
@@ -427,6 +439,8 @@ class Turn:
     """One request's worth of work on one conversation, streaming events to a queue."""
 
     def __init__(self, app, caller: Caller, conversation: dict, queue: asyncio.Queue):
+        self._form_secrets: dict[str, dict] = {}  # passwords typed in a form, for one request
+        self._choice_cache: dict[str, list[tuple[str, str]]] = {}
         self.app = app
         self.caller = caller
         self.catalog: Catalog = get_catalog(app)
@@ -543,6 +557,9 @@ class Turn:
         for decision in decisions[:MAX_PROPOSALS_PER_TURN * 2]:
             action_id = str(decision.get("action_id") or "")
             approve = bool(decision.get("approve"))
+            values = decision.get("values")
+            if approve and isinstance(values, dict) and not await self._take_form_values(action_id, values):
+                continue  # refused: the card stays open with what to fix, nothing ran
             if approve:
                 lines.append(await self._run_confirmed(action_id))
             else:
@@ -563,6 +580,64 @@ class Turn:
         }]})
         await self._loop()
 
+    async def _offer_choices(self, fields: list[dict]) -> None:
+        """A plan or router field lists this person's own plans and routers by name.
+
+        Read with their own access, so a staff member sees what they may see; the
+        server still checks the id on Confirm, as with any value.
+        """
+        for f in fields:
+            source = _CHOICE_SOURCES.get(f["name"])
+            if source is None or f["kind"] not in ("integer", "text"):
+                continue
+            choices = await self._choices(source)
+            if not choices:
+                continue
+            f.update(value_kind=f["kind"], kind="select", options=[c[0] for c in choices],
+                     option_labels=dict(choices))
+            if "value" in f:
+                f["value"] = str(f["value"])
+
+    async def _choices(self, path: str) -> list[tuple[str, str]]:
+        if path not in self._choice_cache:
+            out: list[tuple[str, str]] = []
+            try:
+                result = await executor.call_api(self.app, self.caller, "GET", path, None, None)
+                data = result.data if result.ok else None
+                if isinstance(data, dict):  # a page: the first list in it
+                    data = next((v for v in data.values() if isinstance(v, list)), None)
+                for row in (data or [])[:200]:
+                    if isinstance(row, dict) and row.get("id") is not None:
+                        out.append((str(row["id"]), str(row.get("name") or row.get("identity") or f"#{row['id']}")[:80]))
+            except Exception:  # a convenience: without it the field is a plain input
+                logger.warning("[assistant] could not list %s for a form", path, exc_info=True)
+            self._choice_cache[path] = out
+        return self._choice_cache[path]
+
+    async def _take_form_values(self, action_id: str, values: dict) -> bool:
+        """Merge a form's values into its pending action. False (and the card told why) if they do not pass."""
+        action = await store.pending_action(self.caller, self.conversation["id"], action_id)
+        if action is None:
+            return True  # expired or decided: _run_confirmed says so
+        spec, _ = self.catalog.match(action["method"], action["path"])
+        if spec is None:
+            return True
+        body, typed_secrets, problems = apply_form_values(spec, action.get("body"), values)
+        problems += body_problems(spec, {**body, **typed_secrets})
+        stray = shaping.secret_fields(body)  # a secret the model put in: never
+        if stray:
+            problems.append("secrets cannot go through the chat (" + ", ".join(stray[:3]) + ")")
+        if problems:
+            await self.emit("action_result", {
+                "action_id": action_id, "status": "pending", "ok": False,
+                "detail": "Not run yet. Please fix: " + "; ".join(dict.fromkeys(problems)) + ".",
+            })
+            return False
+        await store.set_action_body(action_id, body)  # stored without the passwords
+        if typed_secrets:
+            self._form_secrets[action_id] = typed_secrets  # this request only, then forgotten
+        return True
+
     async def _run_confirmed(self, action_id: str) -> dict:
         action = await store.claim_action(self.caller, self.conversation["id"], action_id, "running")
         if action is None:
@@ -571,8 +646,10 @@ class Turn:
             return {"action_id": action_id, "outcome": "not run: already decided or expired"}
         await self.emit("step", {"call_id": action_id, "label": action["title"], "phase": "start",
                                  "method": action["method"], "path": action["path"]}, keep=False)
+        typed_secrets = self._form_secrets.pop(action_id, None)
+        body = {**(action.get("body") or {}), **typed_secrets} if typed_secrets else action.get("body")
         result = await executor.call_api(self.app, self.caller, action["method"], action["path"],
-                                         action.get("query"), action.get("body"))
+                                         action.get("query"), body)
         status = "done" if result.ok else "failed"
         detail = "" if result.ok else result.detail()
         await store.finish_action(action_id, status=status, result_status=result.status,
@@ -586,6 +663,8 @@ class Turn:
         out = {"action_id": action_id, "title": action["title"], "method": action["method"],
                "path": action["path"], "http_status": result.status,
                "outcome": "done" if result.ok else "failed"}
+        if isinstance(action.get("body"), dict) and action["body"]:
+            out["sent"] = shaping.mask(action["body"])  # what really ran, form edits included
         if result.ok:
             out["result"] = shaping.for_model(result.data, limit_chars=6000)
         else:
@@ -596,6 +675,7 @@ class Turn:
 
     async def _loop(self) -> None:
         system = self.system_blocks()
+        checked_claim = False
         for step in range(max(1, settings.ASSISTANT_MAX_STEPS)):
             try:
                 message = await self._model_call(system)
@@ -624,6 +704,19 @@ class Turn:
             if not tool_uses:
                 if stop == "max_tokens":
                     await self.emit("notice", {"level": "info", "message": "The answer was cut short."})
+                    return
+                # The model said a form or change is ready without proposing one, so the
+                # person would be told to tap Confirm on nothing. Once per turn, send it
+                # back to put the card there (or to take the words back).
+                said = " ".join(b.get("text", "") for b in content if b.get("type") == "text")
+                if not checked_claim and self.proposals == 0 and _CLAIMS_A_CARD.search(said):
+                    checked_claim = True
+                    self.messages.append({"role": "user", "content": [{"type": "text", "text": (
+                        "[Check] You told the person a form or change is ready, but you did not call "
+                        "call_api for it in this answer, so nothing is on their screen. Call "
+                        "describe_action and call_api now (form: true) to put it there, or say "
+                        "plainly that it is not ready yet.")}]})
+                    continue
                 return
             results = []
             for block in tool_uses:
@@ -794,7 +887,19 @@ class Turn:
                          f"{action.template} to get its exact fields and allowed values, then send "
                          "this call again.",
             }, True)
+        # Every add or edit is shown as a form the person can correct before Confirm,
+        # whatever the model chose; with form: true it may also leave required fields
+        # for the person to fill in.
+        editable = method in ("POST", "PUT", "PATCH")
+        form = bool(args.get("form")) and editable
+        if form and body is None and action.body_schema is not None:
+            body = {}
         problems = body_problems(action, body)
+        if form:  # the person fills in what is missing
+            problems = [p for p in problems if not p.endswith("is required") and p != "this action needs a JSON body"]
+        fields_for_form = form_fields(action, body) if editable and body is not None else None
+        if fields_for_form:
+            await self._offer_choices(fields_for_form)
         if problems:
             return self._tool_result(tool_use_id, {
                 "error": "Not proposed, fix the request first: " + "; ".join(problems) + ".",
@@ -818,11 +923,14 @@ class Turn:
             "body": shaping.mask(body), "permission": permission,
             "sensitive": bool(permission and permission in _sensitive()),
             "expires_at": pending["expires_at"], "status": "pending",
+            **({"form": fields_for_form} if fields_for_form else {}),
         })
         return self._tool_result(tool_use_id, {
             "status": "waiting_for_confirmation",
             "action_id": pending["id"],
-            "note": "Not run yet. The person sees a confirm card with this exact request.",
+            "note": ("Not run yet. The person sees this as a form, fills in or corrects the fields, "
+                     "and confirms; the confirmation result tells you the values that ran.")
+                    if fields_for_form else "Not run yet. The person sees a confirm card with this exact request.",
             **({"ignored_query_params": dropped} if dropped else {}),
         })
 
@@ -846,6 +954,15 @@ class Turn:
         if dropped:
             out["ignored_query_params"] = dropped
         return self._tool_result(tool_use_id, out)
+
+
+# Words that tell the person a card is waiting for them ("tap Confirm", "fill it in").
+_CLAIMS_A_CARD = re.compile(
+    r"(tap confirm|bonyeza confirm|fill (it|them|this|the form|in the form)? ?in|form is ready|"
+    r"fomu iko tayari|jaza fomu)", re.I)
+
+# Form fields that pick one of the person's own records, and where to list them from.
+_CHOICE_SOURCES = {"plan_id": "/api/plans", "router_id": "/api/routers"}
 
 
 def _sensitive() -> frozenset:

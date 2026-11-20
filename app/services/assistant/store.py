@@ -214,6 +214,33 @@ async def claim_action(caller: Caller, conversation_id: str, action_id: str,
         return action_view(action)
 
 
+async def pending_action(caller: Caller, conversation_id: str, action_id: str) -> Optional[dict]:
+    """A pending, unexpired action of this caller, without deciding it."""
+    now = datetime.utcnow()
+    async with db_module.async_session() as db:
+        action = (await db.execute(
+            select(AssistantAction).where(
+                AssistantAction.id == action_id,
+                AssistantAction.conversation_id == conversation_id,
+                AssistantAction.status == "pending",
+                AssistantAction.expires_at >= now,
+                _owner_filter(AssistantAction, caller),
+            )
+        )).scalar_one_or_none()
+        return action_view(action) if action is not None else None
+
+
+async def set_action_body(action_id: str, body: Any) -> None:
+    """Keep what the person filled in on the action, so the record shows what really ran."""
+    async with db_module.async_session() as db:
+        await db.execute(
+            update(AssistantAction)
+            .where(AssistantAction.id == action_id, AssistantAction.status == "pending")
+            .values(body=body)
+        )
+        await db.commit()
+
+
 async def finish_action(action_id: str, *, status: str, result_status: Optional[int],
                         result_summary: str) -> None:
     async with db_module.async_session() as db:

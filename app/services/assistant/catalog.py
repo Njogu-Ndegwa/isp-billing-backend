@@ -415,6 +415,169 @@ def body_problems(action: Action, body) -> list[str]:
     return problems
 
 
+# -- forms -------------------------------------------------------------------
+#
+# A change can be proposed as a form: the card shows the action's fields as inputs,
+# filled with what the assistant knows, and the person completes or corrects them
+# before Confirm. The fields come from the API's own schema, never from the model.
+# A password is a masked input the person types: it goes from their browser to the
+# API for that one request and is never stored, shown to the model or written into
+# the chat. A list of simple values (ports, minutes, permissions) is one input;
+# nested objects are left as the assistant set them.
+
+FORM_FIELD_LIMIT = 20
+# An action's own safety switches ("confirm": true on a reboot) are not questions for the person.
+_FORM_HIDDEN = frozenset({"confirm", "confirmed", "dry_run", "dryrun", "preview"})
+_FORM_KINDS = {"integer": "integer", "number": "number", "boolean": "boolean"}
+
+
+def _field_label(key: str) -> str:
+    words = key.replace("_", " ").strip()
+    return (words[:1].upper() + words[1:]) if words else key
+
+
+def form_fields(action: Action, body: Any) -> Optional[list[dict]]:
+    """The editable fields of a change, in the order a person fills them: required first."""
+    from app.services.assistant.shaping import is_secret_key
+
+    schema = action.body_schema
+    if not isinstance(schema, dict) or schema.get("type") not in (None, "object"):
+        return None
+    props = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
+    known = enum_values()
+    current = body if isinstance(body, dict) else {}
+    out: list[dict] = []
+    hidden = _FORM_HIDDEN | set(action.flags)  # safety switches stay as set, never shown as inputs
+    for key, prop in props.items():
+        if not isinstance(prop, dict) or prop.get("readOnly") or key in hidden:
+            continue
+        typ = prop.get("type")
+        options = prop.get("enum") or known.get(key)
+        item_kind = None
+        if is_secret_key(key):
+            if typ not in (None, "string"):
+                continue
+            kind, options = "password", None
+        elif typ == "array" and isinstance(prop.get("items"), dict) and prop["items"].get("type") in ("string", "integer", "number"):
+            kind = "list"
+            item_kind = {"string": "text"}.get(prop["items"]["type"], prop["items"]["type"])
+            options = prop["items"].get("enum") or (sorted(perms.PERMISSIONS) if key == "permissions" and "staff" in action.template else None)
+        elif options:
+            kind = "select"
+        elif typ in _FORM_KINDS:
+            kind = _FORM_KINDS[typ]
+        elif typ == "string" or (typ is None and "properties" not in prop and "items" not in prop):
+            kind = {"date": "date", "date-time": "datetime"}.get(prop.get("format"), "text")
+        else:
+            continue  # objects and lists stay as the assistant set them
+        f: dict = {"name": key, "label": _field_label(key), "kind": kind, "required": key in required}
+        if item_kind:
+            f["item_kind"] = item_kind
+        if options:
+            f["options"] = [str(o) for o in options]
+        if isinstance(prop.get("description"), str) and prop["description"].strip():
+            f["hint"] = prop["description"].strip()[:160]
+        for bound in ("minimum", "maximum", "maxLength"):
+            if isinstance(prop.get(bound), (int, float)):
+                f[bound] = prop[bound]
+        if kind == "password":
+            pass  # never sent back to the page, never pre-filled
+        elif current.get(key) is not None:
+            f["value"] = current[key]
+        elif prop.get("default") is not None:
+            f["value"] = prop["default"]
+        out.append(f)
+    out.sort(key=lambda f: not f["required"])  # stable: required first, schema order within
+    return out[:FORM_FIELD_LIMIT] or None
+
+
+def _one_value(kind: str, raw: Any, options: list) -> Any:
+    """One typed value read by its kind; ValueError when it cannot be."""
+    if kind == "integer":
+        number = float(str(raw).replace(",", "").strip())
+        if not number.is_integer():
+            raise ValueError
+        return int(number)
+    if kind == "number":
+        number = float(str(raw).replace(",", "").strip())
+        return int(number) if number.is_integer() else number
+    if options:
+        match = next((o for o in options if o.lower() == str(raw).strip().lower()), None)
+        if match is None:
+            raise ValueError
+        return match
+    return str(raw).strip()[:2000]
+
+
+def apply_form_values(action: Action, base: Any, values: dict) -> tuple[dict, dict, list[str]]:
+    """Merge what the person typed into the proposed body, typed by the schema.
+
+    Only the form's own fields are taken (nothing the form did not offer); an emptied
+    optional field is left out. Passwords come back on their own, to be sent with the
+    request and then forgotten. Returns (body, secrets, problems), e.g. a problem
+    "'price' must be a number".
+    """
+    fields = {f["name"]: f for f in (form_fields(action, base) or [])}
+    body = dict(base) if isinstance(base, dict) else {}
+    secrets: dict = {}
+    problems: list[str] = []
+    for key, raw in values.items():
+        f = fields.get(key)
+        if f is None:
+            continue
+        kind = f["kind"]
+        if kind == "password":
+            if isinstance(raw, str) and raw:
+                secrets[key] = raw[:500]
+            continue
+        if raw is None or (isinstance(raw, str) and not raw.strip()) or raw == []:
+            body.pop(key, None)
+            continue
+        if kind == "list":
+            items = raw if isinstance(raw, list) else [p for p in str(raw).replace("\n", ",").split(",")]
+            items = [i for i in items if str(i).strip()]
+            try:
+                body[key] = [_one_value(f.get("item_kind", "text"), i, f.get("options") or []) for i in items][:100]
+            except (TypeError, ValueError):
+                what = {"integer": "whole numbers", "number": "numbers"}.get(f.get("item_kind", ""), "values from the list")
+                problems.append(f"'{key}' must be {what}, separated by commas")
+            continue
+        if kind == "select" and f.get("value_kind") == "integer":
+            kind = "integer"  # a picker of records: the id is a number
+        try:
+            if kind == "integer":
+                value: Any = int(float(str(raw).replace(",", "").strip()))
+                if float(str(raw).replace(",", "").strip()) != value:
+                    raise ValueError
+            elif kind == "number":
+                value = float(str(raw).replace(",", "").strip())
+                if value.is_integer():
+                    value = int(value)
+            elif kind == "boolean":
+                value = raw if isinstance(raw, bool) else str(raw).strip().lower() in ("true", "1", "yes", "on")
+            elif kind == "select":
+                match = next((o for o in f.get("options", []) if o.lower() == str(raw).strip().lower()), None)
+                if match is None:
+                    raise ValueError
+                value = match
+            else:
+                value = str(raw).strip()[:2000]
+        except (TypeError, ValueError):
+            what = {"integer": "a whole number", "number": "a number", "select": "one of " + ", ".join(f.get("options", []))}
+            problems.append(f"'{key}' must be {what.get(kind, 'valid')}")
+            continue
+        if kind in ("integer", "number"):
+            if isinstance(f.get("minimum"), (int, float)) and value < f["minimum"]:
+                problems.append(f"'{key}' must be at least {f['minimum']}")
+                continue
+            if isinstance(f.get("maximum"), (int, float)) and value > f["maximum"]:
+                problems.append(f"'{key}' must be at most {f['maximum']}")
+                continue
+        body[key] = value
+    return body, secrets, problems
+
+
 def build_path(action: Action, params: dict) -> Optional[str]:
     """Rebuild the concrete path with each path value checked and URL-quoted."""
     out, pos = [], 0

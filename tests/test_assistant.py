@@ -1112,3 +1112,213 @@ async def test_briefing_draws_each_router_with_what_it_last_reported(client, own
     s = (await client.get("/api/assistant/briefing", headers=auth(staff_token))).json()
     assert "routers" in s and "customers" not in s
     assert all(r["active_customers"] is None for r in s["routers"]["list"])
+
+
+# ---------------------------------------------------------------------------
+# Forms: a change the person completes before Confirm
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_form_card_is_completed_by_the_person_then_runs(client, owner, db):
+    reseller, token = owner
+    reseller_id = reseller.id
+    use_model([
+        tool_reply("describe_action", {"method": "POST", "path": "/api/plans/create"}, "tu_d"),
+        # only the name is known; the rest is left for the person
+        tool_reply("call_api", {"method": "POST", "path": "/api/plans/create", "form": True,
+                                "body": {"name": "Weekly 300", "connection_type": "hotspot"},
+                                "summary": "New plan"}),
+        text_reply("Fill in the plan and tap Confirm."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "Can I add a new plan"},
+                                           headers=auth(token))).text)
+    card = next(e for e in events if e["type"] == "action")
+    conv_id = events[0]["id"]
+    fields = {f["name"]: f for f in card["form"]}
+    assert fields["name"]["value"] == "Weekly 300" and fields["name"]["required"]
+    assert fields["price"]["required"] and fields["price"]["kind"] in ("number", "integer")
+    assert fields["duration_unit"]["kind"] == "select" and fields["duration_unit"]["options"] == ["MINUTES", "HOURS", "DAYS"]
+    assert [f["required"] for f in card["form"]] == sorted((f["required"] for f in card["form"]), reverse=True)
+
+    # Confirm with the price still missing: nothing runs and the card is told why
+    r = await client.post(f"/api/assistant/conversations/{conv_id}/decide", headers=auth(token), json={
+        "decisions": [{"action_id": card["action_id"], "approve": True,
+                       "values": {"speed": "5M/5M", "duration_value": "7", "duration_unit": "days"}}]})
+    refused = next(e for e in sse_events(r.text) if e["type"] == "action_result")
+    assert refused["status"] == "pending" and not refused["ok"] and "'price' is required" in refused["detail"]
+    db.expire_all()
+    assert (await db.execute(select(Plan).where(Plan.user_id == reseller_id))).scalars().all() == []
+    action = (await db.execute(select(AssistantAction))).scalars().one()
+    assert action.status == "pending"
+
+    # Completed (numbers typed as text, a select in any case): it runs once with those values
+    model = use_model([text_reply("Done: Weekly 300 is live.")])
+    r = await client.post(f"/api/assistant/conversations/{conv_id}/decide", headers=auth(token), json={
+        "decisions": [{"action_id": card["action_id"], "approve": True,
+                       "values": {"price": "300", "speed": "5M/5M", "duration_value": "7",
+                                  "duration_unit": "days", "password": "nope", "made_up": 1}}]})
+    result = next(e for e in sse_events(r.text) if e["type"] == "action_result")
+    assert result["status"] == "done" and result["ok"]
+    db.expire_all()
+    plan = (await db.execute(select(Plan).where(Plan.user_id == reseller_id))).scalars().one()
+    assert plan.name == "Weekly 300" and plan.price == 300 and plan.duration_value == 7
+    action = (await db.execute(select(AssistantAction))).scalars().one()
+    assert action.body["price"] == 300 and action.body["duration_unit"] == "DAYS"
+    assert "password" not in action.body and "made_up" not in action.body  # only the form's own fields
+    told = model.requests[0]["messages"][-1]["content"][0]["text"]
+    assert '"sent"' in told and '"price":300' in told
+
+
+def test_form_fields_keep_passwords_apart_and_read_lists():
+    from app.services.assistant.catalog import Action, apply_form_values, form_fields
+
+    action = Action(method="POST", template="/api/x", title="X", description="", tag="t", body_schema={
+        "type": "object", "required": ["name", "router_password"],
+        "properties": {
+            "name": {"type": "string"}, "router_password": {"type": "string"},
+            "limits": {"type": "object", "properties": {"a": {"type": "integer"}}},
+            "devices": {"type": "integer", "minimum": 1, "maximum": 5}, "active": {"type": "boolean"},
+            "ports": {"type": "array", "items": {"type": "string"}},
+            "minutes": {"type": "array", "items": {"type": "integer"}},
+            "confirm": {"type": "boolean"},
+        },
+    })
+    fields = form_fields(action, {"name": "A", "router_password": "should-not-echo"})
+    assert [f["name"] for f in fields] == ["name", "router_password", "devices", "active", "ports", "minutes"]
+    password = next(f for f in fields if f["name"] == "router_password")
+    assert password["kind"] == "password" and "value" not in password  # never sent back to the page
+    assert next(f for f in fields if f["name"] == "minutes")["item_kind"] == "integer"
+    body, secrets, problems = apply_form_values(action, {"name": "A"}, {
+        "devices": "9", "active": "on", "router_password": "s3cret", "ports": "ether2, ether3", "minutes": "60,1440"})
+    assert problems == ["'devices' must be at most 5"]
+    assert body == {"name": "A", "active": True, "ports": ["ether2", "ether3"], "minutes": [60, 1440]}
+    assert secrets == {"router_password": "s3cret"}  # apart from the body that is stored
+
+
+@pytest.mark.asyncio
+async def test_a_password_typed_in_a_form_is_used_once_and_kept_nowhere(client, owner, db):
+    from app.db.models import ResellerStaff
+
+    reseller, token = owner
+    reseller_id = reseller.id
+    use_model([
+        tool_reply("describe_action", {"method": "POST", "path": "/api/staff"}, "tu_d"),
+        tool_reply("call_api", {"method": "POST", "path": "/api/staff", "form": True,
+                                "body": {"name": "Jo Cashier", "email": "jo.cashier@example.com"}, "summary": "New staff"}),
+        text_reply("Fill in Jo's login and tap Confirm."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "add Jo as staff"},
+                                           headers=auth(token))).text)
+    card = next(e for e in events if e["type"] == "action")
+    conv_id = events[0]["id"]
+    pw = next(f for f in card["form"] if f["name"] == "password")
+    assert pw["kind"] == "password" and pw["required"] and "value" not in pw
+
+    model = use_model([text_reply("Jo can sign in now.")])
+    r = await client.post(f"/api/assistant/conversations/{conv_id}/decide", headers=auth(token), json={
+        "decisions": [{"action_id": card["action_id"], "approve": True,
+                       "values": {"password": "Very-Secret-91", "permissions": ["customers.view"]}}]})
+    result = next(e for e in sse_events(r.text) if e["type"] == "action_result")
+    assert result["status"] == "done", result
+    db.expire_all()
+    staff = (await db.execute(select(ResellerStaff).where(ResellerStaff.parent_reseller_id == reseller_id))).scalars().one()
+    assert staff.name == "Jo Cashier"
+    action = (await db.execute(select(AssistantAction))).scalars().one()
+    assert "password" not in (action.body or {})
+    convo = await client.get(f"/api/assistant/conversations/{conv_id}", headers=auth(token))
+    assert "Very-Secret-91" not in convo.text and "Very-Secret-91" not in r.text
+    assert "Very-Secret-91" not in json.dumps(model.requests)
+
+
+@pytest.mark.asyncio
+async def test_a_form_offers_the_persons_own_plans_and_routers_to_pick(client, owner, db):
+    reseller, token = owner
+    await make_plan(db, reseller, name="Weekly 300", price=300, duration_value=7)
+    await make_router(db, reseller, name="Main Tower")
+    await db.commit()
+    use_model([
+        tool_reply("describe_action", {"method": "POST", "path": "/api/customers/register"}, "tu_d"),
+        tool_reply("call_api", {"method": "POST", "path": "/api/customers/register", "form": True,
+                                "body": {"name": "Amina"}, "summary": "New customer"}),
+        text_reply("Fill in Amina's details and tap Confirm."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "add Amina"},
+                                           headers=auth(token))).text)
+    card = next(e for e in events if e["type"] == "action")
+    fields = {f["name"]: f for f in card["form"]}
+    plan = fields["plan_id"]
+    assert plan["kind"] == "select" and plan["value_kind"] == "integer"
+    assert list(plan["option_labels"].values()) == ["Weekly 300"]
+    if "router_id" in fields:
+        assert list(fields["router_id"]["option_labels"].values()) == ["Main Tower"]
+
+
+@pytest.mark.asyncio
+async def test_an_edit_is_a_prefilled_form_and_runs_with_what_the_person_changed(client, owner, db):
+    reseller, token = owner
+    plan = await make_plan(db, reseller, name="Weekly 300", price=300, duration_value=7)
+    plan_id = plan.id
+    await db.commit()
+    current = {"name": "Weekly 300", "speed": "5M/5M", "price": 350, "duration_value": 7,
+               "duration_unit": "DAYS", "connection_type": "hotspot"}
+    use_model([
+        tool_reply("describe_action", {"method": "PUT", "path": "/api/plans/{plan_id}"}, "tu_d"),
+        # no form flag: an edit is shown as a form anyway, filled with what the model sent
+        tool_reply("call_api", {"method": "PUT", "path": f"/api/plans/{plan_id}", "body": current,
+                                "summary": "Weekly 300 to KES 350"}),
+        text_reply("Check the plan and tap Confirm."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "weekly to 350"},
+                                           headers=auth(token))).text)
+    card = next(e for e in events if e["type"] == "action")
+    assert {f["name"]: f.get("value") for f in card["form"]}["price"] == 350
+    conv_id = events[0]["id"]
+    use_model([text_reply("Weekly 300 now costs KES 320.")])
+    r = await client.post(f"/api/assistant/conversations/{conv_id}/decide", headers=auth(token), json={
+        "decisions": [{"action_id": card["action_id"], "approve": True, "values": {"price": "320"}}]})
+    result = next(e for e in sse_events(r.text) if e["type"] == "action_result")
+    assert result["status"] == "done", result
+    db.expire_all()
+    assert (await db.get(Plan, plan_id)).price == 320  # what the person typed, not what was proposed
+
+
+@pytest.mark.asyncio
+async def test_a_delete_waits_for_confirm_then_removes_the_record(client, owner, db):
+    reseller, token = owner
+    plan = await make_plan(db, reseller, name="Old Promo", price=10, duration_value=1)
+    plan_id = plan.id
+    await db.commit()
+    use_model([
+        tool_reply("describe_action", {"method": "DELETE", "path": "/api/plans/{plan_id}"}, "tu_d"),
+        tool_reply("call_api", {"method": "DELETE", "path": f"/api/plans/{plan_id}", "summary": "Delete Old Promo"}),
+        text_reply("Ready to delete Old Promo. Tap Confirm."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "delete old promo"},
+                                           headers=auth(token))).text)
+    card = next(e for e in events if e["type"] == "action")
+    assert card["method"] == "DELETE" and not card.get("form")  # nothing to fill in: a plain, red confirm
+    assert await db.get(Plan, plan_id) is not None  # still there until Confirm
+    conv_id = events[0]["id"]
+    use_model([text_reply("Old Promo is deleted.")])
+    r = await client.post(f"/api/assistant/conversations/{conv_id}/decide", headers=auth(token),
+                          json={"decisions": [{"action_id": card["action_id"], "approve": True}]})
+    result = next(e for e in sse_events(r.text) if e["type"] == "action_result")
+    assert result["status"] == "done", result
+    db.expire_all()
+    gone = await db.get(Plan, plan_id)
+    assert gone is None or getattr(gone, "is_deleted", False) or getattr(gone, "deleted_at", None) is not None
+
+
+@pytest.mark.asyncio
+async def test_saying_a_form_is_ready_without_one_is_sent_back_once(client, owner, db):
+    _, token = owner
+    model = use_model([
+        text_reply("You need a plan first. Fill it in and tap Confirm."),   # nothing proposed
+        tool_reply("describe_action", {"method": "POST", "path": "/api/plans/create"}, "tu_d"),
+        tool_reply("call_api", {"method": "POST", "path": "/api/plans/create", "form": True, "body": {}}),
+        text_reply("The plan form is below."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "Generate 10 vouchers"},
+                                           headers=auth(token))).text)
+    assert any(e["type"] == "action" and e.get("form") for e in events)
+    assert "[Check]" in json.dumps(model.requests[1]["messages"][-1])

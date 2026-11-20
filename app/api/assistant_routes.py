@@ -12,11 +12,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.config import settings
 from app.services.assistant import briefing, home, store, usage
@@ -84,6 +84,15 @@ def _check_images(images: list[ImageIn]) -> list[dict]:
 class Decision(BaseModel):
     action_id: str = Field(..., max_length=36)
     approve: bool
+    # what the person filled in on a form card; checked against the action's schema
+    values: Optional[dict[str, Any]] = None
+
+    @field_validator("values")
+    @classmethod
+    def _small(cls, v):
+        if v is not None and (len(v) > 40 or len(json.dumps(v, default=str)) > 20_000):
+            raise ValueError("too many values")
+        return v
 
 
 class DecideRequest(BaseModel):
