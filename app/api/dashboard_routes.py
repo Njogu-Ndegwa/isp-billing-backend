@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, extract, case, distinct
 from sqlalchemy.orm import selectinload
 from typing import Optional
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone as dt_timezone
 from collections import defaultdict
 
 from app.db.database import get_db
@@ -17,6 +17,7 @@ from app.db.models import (
 from app.services.auth import verify_token, get_current_user
 from app.services.markets import REPORTING_CURRENCY, reseller_market, sql_kes_by_market
 from app.services.subscription import get_invoice_alert_for_user
+from app.services.subscription_reminders import _zone as market_zone
 from app.services.payment_plan import payment_plan_id
 from app.services.router_helpers import get_router_by_id
 from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address, validate_mac_address
@@ -302,6 +303,21 @@ async def get_dashboard_overview(
         raise HTTPException(status_code=500, detail=f"Failed to fetch dashboard: {str(e)}")
 
 
+def _utcnow() -> datetime:
+    """Current naive UTC time; a seam so tests can pin the clock."""
+    return datetime.utcnow()
+
+
+def _utc_to_local(utc_naive: datetime, zone) -> datetime:
+    """Naive UTC (how the DB stores times) -> naive wall time in ``zone``."""
+    return utc_naive.replace(tzinfo=dt_timezone.utc).astimezone(zone).replace(tzinfo=None)
+
+
+def _local_to_utc(local_naive: datetime, zone) -> datetime:
+    """Naive wall time in ``zone`` -> naive UTC for DB comparisons."""
+    return local_naive.replace(tzinfo=zone).astimezone(dt_timezone.utc).replace(tzinfo=None)
+
+
 @router.get("/api/dashboard/analytics")
 async def get_dashboard_analytics(
     router_id: Optional[int] = None,
@@ -327,8 +343,14 @@ async def get_dashboard_analytics(
         user = await get_current_user(token, db)
         user_id = user.id
         
-        now = datetime.utcnow()
-        today_start = datetime(now.year, now.month, now.day)
+        # Days are the reseller's local calendar days (market timezone, EAT
+        # by default): "Today" starts at local midnight, not UTC midnight,
+        # which is 03:00 in Kenya. All window maths below is in local naive
+        # time; only the DB filter is converted back to UTC.
+        zone = market_zone(reseller_market(user).timezone)
+        now = _utcnow()
+        now_local = _utc_to_local(now, zone)
+        today_start = datetime(now_local.year, now_local.month, now_local.day)
         today_end = today_start + timedelta(days=1)
         
         # Determine date range based on params (priority: dates > preset > days)
@@ -349,12 +371,12 @@ async def get_dashboard_analytics(
                     today_start - timedelta(days=today_start.weekday() + 7),
                     today_start - timedelta(days=today_start.weekday())
                 ),
-                "this_month": (datetime(now.year, now.month, 1), today_end),
+                "this_month": (datetime(now_local.year, now_local.month, 1), today_end),
                 "last_month": (
-                    datetime(now.year, now.month, 1) - timedelta(days=1),
-                    datetime(now.year, now.month, 1)
+                    datetime(now_local.year, now_local.month, 1) - timedelta(days=1),
+                    datetime(now_local.year, now_local.month, 1)
                 ),
-                "this_year": (datetime(now.year, 1, 1), today_end),
+                "this_year": (datetime(now_local.year, 1, 1), today_end),
                 "last_7_days": (today_start - timedelta(days=6), today_end),
                 "last_30_days": (today_start - timedelta(days=29), today_end),
                 "last_90_days": (today_start - timedelta(days=89), today_end),
@@ -362,12 +384,12 @@ async def get_dashboard_analytics(
             }
             # Fix last_month to get correct range
             if preset == "last_month":
-                first_of_this_month = datetime(now.year, now.month, 1)
+                first_of_this_month = datetime(now_local.year, now_local.month, 1)
                 last_month_end = first_of_this_month
-                if now.month == 1:
-                    last_month_start = datetime(now.year - 1, 12, 1)
+                if now_local.month == 1:
+                    last_month_start = datetime(now_local.year - 1, 12, 1)
                 else:
-                    last_month_start = datetime(now.year, now.month - 1, 1)
+                    last_month_start = datetime(now_local.year, now_local.month - 1, 1)
                 presets["last_month"] = (last_month_start, last_month_end)
             
             if preset not in presets:
@@ -395,8 +417,8 @@ async def get_dashboard_analytics(
             Plan, Plan.id == payment_plan_id()
         ).where(
             CustomerPayment.reseller_id == user_id,
-            CustomerPayment.created_at >= filter_start,
-            CustomerPayment.created_at < filter_end
+            CustomerPayment.created_at >= _local_to_utc(filter_start, zone),
+            CustomerPayment.created_at < _local_to_utc(filter_end, zone)
         )
         if router_id:
             payments_stmt = payments_stmt.where(func.coalesce(CustomerPayment.router_id, Customer.router_id) == router_id)
@@ -438,8 +460,10 @@ async def get_dashboard_analytics(
         unique_customers_set = set()
         
         for payment, customer, plan in all_payments:
-            date_key = payment.created_at.strftime("%Y-%m-%d")
-            hour = payment.created_at.hour
+            # Bucket by the reseller's local day/hour, not the UTC one.
+            created_local = _utc_to_local(payment.created_at, zone)
+            date_key = created_local.strftime("%Y-%m-%d")
+            hour = created_local.hour
             amount = float(payment.amount)
             # Compensation vouchers are free: counted and listed, but never revenue.
             rev_amount = amount if payment.counts_as_revenue else 0.0
@@ -450,6 +474,8 @@ async def get_dashboard_analytics(
             
             day = daily_data[date_key]
             day["transactions"].append({
+                # Kept in UTC: the admin UI shifts this to local itself
+                # (formatTimeGMT3), so a local value would be shifted twice.
                 "time": payment.created_at.strftime("%H:%M:%S"),
                 "amount": amount,
                 "phone": phone[-4:] if phone else "unknown",
