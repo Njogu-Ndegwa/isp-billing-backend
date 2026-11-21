@@ -1392,6 +1392,81 @@ async def test_active_customers_can_be_filtered_by_when_their_time_ends(client, 
 
 
 @pytest.mark.asyncio
+async def test_the_customer_list_filters_on_the_server(client, owner, db):
+    from datetime import datetime, timedelta as td
+
+    from app.db.models import CustomerStatus
+
+    reseller, token = owner
+    plan = await make_plan(db, reseller, name="Weekly 300", price=300, duration_value=7)
+    now = datetime.utcnow()
+    await make_customer(db, reseller, plan, name="Paid Up", phone="254700000001",
+                        status=CustomerStatus.ACTIVE, expiry=now + td(days=3))
+    await make_customer(db, reseller, plan, name="Ran Out", phone="254700000002",
+                        status=CustomerStatus.ACTIVE, expiry=now - td(hours=2))
+    await make_customer(db, reseller, plan, name="Gone", phone="254700000003",
+                        status=CustomerStatus.INACTIVE, expiry=now - td(days=9))
+    pppoe = await make_customer(db, reseller, plan, name="Home Line", phone="254711222333",
+                                status=CustomerStatus.ACTIVE, expiry=now + td(days=20))
+    pppoe.pppoe_username = "home01"
+    await db.commit()
+
+    async def names(q):
+        r = await client.get(f"/api/customers?{q}", headers=auth(token))
+        assert r.status_code == 200, r.text
+        return sorted(c["name"] for c in r.json())
+
+    assert await names("status=active") == ["Home Line", "Paid Up", "Ran Out"]
+    assert await names("status=inactive") == ["Gone"]
+    assert await names("status=active&overdue=false") == ["Home Line", "Paid Up"]
+    assert await names("overdue=true") == ["Gone", "Ran Out"]
+    assert await names("connection_type=pppoe") == ["Home Line"]
+    assert await names("connection_type=hotspot&status=active") == ["Paid Up", "Ran Out"]
+    assert await names("search=0711222333") == ["Home Line"]
+    assert await names("search=paid") == ["Paid Up"]
+    assert (await client.get("/api/customers?status=happy", headers=auth(token))).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_the_router_list_keeps_only_online_or_offline_ones(client, owner, db, monkeypatch):
+    from app.api import router_management
+
+    reseller, token = owner
+    await make_router(db, reseller, name="Up One")
+    await make_router(db, reseller, name="Down One")
+    await db.commit()
+    monkeypatch.setattr(router_management, "build_router_status",
+                        lambda r, now=None: {"status": "offline" if r.name.startswith("Down") else "online"})
+
+    async def names(q):
+        r = await client.get(f"/api/routers{q}", headers=auth(token))
+        assert r.status_code == 200, r.text
+        return [x["name"] for x in r.json()]
+
+    assert await names("?status=offline") == ["Down One"]
+    assert await names("?status=online") == ["Up One"]
+    assert sorted(await names("")) == ["Down One", "Up One"]
+
+
+@pytest.mark.asyncio
+async def test_a_filter_an_action_does_not_have_is_refused_not_ignored(client, owner, db):
+    """"Active customers" once came back with inactive ones: the unknown filter was
+    dropped and the whole list drawn. Now nothing runs and the model is told why."""
+    reseller, token = owner
+    await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    await db.commit()
+    model = use_model([
+        tool_reply("call_api", {"method": "GET", "path": "/api/plans", "query": {"colour": "blue"}, "show": "table"}, "tu_1"),
+        text_reply("Plans have no colour."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "blue plans?"},
+                                           headers=auth(token))).text)
+    assert not [e for e in events if e["type"] == "data"]   # nothing unfiltered reached the screen
+    told = [res for req in model.requests for res in tool_results(req)]
+    assert any("has no filter colour" in (r.get("error") or "") for r in told), told
+
+
+@pytest.mark.asyncio
 async def test_the_model_is_told_the_local_time_and_what_is_wrong_with_the_account(client, owner, db):
     from datetime import datetime, timedelta as td
 
