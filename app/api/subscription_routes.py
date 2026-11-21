@@ -12,7 +12,7 @@ from app.db.models import (
     User, UserRole, Subscription, SubscriptionFreeSetupGrant, SubscriptionInvoice,
     SubscriptionPayment, SubscriptionStatus, InvoiceStatus, SubscriptionPaymentStatus,
     B2BTransaction, B2BTransactionStatus, ResellerPaymentMethod,
-    ResellerPaymentMethodType,
+    ResellerPaymentMethodType, SmsCreditOrder, SmsCreditOrderStatus,
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import (
@@ -923,12 +923,25 @@ async def _paystack_card_settlement(
 
 
 async def _subscription_collection_summary(db: AsyncSession) -> dict:
-    total_collected = float((await db.execute(
+    subscription_collected = float((await db.execute(
         select(func.coalesce(func.sum(SubscriptionPayment.amount), 0)).where(
             SubscriptionPayment.status == SubscriptionPaymentStatus.COMPLETED,
             _IN_MPESA_SHORTCODE,
         )
     )).scalar() or 0)
+    # SMS credits are bought by STK push to the same platform shortcode
+    # (messaging_routes.buy_credits), so that money sits in the paybill next to
+    # subscription payments and is Bitwave's to send on. Every completed order
+    # counts here, own reseller accounts included: the money is in the paybill
+    # whoever paid it.
+    sms_row = (await db.execute(
+        select(
+            func.coalesce(func.sum(SmsCreditOrder.amount), 0),
+            func.count(SmsCreditOrder.id),
+        ).where(SmsCreditOrder.status == SmsCreditOrderStatus.COMPLETED)
+    )).one()
+    sms_collected = float(sms_row[0] or 0)
+    total_collected = subscription_collected + sms_collected
     transfers = await _subscription_owner_transfer_totals(db)
     available = round(
         total_collected - transfers["completed_gross"] - transfers["pending_gross"],
@@ -941,6 +954,9 @@ async def _subscription_collection_summary(db: AsyncSession) -> dict:
     return {
         "paybill_collected": round(total_collected, 2),
         "total_collected": round(total_collected, 2),
+        "subscription_collected": round(subscription_collected, 2),
+        "sms_collected": round(sms_collected, 2),
+        "sms_orders": int(sms_row[1] or 0),
         "completed_sent": transfers["completed_gross"],
         "pending_send": transfers["pending_gross"],
         "completed_bank_net": transfers["completed_net"],
@@ -1174,7 +1190,7 @@ async def admin_subscription_collections(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Summarize subscription collections and the amount not yet sent to the owner bank."""
+    """Summarize paybill collections (subscriptions + SMS credit sales) and the amount not yet sent to the owner bank."""
     await _require_admin(token, db)
     return await _subscription_collection_summary(db)
 
@@ -1253,12 +1269,12 @@ async def admin_send_subscription_collections_to_bank(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Initiate a B2B transfer for completed subscription payments not yet sent/reserved."""
+    """Initiate a B2B transfer for completed subscription payments and SMS credit sales not yet sent/reserved."""
     admin = await _require_admin(token, db)
     summary = await _subscription_collection_summary(db)
     amount = summary["available_to_send"]
     if amount <= 0:
-        raise HTTPException(status_code=400, detail="No completed subscription collections available to send")
+        raise HTTPException(status_code=400, detail="No completed subscription or SMS collections available to send")
 
     destination = await _get_owner_destination(db, admin.id, request.payment_method_id)
     if not destination:
@@ -1282,7 +1298,7 @@ async def admin_send_subscription_collections_to_bank(
             amount=amount,
             party_b=party_b,
             account_reference=account_ref,
-            remarks=f"Subscription collections to {destination.label}",
+            remarks=f"Subscription + SMS collections to {destination.label}",
             fee=fee_preview["total_fee"],
             triggered_by=SUBSCRIPTION_OWNER_TRIGGER,
         )
