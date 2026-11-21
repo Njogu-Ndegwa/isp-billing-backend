@@ -1553,6 +1553,22 @@ def _page_envelope(items: list, page: int, per_page: int, total: int) -> dict:
     }
 
 
+async def _online_condition(db: AsyncSession, user, online: bool):
+    """Who is connected right now, from the routers' live reports (no RouterOS calls):
+    the same answer as the Customers page's Online filter."""
+    from app.api.usage_routes import _live_for, _live_router_ids_for
+
+    router_ids = await _live_router_ids_for(db, user)
+    if not router_ids:
+        return Customer.id.in_([])   # no live router: nobody can be said to be on or off
+    on_live = (await db.execute(
+        select(Customer).options(selectinload(Customer.plan))
+        .where(Customer.user_id == user.id, Customer.router_id.in_(router_ids))
+    )).scalars().all()
+    ids = [c.id for c in on_live if ((live := _live_for(c)) is not None and live.online) == online]
+    return Customer.id.in_(ids)
+
+
 def _list_filters(status, connection_type, overdue, search, now) -> list:
     """The narrowing the Customers list can do on the server, so a question like
     "my active customers" gets only those (an unknown filter used to be ignored
@@ -1596,6 +1612,9 @@ async def get_customers_api(
                        Query(description="true: only those whose paid time has run out (paused ones excluded); false: leave them out")] = None,
     search: Annotated[Optional[str],
                       Query(max_length=80, description="Name, phone, account number or PPPoE username contains this")] = None,
+    online: Annotated[Optional[bool],
+                      Query(description=("true: only customers connected right now; false: only those not connected. "
+                                         "Covers routers on live reporting; customers on other routers are left out."))] = None,
     page: Annotated[Optional[int], Query(ge=1)] = None,
     per_page: Annotated[Optional[int], Query(ge=1, le=CUSTOMER_LIST_MAX_PER_PAGE)] = None,
     db: AsyncSession = Depends(get_db),
@@ -1629,6 +1648,8 @@ async def get_customers_api(
         elif tier_filter == "visitor":
             conditions.append(~has_paid)
         conditions.extend(_list_filters(status, connection_type, overdue, search, now))
+        if online is not None:
+            conditions.append(await _online_condition(db, user, online))
         stmt = (
             select(Customer, has_paid.label("has_paid"))
             .where(*conditions)
