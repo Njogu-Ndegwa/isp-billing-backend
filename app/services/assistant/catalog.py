@@ -436,8 +436,86 @@ def _field_label(key: str) -> str:
     return (words[:1].upper() + words[1:]) if words else key
 
 
-def form_fields(action: Action, body: Any) -> Optional[list[dict]]:
-    """The editable fields of a change, in the order a person fills them: required first."""
+# -- fields that belong to one choice ------------------------------------------
+#
+# One request model often serves several kinds of thing: a payment method is a bank
+# account, a till, an MTN wallet..., each with its own fields. The API says which
+# fields go with which choice in the schema itself:
+#
+#     "x-fields-for":   {"method_type": {"mpesa_till": ["mpesa_till_number"], ...}}
+#     "x-required-for": {"method_type": {"mpesa_till": ["mpesa_till_number"], ...}}
+#
+# and a form shows only the fields of the chosen kind. When the person can still
+# change the choice in the form, each such field carries "when" and the page shows it
+# only while that choice is picked. A field listed under no choice is always shown.
+
+def choice_groups(schema: Any) -> dict[str, dict[str, list[str]]]:
+    spec = schema.get("x-fields-for") if isinstance(schema, dict) else None
+    if not isinstance(spec, dict):
+        return {}
+    return {choice: {str(v): list(m or []) for v, m in groups.items()}
+            for choice, groups in spec.items() if isinstance(groups, dict)}
+
+
+def _owners(groups: dict[str, list[str]]) -> dict[str, list[str]]:
+    owners: dict[str, list[str]] = {}
+    for value, members in groups.items():
+        for name in members:
+            owners.setdefault(name, []).append(value)
+    return owners
+
+
+def _chosen(choice: str, current: dict, context: Optional[dict]) -> Optional[str]:
+    for source in (current, context or {}):
+        value = source.get(choice)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _fit_to_choices(schema: dict, fields: list[dict], current: dict, context: Optional[dict]) -> list[dict]:
+    needs = schema.get("x-required-for") if isinstance(schema.get("x-required-for"), dict) else {}
+    on_form = {f["name"] for f in fields}
+    for choice, groups in choice_groups(schema).items():
+        owners = _owners(groups)
+        need = {str(v): set(m or []) for v, m in (needs.get(choice) or {}).items()}
+        chosen = _chosen(choice, current, context)
+        kept = []
+        for f in fields:
+            if f["name"] == choice and chosen is not None and f.get("value") is None:
+                f = {**f, "value": chosen}  # an edit: the record's own choice
+            values = owners.get(f["name"])
+            if values is None:
+                kept.append(f)
+            elif choice in on_form:  # the person may still change it: the page decides
+                required = all(f["name"] in need.get(v, ()) for v in values)
+                kept.append({**f, "when": {choice: values}, **({"required": True} if required else {})})
+            elif chosen is None:
+                kept.append(f)  # unknown kind: nothing to go by, show everything as before
+            elif chosen.lower() in {v.lower() for v in values}:
+                kept.append({**f, **({"required": True} if f["name"] in need.get(chosen, ()) else {})})
+        fields = kept
+    return fields
+
+
+def drop_unchosen(schema: Any, body: dict, context: Optional[dict] = None) -> dict:
+    """Leave out values for fields of a kind that was not chosen (typed, then switched)."""
+    out = dict(body)
+    for choice, groups in choice_groups(schema).items():
+        chosen = _chosen(choice, out, context)
+        if chosen is None:
+            continue
+        for name, values in _owners(groups).items():
+            if chosen.lower() not in {v.lower() for v in values}:
+                out.pop(name, None)
+    return out
+
+
+def form_fields(action: Action, body: Any, context: Optional[dict] = None) -> Optional[list[dict]]:
+    """The editable fields of a change, in the order a person fills them: required first.
+
+    context: the record being edited, when known, for fields that depend on its kind.
+    """
     from app.services.assistant.shaping import is_secret_key
 
     schema = action.body_schema
@@ -488,8 +566,17 @@ def form_fields(action: Action, body: Any) -> Optional[list[dict]]:
         elif prop.get("default") is not None:
             f["value"] = prop["default"]
         out.append(f)
+    out = _fit_to_choices(schema, out, current, context)
     out.sort(key=lambda f: not f["required"])  # stable: required first, schema order within
-    return out[:FORM_FIELD_LIMIT] or None
+    # the limit is what is on screen at once: fields of one kind are shown one kind at a time
+    shown, kept = 0, []
+    for f in out:
+        if "when" not in f:
+            shown += 1
+            if shown > FORM_FIELD_LIMIT:
+                continue
+        kept.append(f)
+    return kept or None
 
 
 def _one_value(kind: str, raw: Any, options: list) -> Any:
@@ -510,7 +597,8 @@ def _one_value(kind: str, raw: Any, options: list) -> Any:
     return str(raw).strip()[:2000]
 
 
-def apply_form_values(action: Action, base: Any, values: dict) -> tuple[dict, dict, list[str]]:
+def apply_form_values(action: Action, base: Any, values: dict,
+                      context: Optional[dict] = None) -> tuple[dict, dict, list[str]]:
     """Merge what the person typed into the proposed body, typed by the schema.
 
     Only the form's own fields are taken (nothing the form did not offer); an emptied
@@ -518,7 +606,7 @@ def apply_form_values(action: Action, base: Any, values: dict) -> tuple[dict, di
     request and then forgotten. Returns (body, secrets, problems), e.g. a problem
     "'price' must be a number".
     """
-    fields = {f["name"]: f for f in (form_fields(action, base) or [])}
+    fields = {f["name"]: f for f in (form_fields(action, base, context) or [])}
     body = dict(base) if isinstance(base, dict) else {}
     secrets: dict = {}
     problems: list[str] = []
@@ -575,6 +663,15 @@ def apply_form_values(action: Action, base: Any, values: dict) -> tuple[dict, di
                 problems.append(f"'{key}' must be at most {f['maximum']}")
                 continue
         body[key] = value
+    # a field of a kind that was not chosen (typed, then the kind switched) is not sent
+    body = drop_unchosen(action.body_schema, body, context)
+    secrets = {k: v for k, v in secrets.items() if k in drop_unchosen(action.body_schema, {**body, k: v}, context)}
+    for f in form_fields(action, body, context) or []:
+        # the chosen kind's own required fields, which the schema alone cannot require
+        when = f.get("when") or {}
+        if f.get("required") and when and f["kind"] != "password" and body.get(f["name"]) in (None, ""):
+            if all(str(body.get(c, "")).lower() in {v.lower() for v in vs} for c, vs in when.items()):
+                problems.append(f"'{f['name']}' is required")
     return body, secrets, problems
 
 

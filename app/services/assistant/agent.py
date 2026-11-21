@@ -25,7 +25,9 @@ from app.config import settings
 from app.services.assistant import executor, shaping, store
 from app.services.assistant.usage import TurnUsage
 from app.services.assistant.caller import Caller
-from app.services.assistant.catalog import Action, Catalog, apply_form_values, body_problems, build_path, form_fields, get_catalog
+from app.services.assistant.catalog import (
+    Action, Catalog, apply_form_values, body_problems, build_path, choice_groups, form_fields, get_catalog,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -745,6 +747,27 @@ class Turn:
             if "value" in f:
                 f["value"] = str(f["value"])
 
+    async def _record_kind(self, action: Action, method: str, path: str, body: Any) -> Optional[dict]:
+        """For an edit whose fields depend on what kind of record it is (a till or a bank
+        account, a photo or a video ad...) and the change does not say: the record's kind."""
+        if method not in ("PUT", "PATCH"):
+            return None
+        given = body if isinstance(body, dict) else {}
+        missing = [c for c in choice_groups(action.body_schema) if given.get(c) in (None, "")]
+        if not missing:
+            return None
+        try:
+            result = await executor.call_api(self.app, self.caller, "GET", path, None, None)
+        except Exception:
+            logger.warning("[assistant] could not read %s for its kind", path, exc_info=True)
+            return None
+        data = result.data if result.ok else None
+        if isinstance(data, dict) and len(data) == 1 and isinstance(next(iter(data.values())), dict):
+            data = next(iter(data.values()))  # {"payment_method": {...}}
+        if not isinstance(data, dict):
+            return None
+        return {c: data[c] for c in missing if data.get(c) not in (None, "")} or None
+
     async def _choices(self, path: str) -> list[tuple[str, str]]:
         if path not in self._choice_cache:
             out: list[tuple[str, str]] = []
@@ -769,7 +792,8 @@ class Turn:
         spec, _ = self.catalog.match(action["method"], action["path"])
         if spec is None:
             return True
-        body, typed_secrets, problems = apply_form_values(spec, action.get("body"), values)
+        context = await self._record_kind(spec, action["method"], action["path"], action.get("body"))
+        body, typed_secrets, problems = apply_form_values(spec, action.get("body"), values, context)
         problems += body_problems(spec, {**body, **typed_secrets})
         before = action.get("body") if isinstance(action.get("body"), dict) else {}
         for name in ("customer_ids",):
@@ -1071,7 +1095,8 @@ class Turn:
         problems = body_problems(action, body)
         if form:  # the person fills in what is missing
             problems = [p for p in problems if not p.endswith("is required") and p != "this action needs a JSON body"]
-        fields_for_form = form_fields(action, body) if editable and body is not None else None
+        context = await self._record_kind(action, method, path, body) if editable and body is not None else None
+        fields_for_form = form_fields(action, body, context) if editable and body is not None else None
         if fields_for_form:
             await self._offer_choices(fields_for_form)
         if problems:

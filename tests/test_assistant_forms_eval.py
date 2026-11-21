@@ -48,6 +48,25 @@ async def _full(db, reseller):
                     connection_type=ConnectionType.PPPOE, speed="10M/10M")
 
 
+async def _with_bank(db, reseller):
+    """Paid out to a bank account, no till yet."""
+    from app.db.models import ResellerPaymentMethod, ResellerPaymentMethodType
+
+    await _full(db, reseller)
+    db.add(ResellerPaymentMethod(user_id=reseller.id, method_type=ResellerPaymentMethodType.BANK_ACCOUNT,
+                                 label="Equity Bank", bank_paybill_number="247247",
+                                 bank_account_number="0170299999999", is_active=True))
+
+
+async def _with_till(db, reseller):
+    """Paid out to an M-Pesa till already."""
+    from app.db.models import ResellerPaymentMethod, ResellerPaymentMethodType
+
+    await _full(db, reseller)
+    db.add(ResellerPaymentMethod(user_id=reseller.id, method_type=ResellerPaymentMethodType.MPESA_TILL,
+                                 label="Shop Till", mpesa_till_number="123456", is_active=True))
+
+
 async def _with_customer(db, reseller):
     router = await make_router(db, reseller, name="Main Tower")
     plan = await make_plan(db, reseller, name="Weekly 300", price=300, duration_value=7)
@@ -110,6 +129,18 @@ def form_for(path_start: str, **prefilled):
             if got is None or (want is not ... and str(want).lower() not in str(got).lower()):
                 return f"{k} should be filled with {want!r}, got {got!r}"
         return None
+    return check
+
+
+def shows_only(*names, never=()):
+    """What the person sees on the form (fields of the chosen kind only): these, and none of `never`."""
+    def check(row):
+        seen = set(row.get("visible") or [])
+        missing = [n for n in names if n not in seen]
+        wrong = sorted(n for n in seen if any(n.startswith(p) for p in never))
+        if missing:
+            return f"form should show {', '.join(missing)}"
+        return f"form shows fields of another kind: {', '.join(wrong)}" if wrong else None
     return check
 
 
@@ -202,6 +233,38 @@ CASES = [
      form_for("/api/access-credentials")),
     (_full, "Add a staff member who can only see customers", form_for("/api/staff")),
     (_full, "Add an M-Pesa till for my payments", form_for("/api/payment-methods")),
+    # payment methods: one request model, seven kinds; the form must show the chosen kind only
+    (_full, "Change my payment method to M-Pesa till 123456",
+     all_of(form_for("/api/payment-methods", method_type="mpesa_till"),
+            shows_only("mpesa_till_number", never=("bank_", "mtn_", "fapshi_", "zenopay_", "mpesa_shortcode", "mpesa_paybill")))),
+    (_with_bank, "I want my customers' money to go to my till 654321 instead of the bank",
+     all_of(form_for("/api/payment-methods", method_type="mpesa_till"),
+            shows_only("mpesa_till_number", never=("bank_", "mtn_", "fapshi_", "zenopay_")))),
+    (_with_till, "Change my till number to 778899",
+     all_of(form_for("/api/payment-methods/", mpesa_till_number="778899"),
+            shows_only("mpesa_till_number", never=("bank_", "mtn_", "fapshi_", "zenopay_", "mpesa_shortcode")))),
+    (_with_bank, "Change my bank account number to 0170211111111",
+     all_of(form_for("/api/payment-methods/", bank_account_number="0170211111111"),
+            shows_only("bank_account_number", never=("mpesa_", "mtn_", "fapshi_", "zenopay_")))),
+    (_with_bank, "Rename my Equity Bank payment method to Equity Main",
+     all_of(form_for("/api/payment-methods/", label="Equity Main"), shows_only(never=("mpesa_", "mtn_", "fapshi_")))),
+    (_full, "Weka paybill yangu 222111 ndio wateja walipe",
+     all_of(form_for("/api/payment-methods", method_type="mpesa_paybill"),
+            shows_only("mpesa_paybill_number", never=("bank_", "mtn_", "fapshi_", "mpesa_till")))),
+    (_full, "Set up M-Pesa payments with my own Daraja keys, shortcode 600999",
+     all_of(form_for("/api/payment-methods", method_type="mpesa_paybill_with_keys"),
+            shows_only("mpesa_shortcode", "mpesa_passkey", never=("bank_", "mtn_", "fapshi_", "mpesa_till")))),
+    (_full, "Add MTN Mobile Money so my customers in Uganda can pay",
+     all_of(form_for("/api/payment-methods", method_type="mtn_momo"),
+            shows_only("mtn_api_user", never=("bank_", "mpesa_", "fapshi_")))),
+    (_full, "Customers should pay into my bank: Equity paybill 247247, account 0170288888888",
+     all_of(form_for("/api/payment-methods", method_type="bank_account"),
+            shows_only("bank_paybill_number", "bank_account_number", never=("mpesa_", "mtn_", "fapshi_")))),
+    # ads: a photo ad and a video ad have different fields
+    (_full, "Create a video ad for my phone shop, Kahawa Phones, 0712000111",
+     all_of(form_for("/api/ads"), shows_only("video_url", never=("image_url",)))),
+    (_full, "Make a photo ad for Mama Mboga groceries, call 0712000222",
+     all_of(form_for("/api/ads"), shows_only("image_url", never=("video_url", "poster_url")))),
     # messaging: texting customers, templates, automatic messages, credits, own provider
     (_messaging, "Send an SMS to all my active customers saying we have maintenance tonight from 10pm",
      form_for("/api/messaging/send", filter="active")),
@@ -228,6 +291,10 @@ CASES = [
     (_ending_soon, "How many customers do I have?", all_of(answers_without_a_card, guides_to("subscription"))),
     (_ending_soon, "How much do I owe Bitwave?", guides_to("1,500", "1500")),
 ]
+
+
+def _value(card, name):
+    return next((f.get("value") for f in card.get("form", []) if f["name"] == name), "")
 
 
 def _asks_in_text(text: str) -> bool:
@@ -274,6 +341,10 @@ async def test_add_and_edit_requests_come_back_as_forms(client, owner, db, monke
         "prefilled": {f["name"]: f.get("option_labels", {}).get(str(f["value"]), f["value"])
                       for f in (form_card or {}).get("form", []) if "value" in f} if form_card else None,
         "pickers": [f["name"] for f in (form_card or {}).get("form", []) if f.get("option_labels")] if form_card else None,
+        # what the page shows: fields without a condition, and those whose choice is the one picked
+        "visible": [f["name"] for f in (form_card or {}).get("form", [])
+                    if all(str(_value(form_card, c)).lower() in {v.lower() for v in vs}
+                           for c, vs in (f.get("when") or {}).items())] if form_card else None,
         "asked_in_text": _asks_in_text(text),
         # the worst failure: saying a form is ready when none was made
         "claimed_without_card": not cards and bool(re.search(

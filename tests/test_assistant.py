@@ -1465,3 +1465,71 @@ async def test_words_written_next_to_a_lookup_are_taken_back_and_times_come_loca
     events = sse_events((await client.post("/api/assistant/chat", json={"message": "my plans"},
                                            headers=auth(token))).text)
     assert visible_text(events) == "Here are your plans."
+
+
+def test_a_form_shows_only_the_fields_of_the_chosen_kind():
+    """One request model, many kinds (a till, a bank account, MTN...): the API says which
+    fields go with which kind, and a form shows only those, whatever the request is for."""
+    from app.services.assistant.catalog import Action, apply_form_values, form_fields
+
+    schema = {
+        "type": "object", "required": ["kind", "label"],
+        "properties": {"kind": {"type": "string", "enum": ["till", "bank"]}, "label": {"type": "string"},
+                       "till_number": {"type": "string"}, "bank_account": {"type": "string"},
+                       "bank_api_key": {"type": "string"}, "note": {"type": "string"}},
+        "x-fields-for": {"kind": {"till": ["till_number"], "bank": ["bank_account", "bank_api_key"]}},
+        "x-required-for": {"kind": {"till": ["till_number"], "bank": ["bank_account"]}},
+    }
+    add = _action("POST", "/api/things", schema)
+    fields = {f["name"]: f for f in form_fields(add, {"kind": "till", "label": "Shop"})}
+    # the person can still switch the kind on the form: the page shows each kind's fields with it
+    assert fields["till_number"]["when"] == {"kind": ["till"]} and fields["till_number"]["required"]
+    assert fields["bank_account"]["when"] == {"kind": ["bank"]}
+    assert "when" not in fields["note"] and "when" not in fields["label"]
+
+    # typed into the bank fields, then chose a till: the bank values are not sent
+    body, secrets, problems = apply_form_values(add, {"kind": "till", "label": "Shop"}, {
+        "kind": "till", "label": "Shop", "till_number": "123456", "bank_account": "999", "bank_api_key": "s3cret"})
+    assert body == {"kind": "till", "label": "Shop", "till_number": "123456"} and not secrets and not problems
+    # the chosen kind's own required field
+    _, _, problems = apply_form_values(add, {"kind": "bank", "label": "B"}, {"kind": "bank", "label": "B"})
+    assert problems == ["'bank_account' is required"]
+
+    # an edit: the kind is the record's own and not on the form; only its fields, none required
+    edit_schema = {k: v for k, v in schema.items() if k not in ("required", "x-required-for")}
+    edit_schema["properties"] = {k: v for k, v in schema["properties"].items() if k != "kind"}
+    edit = _action("PUT", "/api/things/{id}", edit_schema)
+    names = [f["name"] for f in form_fields(edit, {}, {"kind": "bank"})]
+    assert sorted(names) == ["bank_account", "bank_api_key", "label", "note"]
+    assert not any(f["required"] for f in form_fields(edit, {}, {"kind": "bank"}))
+    # kind unknown: nothing to go by, every field as before
+    assert len(form_fields(edit, {})) == 5
+
+
+@pytest.mark.asyncio
+async def test_editing_a_payment_method_shows_only_its_own_kind(client, owner, db):
+    from app.db.models import ResellerPaymentMethod, ResellerPaymentMethodType
+
+    reseller, token = owner
+    pm = ResellerPaymentMethod(user_id=reseller.id, method_type=ResellerPaymentMethodType.BANK_ACCOUNT,
+                               label="Equity", bank_paybill_number="247247", bank_account_number="0170299999999")
+    db.add(pm)
+    await db.commit()
+    use_model([
+        tool_reply("describe_action", {"method": "PUT", "path": "/api/payment-methods/{method_id}"}, "tu_d"),
+        tool_reply("call_api", {"method": "PUT", "path": f"/api/payment-methods/{pm.id}",
+                                "body": {"bank_account_number": "0170211111111"}}),
+        text_reply("Check the new account number and tap Confirm."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "new bank account number"},
+                                           headers=auth(token))).text)
+    card = next(e for e in events if e["type"] == "action")
+    names = {f["name"] for f in card["form"]}
+    assert {"bank_account_number", "bank_paybill_number", "label"} <= names
+    assert not any(n.startswith(("mpesa_", "mtn_", "fapshi_", "zenopay_")) for n in names), names
+
+
+def _action(method, template, schema):
+    from app.services.assistant.catalog import Action
+
+    return Action(method=method, template=template, title="X", description="", tag="t", body_schema=schema)
