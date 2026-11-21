@@ -50,6 +50,7 @@ EXCLUDED_PREFIXES = (
     "/api/users/register",
     "/api/admin/impersonate",  # mints a token the chat cannot use
     "/api/impersonation",
+    "/api/routers/create",     # a router is added with a setup code (POST /api/provision/create), never by hand
 )
 EXCLUDED_FRAGMENTS = ("/webfig/{", "/jsproxy")
 

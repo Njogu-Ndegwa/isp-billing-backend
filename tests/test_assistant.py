@@ -1923,3 +1923,20 @@ def test_a_customer_form_marks_the_location_for_a_map():
     register = next(a for a in catalog.actions if a.method == "POST" and a.template == "/api/customers/register")
     fields = {f["name"]: f for f in form_fields(register, {})}
     assert fields["latitude"]["geo"] == "lat" and fields["longitude"]["geo"] == "lng"
+
+
+def test_a_router_is_added_with_a_two_question_setup_form_never_by_hand():
+    """As on the classic setup page: the RouterOS version and the Wi-Fi name. The
+    RouterBOARD question only for RouterOS 6; payment methods are not asked."""
+    import main
+    from app.services.assistant.catalog import form_fields, get_catalog
+
+    catalog = get_catalog(main.app)
+    assert not any(a.template == "/api/routers/create" for a in catalog.actions)
+    setup = next(a for a in catalog.actions if a.method == "POST" and a.template == "/api/provision/create")
+    fields = {f["name"]: f for f in form_fields(setup, {}, None)}
+    assert fields["vpn_type"]["kind"] == "select" and fields["vpn_type"]["options"] == ["wireguard", "l2tp"]
+    assert fields["vpn_type"]["value"] == "wireguard"
+    assert fields["is_routerboard"]["when"] == {"vpn_type": ["l2tp"]}
+    assert fields["payment_methods"].get("admin_only") is True
+    assert "business name" in fields["ssid"]["hint"]
