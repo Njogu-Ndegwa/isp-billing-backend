@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Optional
 from urllib.parse import quote
@@ -169,3 +170,36 @@ def create_upload(content_type: str, size: int, owner_label: str, now: Optional[
         upload_url=url, public_url=f"{public_media_base()}/{key}", key=key,
         content_type=content_type, max_bytes=limit, expires_in=UPLOAD_URL_TTL_SECONDS,
     )
+
+
+# A reseller's own photo for the portal hero. Stored in the same bucket as ad
+# media and served by the same Worker, because that host is already in every
+# router's walled garden. Portal users pay for this on metered connections
+# before they have even bought a plan: the bundled presets are 25-66 KB, so the
+# dashboard re-encodes to about that and this cap, enforced by R2 through the
+# signed content-length, is the backstop. No PNG and no video on purpose.
+HERO_ALLOWED_TYPES = {"image/jpeg", "image/webp"}
+HERO_MAX_BYTES = 300 * 1024
+
+
+def create_portal_hero_upload(content_type: str, size: int, owner_label: str, now: Optional[datetime] = None) -> UploadTicket:
+    """An upload slot for one portal hero photo, far tighter than an ad's."""
+    if not media_configured():
+        raise MediaNotConfigured("Photo storage is not set up yet")
+    if content_type not in HERO_ALLOWED_TYPES:
+        raise MediaRejected("Upload a JPEG or WebP photo")
+    if not isinstance(size, int) or size <= 0:
+        raise MediaRejected("The file is empty")
+    if size > HERO_MAX_BYTES:
+        raise MediaRejected(f"The photo is larger than {HERO_MAX_BYTES // 1024} KB")
+    return replace(create_upload(content_type, size, owner_label, now=now), max_bytes=HERO_MAX_BYTES)
+
+
+def is_portal_hero_url(url: Optional[str]) -> bool:
+    """True for a link create_portal_hero_upload could have produced. The portal
+    client (isp-frontend script.js customHeroUrl) checks the same shape."""
+    base = public_media_base()
+    if not url or not base or not url.startswith(f"{base}/"):
+        return False
+    rest = url[len(base) + 1:]
+    return re.fullmatch(rf"{KEY_PREFIX}\d{{4}}/\d{{2}}/[A-Za-z0-9_-]+\.(?:jpg|webp)", rest) is not None
