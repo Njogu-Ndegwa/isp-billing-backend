@@ -24,7 +24,7 @@ from datetime import datetime
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import joinedload
@@ -49,6 +49,7 @@ from app.db.models import (
 )
 from app.services.auth import verify_token, get_current_user
 from app.services.account_numbers import is_valid_account_number
+from app.services.payment_numbers import PAYMENT_SEARCH_DESCRIPTION, payment_search_condition
 from app.services.c2b_handler import (
     SUCCESS_RESPONSE,
     handle_confirmation,
@@ -213,14 +214,21 @@ async def register_reseller_c2b(
 
 @router.get("/api/c2b/unmatched")
 async def list_unmatched_c2b(
+    search: Optional[str] = Query(None, description=PAYMENT_SEARCH_DESCRIPTION),
     resolved: bool = False,
     limit: int = 100,
     include_stk_echo: bool = False,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ) -> list[dict]:
-    """List unmatched C2B payments assigned to the current reseller for triage.
+    """List unmatched C2B payments assigned to the current reseller for triage;
+    search= finds one payment by its M-Pesa code or phone.
     Admins see all rows (no reseller scope).
+
+    ``search`` is an exact, case-insensitive match on the paybill TransID or
+    the payer's phone (MSISDN, or the account number when they typed their
+    phone there) in any of 07…/7…/254…/+254…. It is applied in the query,
+    before ``limit``, so an older payment is still found.
 
     STK echoes (the C2B copy Safaricom sends of an STK hotspot payment that
     was already credited) are left out unless include_stk_echo=true: the
@@ -242,6 +250,15 @@ async def list_unmatched_c2b(
                 C2BTransaction.status == C2BTransactionStatus.STK_ECHO
             )
         )
+
+    # Called directly (not over HTTP) the default is the Query() marker.
+    search = (search.strip() or None) if isinstance(search, str) else None
+    if search:
+        stmt = stmt.where(UnmatchedC2BPayment.c2b_transaction.has(payment_search_condition(
+            search,
+            code_columns=(C2BTransaction.trans_id,),
+            phone_columns=(C2BTransaction.msisdn, C2BTransaction.bill_ref_number),
+        )))
 
     rows = (await db.execute(stmt)).scalars().all()
     return [_serialize_unmatched(r) for r in rows]
