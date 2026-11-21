@@ -30,7 +30,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -55,7 +55,18 @@ class SaleTerms(BaseModel):
 
 
 class SoldAdCreateRequest(ar.AdCreateRequest, SaleTerms):
-    pass
+    # On a sold ad the business is the seller: its name is the ad's title and seller, and its
+    # phone the ad's, unless the reseller gives others, so nobody is asked twice.
+    title: Optional[str] = None
+    seller_name: Optional[str] = None
+    phone_number: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _seller_is_the_business(self):
+        self.title = (self.title or "").strip() or self.business_name
+        self.seller_name = (self.seller_name or "").strip() or self.business_name
+        self.phone_number = (self.phone_number or "").strip() or self.business_phone
+        return self
 
 
 class PromptRequest(BaseModel):
@@ -147,12 +158,16 @@ async def selling_access(
     """Whether this reseller may sell yet. The dashboard shows "coming soon"
     in place of the selling form when not."""
     user = await get_current_user(token, db)
-    allowed = (
-        not ar._is_admin(user)
-        and ad_review.is_kenyan(user)
-        and await ad_sales.selling_allowed(db, user.id)
-    )
-    return {"allowed": allowed}
+    # why not, in words the reseller (and the assistant) can pass on
+    if ar._is_admin(user):
+        reason = "Bitwave admins create platform ads; selling is for resellers."
+    elif not ad_review.is_kenyan(user):
+        reason = "Selling ads works with M-Pesa, so it is open to resellers in Kenya for now."
+    elif not await ad_sales.selling_allowed(db, user.id):
+        reason = "Selling ads has not been switched on for this account yet. Bitwave support can turn it on."
+    else:
+        reason = None
+    return {"allowed": reason is None, **({"reason": reason} if reason else {})}
 
 
 @router.get("/api/ad-sales/quote")

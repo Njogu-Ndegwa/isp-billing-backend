@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from pydantic import BaseModel, HttpUrl, field_validator
+from pydantic import BaseModel, ConfigDict, HttpUrl, field_validator
 from typing import Optional, Literal
 from datetime import datetime
 
@@ -61,7 +61,30 @@ VALID_ANNOUNCEMENT_TYPES = {"info", "warning", "success"}
 # Pydantic schemas
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _portal_form_schema(schema: dict) -> None:
+    """What a form needs that the validators below already know: the allowed values of
+    each choice (as picks, not free text), which fields only matter once their switch is
+    on (an announcement's text, the welcome banner's words, the social links), and the
+    pictures the person uploads from their phone (logo, header photo)."""
+    props = schema.get("properties", {})
+    for name, values in (("color_theme", OFFERED_THEMES), ("header_style", VALID_HEADER_STYLES),
+                         ("portal_language", VALID_LANGUAGES), ("announcement_type", VALID_ANNOUNCEMENT_TYPES),
+                         ("plan_sort_order", VALID_PLAN_SORT_ORDERS)):
+        if isinstance(props.get(name), dict):
+            props[name]["enum"] = sorted(values)
+    for name in ("company_logo_url", "header_bg_image_url"):
+        if isinstance(props.get(name), dict):
+            props[name]["x-upload"] = {"accept": "image/*", "ticket": "/api/ads/media/upload-url"}
+    schema["x-fields-for"] = {
+        "show_announcement": {"true": ["announcement_type", "announcement_text"]},
+        "show_welcome_banner": {"true": ["welcome_title", "welcome_subtitle"]},
+        "show_social_links": {"true": ["facebook_url", "whatsapp_group_url", "instagram_url"]},
+    }
+
+
 class PortalSettingsUpdate(BaseModel):
+    model_config = ConfigDict(json_schema_extra=_portal_form_schema)
+
     # Theme
     color_theme: Optional[str] = None
     # Header

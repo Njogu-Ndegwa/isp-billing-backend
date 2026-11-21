@@ -157,7 +157,8 @@ async def test_outside_the_pilot_no_sold_ad_is_created_and_no_prompt_goes_out(cl
 
     r = await client.post("/api/ad-sales", json=SOLD, headers=_bearer(outside))
     assert r.status_code == 403 and "coming soon" in r.json()["detail"]
-    assert (await client.get("/api/ad-sales/access", headers=_bearer(outside))).json() == {"allowed": False}
+    refused = (await client.get("/api/ad-sales/access", headers=_bearer(outside))).json()
+    assert refused["allowed"] is False and "Bitwave support can turn it on" in refused["reason"]  # said, so it can be passed on
     assert stk == []
     assert (await db.execute(select(Ad))).scalars().first() is None
 
@@ -462,3 +463,15 @@ async def test_admin_takedown_reject_refund_and_lists_work_with_a_real_login(cli
     assert r.status_code == 200, r.text
     assert (await client.get("/api/ad-sales", headers=h_owner)).status_code == 200
     assert (await client.get("/api/ads/manage", headers=h_owner)).status_code == 200
+
+
+
+def test_a_sold_ad_takes_the_business_as_its_seller():
+    from app.api.ad_sales_routes import SoldAdCreateRequest
+
+    req = SoldAdCreateRequest(business_name="Kamau Hardware", business_phone="0712333444", weeks=2,
+                              price_per_week=300)
+    assert (req.title, req.seller_name, req.phone_number) == ("Kamau Hardware", "Kamau Hardware", "0712333444")
+    other = SoldAdCreateRequest(business_name="Kamau Hardware", business_phone="0712333444", weeks=2,
+                                price_per_week=300, title="Kamau", seller_name="Shop 2", phone_number="0700000001")
+    assert (other.seller_name, other.phone_number) == ("Shop 2", "0700000001")

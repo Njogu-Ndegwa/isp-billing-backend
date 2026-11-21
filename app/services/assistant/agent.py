@@ -779,27 +779,23 @@ class Turn:
                 f["option_attrs"] = {a: {i: str(rows.get(i, {}).get(a, "")) for i in f["options"]} for a in sorted(attrs)}
 
     async def _record_kind(self, action: Action, method: str, path: str, body: Any) -> Optional[dict]:
-        """For an edit whose fields depend on what kind of record it is (a till or a bank
-        account, a photo or a video ad...) and the change does not say: the record's kind."""
-        if method not in ("PUT", "PATCH"):
-            return None
-        given = body if isinstance(body, dict) else {}
-        # the record's own value for each choice the change leaves out (for "plan_id.connection_type":
-        # its plan_id, whose type the page reads from the plan picker)
-        missing = list(dict.fromkeys(c.split(".", 1)[0] for c in choice_groups(action.body_schema)
-                                     if given.get(c.split(".", 1)[0]) in (None, "")))
-        if not missing:
+        """An edit's record as it is now: its current values fill the form (a switch shows
+        whether it is on, not "off" for unknown) and say what kind of record it is (a till or
+        a bank account, a photo or a video ad), so only that kind's fields are shown."""
+        if method not in ("PUT", "PATCH") or not isinstance(action.body_schema, dict):
             return None
         data = await self._record(path)
         if not isinstance(data, dict):
             return None
         out = {}
-        for c in missing:
-            value = data.get(c)
-            if value in (None, "") and c.endswith("_id") and isinstance(data.get(c[:-3]), dict):
-                value = data[c[:-3]].get("id")  # {"plan": {"id": 3, ...}}
-            if value not in (None, ""):
-                out[c] = value
+        for key, value in data.items():
+            if isinstance(value, (str, int, float, bool)) or (
+                    isinstance(value, list) and all(isinstance(v, (str, int, float)) for v in value)):
+                out[key] = value
+        for c in choice_groups(action.body_schema):
+            base = c.split(".", 1)[0]
+            if out.get(base) in (None, "") and base.endswith("_id") and isinstance(data.get(base[:-3]), dict):
+                out[base] = data[base[:-3]].get("id")  # {"plan": {"id": 3, ...}}
         return out or None
 
     async def _record(self, path: str) -> Optional[dict]:
@@ -1158,6 +1154,8 @@ class Turn:
             problems = [p for p in problems if not p.endswith("is required") and p != "this action needs a JSON body"]
         context = await self._record_kind(action, method, path, body) if editable and body is not None else None
         fields_for_form = form_fields(action, body, context) if editable and body is not None else None
+        if fields_for_form and not self.caller.is_admin:  # Bitwave-only fields (an ad's advertiser) are not asked
+            fields_for_form = [f for f in fields_for_form if not f.get("admin_only")] or None
         if fields_for_form:
             await self._offer_choices(fields_for_form)
         if problems:

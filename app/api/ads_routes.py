@@ -104,9 +104,9 @@ class AdCreateRequest(BaseModel):
     title: str
     seller_name: str
     phone_number: str
-    advertiser_id: Optional[int] = None
+    advertiser_id: Optional[int] = Field(None, json_schema_extra={"x-admin-only": True})
     description: Optional[str] = None
-    image_url: Optional[str] = None
+    image_url: Optional[str] = Field(None, json_schema_extra={"x-upload": {"accept": "image/*", "ticket": "/api/ads/media/upload-url"}})
     seller_location: Optional[str] = None
     whatsapp_number: Optional[str] = None
     price: Optional[str] = None
@@ -119,11 +119,11 @@ class AdCreateRequest(BaseModel):
     expires_at: Optional[str] = None
     placement: str = "local"
     media_type: str = Field("image", json_schema_extra={"enum": ["image", "video"]})
-    video_url: Optional[str] = None
-    poster_url: Optional[str] = None
+    video_url: Optional[str] = Field(None, json_schema_extra={"x-upload": {"accept": "video/*", "ticket": "/api/ads/media/upload-url"}})
+    poster_url: Optional[str] = Field(None, json_schema_extra={"x-upload": {"accept": "image/*", "ticket": "/api/ads/media/upload-url"}})
     image_fit: str = "cover"
     bg_color: Optional[str] = None
-    slot: Optional[str] = None          # admin: "platform"; reseller: "house" (default) or "reseller"
+    slot: Optional[str] = Field(None, json_schema_extra={"x-admin-only": True})  # admin: "platform"; reseller: "house" (default); sold ads use /api/ad-sales
     router_ids: Optional[list[int]] = None
 
 
@@ -131,10 +131,10 @@ class AdUpdateRequest(BaseModel):
     # a photo ad has a photo, a video ad a video and its poster: a form shows one set
     model_config = ConfigDict(json_schema_extra=_MEDIA_EDIT)
 
-    advertiser_id: Optional[int] = None     # admin only; Bitwave ads
+    advertiser_id: Optional[int] = Field(None, json_schema_extra={"x-admin-only": True})  # Bitwave ads
     title: Optional[str] = None
     description: Optional[str] = None
-    image_url: Optional[str] = None
+    image_url: Optional[str] = Field(None, json_schema_extra={"x-upload": {"accept": "image/*", "ticket": "/api/ads/media/upload-url"}})
     seller_name: Optional[str] = None
     seller_location: Optional[str] = None
     phone_number: Optional[str] = None
@@ -150,11 +150,11 @@ class AdUpdateRequest(BaseModel):
     is_active: Optional[bool] = None
     placement: Optional[str] = None
     media_type: Optional[str] = Field(None, json_schema_extra={"enum": ["image", "video"]})
-    video_url: Optional[str] = None
-    poster_url: Optional[str] = None
+    video_url: Optional[str] = Field(None, json_schema_extra={"x-upload": {"accept": "video/*", "ticket": "/api/ads/media/upload-url"}})
+    poster_url: Optional[str] = Field(None, json_schema_extra={"x-upload": {"accept": "image/*", "ticket": "/api/ads/media/upload-url"}})
     image_fit: Optional[str] = None
     bg_color: Optional[str] = None
-    slot: Optional[str] = None
+    slot: Optional[str] = Field(None, json_schema_extra={"x-admin-only": True})
     router_ids: Optional[list[int]] = None
 
 
