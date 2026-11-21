@@ -25,8 +25,11 @@ from app.config import settings
 from app.services.assistant import executor, known_issues, shaping, store, listing
 from app.services.assistant.usage import TurnUsage
 from app.services.assistant.caller import Caller
+from urllib.parse import quote
+
 from app.services.assistant.catalog import (
     Action, Catalog, apply_form_values, body_problems, build_path, choice_groups, form_fields, get_catalog,
+    pick_label,
 )
 
 logger = logging.getLogger(__name__)
@@ -204,6 +207,7 @@ How to work
 - To create or edit something (a plan, a customer, a router setting, a payment method...), never ask for the fields in text. Call describe_action, then call_api with form: true and a body holding what you already know: values the person gave, sensible defaults, and for an edit the record's current values (read it first). The person sees a form, fills in or corrects it and taps Confirm; leave out what you do not know. In your words, say only what the form is for, e.g. "Fill in the plan and tap Confirm." When the plan or router is not clear, leave plan_id or router_id out: the form lets the person pick from their own plans and routers. Ask in text only when it is unclear which record or which action is meant.
 - When what a change needs does not exist yet (no plan to put vouchers or a customer on), say so in one sentence and open the form for that first. A router is added with the setup command, not a form.
 - Never say a form or a change is ready unless call_api answered "waiting_for_confirmation". If it returned an error, fix the request and send it again, or say plainly what went wrong.
+- A moment in a form body is UTC like the API's (or written with its zone): the form shows it on the person's clock. Leave out force and allow_duplicate: when the API refuses a change as a duplicate or conflict, its card says why and offers Do it anyway, so say the reason in one line and do not propose it again.
 - A ✎ call does not run when you make it. It becomes a confirmation card and the person taps Confirm or Cancel. After proposing, end your turn with one or two sentences saying what is ready and that it runs when they tap Confirm, e.g. "Ready to create the plan — tap Confirm." Never say you created, changed, set up or sent anything until you have its result.
 - Confirmed and cancelled actions come back in a message that starts with [Confirmation results]. Report what happened plainly, failures included, then continue the task if more steps remain.
 - A customer can be given internet without paying through M-Pesa: register them if new, then activate with the activate action for their connection (activate-hotspot, activate-pppoe or activate-static), payment_method cash (cash received), other (paid elsewhere) or none (free: a comp, a test). A hotspot customer needs their device MAC.
@@ -769,6 +773,8 @@ class Turn:
             values = decision.get("values")
             if approve and isinstance(values, dict) and not await self._take_form_values(action_id, values):
                 continue  # refused: the card stays open with what to fix, nothing ran
+            if approve and await self._preview_first(action_id):
+                continue  # what it would do is on the card now; the next Confirm does it
             if approve:
                 lines.append(await self._run_confirmed(action_id))
             else:
@@ -789,8 +795,10 @@ class Turn:
         }]})
         await self._loop()
 
-    async def _offer_choices(self, fields: list[dict], narrow: Optional[dict] = None, editing: bool = False) -> dict:
-        """A plan or router field lists this person's own plans and routers by name.
+    async def _offer_choices(self, fields: list[dict], narrow: Optional[dict] = None, editing: bool = False,
+                             params: Optional[dict] = None, body: Any = None) -> dict:
+        """A record field lists this person's own records by name (x-pick); a live field lists
+        what the thing has now (x-options-from: a router's ports, each with its mode).
 
         Read with their own access, so a staff member sees what they may see; the
         server still checks the id on Confirm, as with any value. `narrow` keeps only the
@@ -799,20 +807,34 @@ class Turn:
         """
         narrowed: dict = {}
         narrow = narrow if isinstance(narrow, dict) else {}
+        dropped: set[str] = set()
         for f in fields:
-            people = _PEOPLE_SOURCES.get(f["name"])
-            if people and f["kind"] == "list" and isinstance(f.get("value"), list) and f["value"]:
-                # the customers already chosen, by name, to untick; adding more is asked in the chat
-                names = dict(await self._choices(people))
-                picked = [str(v) for v in f["value"]][:100]
-                f.update(options=picked, option_labels={v: names.get(v, f"Customer {v}") for v in picked},
-                         value=picked)
+            live = f.pop("options_from", None)
+            if live:
+                dropped |= await self._live_options(f, live, {**(body if isinstance(body, dict) else {}), **(params or {})})
                 continue
-            source = _CHOICE_SOURCES.get(f["name"])
-            if source is None or f["kind"] not in ("integer", "text"):
+            pick = f.get("pick")
+            if not pick:
                 continue
-            choices = await self._choices(source)
-            if not choices:
+            source, label = pick["from"], pick.get("label")
+            searchable = bool(pick.get("search"))
+            if f["kind"] == "list":
+                picked = [str(v) for v in f["value"]][:100] if isinstance(f.get("value"), list) else []
+                if searchable:
+                    # a big list (customers): the ones already chosen, by name, to untick; more are found by search
+                    names = await self._names(pick, picked)
+                    f.update(options=picked, option_labels={v: names.get(v, f"#{v}") for v in picked}, value=picked)
+                    continue
+                choices = await self._choices(source, pick.get("query"), label)
+                if choices:
+                    ids = [c[0] for c in choices]
+                    f.update(options=ids + [v for v in picked if v not in ids], value=picked,
+                             option_labels={**{v: f"#{v}" for v in picked}, **dict(choices)})
+                continue
+            if f["kind"] not in ("integer", "text"):
+                continue
+            choices = await self._choices(source, pick.get("query"), label)
+            if not choices and not searchable:
                 if f.get("required"):
                     # nothing to pick at all (no router, no plan): the form could never be sent
                     narrowed[f["name"]] = {"rule": {}, "fit": [], "there_are": []}
@@ -825,7 +847,7 @@ class Turn:
                 # an edit keeps the record's kind (a PPPoE customer's plans are PPPoE plans) unless asked otherwise
                 current = self._choice_rows.get(source, {}).get(str(f["value"]), {})
                 rule = {a: current[a] for a in deciding if current.get(a) not in (None, "")} or None
-            if isinstance(rule, dict) and rule:
+            if isinstance(rule, dict) and rule and not searchable:
                 rows = self._choice_rows.get(source, {})
 
                 def fits(cid: str) -> bool:
@@ -846,6 +868,9 @@ class Turn:
                     continue
                 if len(choices) == 1 and f.get("value") in (None, ""):
                     f["value"] = choices[0][0]  # the only one that fits: picked for the person
+            if searchable and f.get("value") not in (None, "") and str(f["value"]) not in dict(choices):
+                # the chosen one is past the first page: named all the same
+                choices = choices + [(str(f["value"]), (await self._names(pick, [str(f["value"])])).get(str(f["value"]), f"#{f['value']}"))]
             f.update(value_kind=f["kind"], kind="select", options=[c[0] for c in choices],
                      option_labels=dict(choices))
             if "value" in f:
@@ -855,25 +880,112 @@ class Turn:
             if attrs:
                 rows = self._choice_rows.get(source, {})
                 f["option_attrs"] = {a: {i: str(rows.get(i, {}).get(a, "")) for i in f["options"]} for a in sorted(attrs)}
+        if dropped:
+            fields[:] = [f for f in fields if f["name"] not in dropped]
         return narrowed
+
+    async def _live_options(self, f: dict, live: dict, values: dict) -> set[str]:
+        """Fill a field from the live thing it is about (GET /api/routers/7/ports): the values it
+        has, each labelled with its state, and for a set changed by add/remove, the set it has now.
+        Returns the add/remove fields the picker replaces. Without an answer the field stays as typed."""
+        names = re.findall(r"\{(\w+)\}", live["path"])
+        if any(values.get(n) in (None, "") for n in names):
+            return set()
+        path = live["path"]
+        for n in names:
+            path = path.replace("{" + n + "}", quote(str(values[n]), safe=""))
+        try:
+            result = await executor.call_api(self.app, self.caller, "GET", path, None, None)
+        except Exception:
+            logger.warning("[assistant] could not read %s for a form", path, exc_info=True)
+            return set()
+        data = result.data if result.ok else None
+        rows = data.get(live.get("list")) if isinstance(data, dict) and live.get("list") else data
+        if isinstance(rows, dict):
+            rows = next((v for v in rows.values() if isinstance(v, list)), None)
+        if not isinstance(rows, list):
+            return set()
+        key = live.get("value") or "name"
+        where = live.get("where") if isinstance(live.get("where"), dict) else {}
+        busy = set()
+        for k in live.get("exclude_in") or []:  # values the thing already uses for something else
+            busy |= {str(v) for v in (data.get(k) or [])} if isinstance(data, dict) else set()
+        options, labels = [], {}
+        for row in rows[:64]:
+            if not isinstance(row, dict) or row.get(key) in (None, ""):
+                continue
+            if any(str(row.get(w, "")).lower() not in {str(x).lower() for x in (want if isinstance(want, list) else [want])}
+                   for w, want in where.items()):
+                continue
+            value = str(row[key])
+            if value in busy:
+                continue
+            label = pick_label(row, live.get("label")) if live.get("label") else value
+            off = live.get("off")
+            if off and str(row.get(off, "")).lower() in ("false", "0", "", "none"):
+                label += " · no cable"
+            options.append(value)
+            labels[value] = _option_words(label)
+        if not options:
+            return set()
+        picked = f.get("value") if isinstance(f.get("value"), list) else None
+        current = data.get(live.get("current")) if isinstance(data, dict) and live.get("current") else None
+        drop: set[str] = set()
+        if f.get("changes") and isinstance(current, list):
+            add, remove = f["changes"]["add"], f["changes"]["remove"]
+            body_add = values.get(add) if isinstance(values.get(add), list) else []
+            body_remove = {str(v) for v in values.get(remove) or []} if isinstance(values.get(remove), list) else set()
+            if picked is None:
+                picked = [str(v) for v in current] + [str(v) for v in body_add if str(v) not in map(str, current)]
+                picked = [v for v in picked if v not in body_remove]
+            f["baseline"] = [str(v) for v in current]  # what it is now: the page sends only what changed
+            drop = {add, remove}
+        for v in picked or []:
+            if str(v) not in options:  # set now but not listed (a port gone from the bridge): still shown
+                options.append(str(v))
+                labels.setdefault(str(v), str(v))
+        f.update(options=options, option_labels=labels)
+        if f["kind"] == "list":
+            f["value"] = [str(v) for v in picked or []]
+        else:
+            f.update(kind="select")
+        return drop
 
     async def _record_kind(self, action: Action, method: str, path: str, body: Any) -> Optional[dict]:
         """An edit's record as it is now: its current values fill the form (a switch shows
         whether it is on, not "off" for unknown) and say what kind of record it is (a till or
-        a bank account, a photo or a video ad), so only that kind's fields are shown."""
-        if method not in ("PUT", "PATCH") or not isinstance(action.body_schema, dict):
+        a bank account, a photo or a video ad), so only that kind's fields are shown.
+
+        A setting kept on a parent record (a router's expired-PPPoE page switch, changed at
+        PUT /api/routers/7/pppoe-expired-redirect) is named by the schema's "x-current":
+        {"fields": {"enabled": "pppoe_expired_redirect"}} read from the record one level up,
+        or from "from" (a path template)."""
+        if method not in ("PUT", "PATCH", "POST") or not isinstance(action.body_schema, dict):
             return None
-        data = await self._record(path)
-        if not isinstance(data, dict):
+        current_spec = action.body_schema.get("x-current")
+        if method == "POST" and not isinstance(current_spec, dict):
             return None
+        data = await self._record(path) if method != "POST" else None
         out = {}
-        for key, value in data.items():
+        for key, value in (data or {}).items():
             if isinstance(value, (str, int, float, bool)) or (
                     isinstance(value, list) and all(isinstance(v, (str, int, float)) for v in value)):
                 out[key] = value
+        if isinstance(current_spec, dict) and isinstance(current_spec.get("fields"), dict):
+            source = current_spec.get("from")
+            if isinstance(source, str):
+                _, params = self.catalog.match(method, path)
+                for n in re.findall(r"\{(\w+)\}", source):
+                    source = source.replace("{" + n + "}", quote(str(params.get(n, "")), safe=""))
+            else:
+                source = path.rstrip("/").rpartition("/")[0]
+            parent = await self._record(source) if source else None
+            for field_name, record_key in current_spec["fields"].items():
+                if isinstance(parent, dict) and parent.get(record_key) is not None and out.get(field_name) is None:
+                    out[field_name] = parent[record_key]
         for c in choice_groups(action.body_schema):
             base = c.split(".", 1)[0]
-            if out.get(base) in (None, "") and base.endswith("_id") and isinstance(data.get(base[:-3]), dict):
+            if out.get(base) in (None, "") and base.endswith("_id") and isinstance((data or {}).get(base[:-3]), dict):
                 out[base] = data[base[:-3]].get("id")  # {"plan": {"id": 3, ...}}
         return out or None
 
@@ -900,22 +1012,32 @@ class Turn:
                 return data
         return None
 
-    async def _choices(self, path: str) -> list[tuple[str, str]]:
-        if path not in self._choice_cache:
+    async def _choices(self, path: str, query: Optional[dict] = None, label: Optional[str] = None) -> list[tuple[str, str]]:
+        cache_key = json.dumps([path, query or {}, label or ""], sort_keys=True)
+        if cache_key not in self._choice_cache:
             out: list[tuple[str, str]] = []
             try:
-                result = await executor.call_api(self.app, self.caller, "GET", path, None, None)
+                result = await executor.call_api(self.app, self.caller, "GET", path, query or None, None)
                 data = result.data if result.ok else None
                 if isinstance(data, dict):  # a page: the first list in it
                     data = next((v for v in data.values() if isinstance(v, list)), None)
                 for row in (data or [])[:200]:
                     if isinstance(row, dict) and row.get("id") is not None:
-                        out.append((str(row["id"]), str(row.get("name") or row.get("identity") or f"#{row['id']}")[:80]))
+                        out.append((str(row["id"]), pick_label(row, label)))
                         self._choice_rows.setdefault(path, {})[str(row["id"])] = row
             except Exception:  # a convenience: without it the field is a plain input
                 logger.warning("[assistant] could not list %s for a form", path, exc_info=True)
-            self._choice_cache[path] = out
-        return self._choice_cache[path]
+            self._choice_cache[cache_key] = out
+        return self._choice_cache[cache_key]
+
+    async def _names(self, pick: dict, ids: list[str]) -> dict[str, str]:
+        """The chosen records of a big list by name: the first page, then each one still unnamed."""
+        names = dict(await self._choices(pick["from"], pick.get("query"), pick.get("label")))
+        for cid in [i for i in ids if i not in names][:20]:
+            row = await self._record(f"{pick['from'].rstrip('/')}/{quote(cid, safe='')}")
+            if isinstance(row, dict):
+                names[cid] = pick_label(row, pick.get("label"))
+        return names
 
     async def _take_form_values(self, action_id: str, values: dict) -> bool:
         """Merge a form's values into its pending action. False (and the card told why) if they do not pass."""
@@ -926,7 +1048,7 @@ class Turn:
         if spec is None:
             return True
         context = await self._record_kind(spec, action["method"], action["path"], action.get("body"))
-        body, typed_secrets, problems = apply_form_values(spec, action.get("body"), values, context)
+        body, typed_secrets, problems = apply_form_values(spec, action.get("body"), values, context, await self._zone())
         problems += body_problems(spec, {**body, **typed_secrets})
         before = action.get("body") if isinstance(action.get("body"), dict) else {}
         for name in ("customer_ids",):
@@ -963,6 +1085,100 @@ class Turn:
         return {"kind": "mpesa", "poll": path,
                 "message": f"Check {'the phone ' + str(phone) if phone else 'your phone'}: enter your M-Pesa PIN to pay."}
 
+    # -- preview first, then do it ---------------------------------------------
+
+    def _previewed(self, action_id: str) -> Optional[str]:
+        """The request last previewed for this action (its fingerprint), from the chat's own record."""
+        for item in reversed(self.transcript):
+            if item.get("type") == "action_result" and item.get("action_id") == action_id:
+                return item.get("preview_of")
+        return None
+
+    def _preview_request(self, spec: Action, params: dict, action: dict) -> Optional[tuple]:
+        """The read that shows what this change would do: its own preview route (x-preview),
+        or the same request as a dry run (dry_run=true, apply=false)."""
+        query = dict(action.get("query") or {})
+        body = dict(action["body"]) if isinstance(action.get("body"), dict) else action.get("body")
+        if spec.preview:
+            target = self.catalog.get("POST", spec.preview)
+            path = build_path(target, params) if target is not None else None
+            if path is None:
+                return None
+            props = (target.body_schema or {}).get("properties") or {}
+            if isinstance(body, dict) and props:
+                body = {k: v for k, v in body.items() if k in props}
+            return "POST", path, None, body
+        if spec.apply_flag:
+            flag, value = spec.apply_flag, False
+        elif spec.flags:
+            flag, value = spec.flags[0], True
+        else:
+            return None
+        if spec.in_query(flag):
+            query[flag] = value
+        else:
+            body = {**(body if isinstance(body, dict) else {}), flag: value}
+        return action["method"], action["path"], query or None, body
+
+    async def _preview_first(self, action_id: str) -> bool:
+        """For a change that can be previewed: the first Confirm shows what it would do on the
+        card (who gets credited, what the router check found) and the next Confirm does it. A
+        change edited after its preview is previewed again. True when a preview was shown."""
+        action = await store.pending_action(self.caller, self.conversation["id"], action_id)
+        if action is None:
+            return False
+        spec, params = self.catalog.match(action["method"], action["path"])
+        if spec is None or not spec.previews:
+            return False
+        fingerprint = _fingerprint(action)
+        if self._previewed(action_id) == fingerprint:
+            return False  # seen as it is: now do it
+        request = self._preview_request(spec, params, action)
+        if request is None:
+            return False
+        method, path, query, body = request
+        await self.emit("step", {"call_id": action_id, "label": action["title"], "phase": "start",
+                                 "method": method, "path": path}, keep=False)
+        try:
+            result = await executor.call_api(self.app, self.caller, method, path, query, body)
+        except Exception:
+            logger.warning("[assistant] preview of %s %s failed", method, path, exc_info=True)
+            return False  # no preview to show: Confirm does it, as before
+        await self.emit("step", {"call_id": action_id, "label": action["title"], "phase": "end",
+                                 "ok": result.ok, "status": result.status}, keep=False)
+        await self.emit("action_result", {
+            "action_id": action_id, "status": "pending", "ok": result.ok, "http_status": result.status,
+            "preview_of": fingerprint,
+            "detail": "" if result.ok else "The check found a problem: " + (_refusal(result) or result.detail()),
+            "preview": shaping.for_screen(result.data) if result.ok else None,
+        })
+        return True
+
+    async def _offer_retry(self, action: dict, spec: Action, reason: str) -> Optional[str]:
+        """The API refused (a duplicate, a conflict) and has a flag to do it anyway: the same
+        request with that flag, as a card of its own. Nothing runs until the person confirms it."""
+        flag = spec.overrides[0]
+        query = dict(action.get("query") or {})
+        body = action.get("body")
+        if spec.in_query(flag):
+            query[flag] = True
+        else:
+            body = {**(body if isinstance(body, dict) else {}), flag: True}
+        permission = spec.staff_rule.permission_label if spec.staff_rule is not None else None
+        pending = await store.create_action(
+            self.caller, self.conversation["id"], method=action["method"], path=action["path"],
+            template=action["template"], query=query or None, body=body, title=action["title"],
+            permission=permission, tool_use_id=None,
+        )
+        await self.emit("action", {
+            "action_id": pending["id"], "title": action["title"], "summary": action["title"],
+            "method": action["method"], "path": action["path"],
+            "query": shaping.mask(query) if query else None, "body": shaping.mask(body),
+            "permission": permission, "sensitive": True, "retry_of": action["id"], "reason": reason[:300],
+            "expires_at": pending["expires_at"], "status": "pending",
+        })
+        return pending["id"]
+
     async def _run_confirmed(self, action_id: str) -> dict:
         action = await store.claim_action(self.caller, self.conversation["id"], action_id, "running")
         if action is None:
@@ -971,10 +1187,13 @@ class Turn:
             return {"action_id": action_id, "outcome": "not run: already decided or expired"}
         await self.emit("step", {"call_id": action_id, "label": action["title"], "phase": "start",
                                  "method": action["method"], "path": action["path"]}, keep=False)
+        spec, _ = self.catalog.match(action["method"], action["path"])
         typed_secrets = self._form_secrets.pop(action_id, None)
         body = {**(action.get("body") or {}), **typed_secrets} if typed_secrets else action.get("body")
-        result = await executor.call_api(self.app, self.caller, action["method"], action["path"],
-                                         action.get("query"), body)
+        query = action.get("query")
+        if spec is not None:
+            query, body = _for_real(spec, query, body)
+        result = await executor.call_api(self.app, self.caller, action["method"], action["path"], query, body)
         status = "done" if result.ok else "failed"
         detail = "" if result.ok else result.detail()
         awaiting = self._payment_wait(action, result.data) if result.ok else None
@@ -982,16 +1201,29 @@ class Turn:
                                   result_summary=detail or ("payment prompt sent" if awaiting else "ok"))
         logger.info("[assistant] user=%s staff=%s ran %s %s -> %s", self.caller.user_id,
                     self.caller.staff_id, action["method"], action["path"], result.status)
+        reason = _refusal(result) if not result.ok else ""
+        overridable = (spec is not None and bool(spec.overrides) and _names_override(result, spec, reason)
+                       and not any(_flag_set(action, f) for f in spec.overrides))
         await self.emit("action_result", {
             "action_id": action_id, "status": status, "ok": result.ok, "http_status": result.status,
-            "detail": detail, "payload": shaping.for_screen(result.data) if result.ok and not awaiting else None,
+            "detail": reason or detail,
+            "payload": shaping.for_screen(result.data) if result.ok and not awaiting else None,
             **({"awaiting": awaiting} if awaiting else {}),
         })
+        retry = await self._offer_retry(action, spec, reason or detail) if overridable else None
+        if awaiting:
+            outcome = ("payment prompt sent, NOT paid yet: M-Pesa is asking for the PIN on the phone. Say "
+                       "so (check the phone, enter the PIN); the card shows when it is paid. Never say it is "
+                       "bought, paid or done.")
+        elif result.ok:
+            outcome = "done"
+        elif retry:
+            outcome = ("refused by the API, nothing changed. A Do it anyway card is on screen: say why in one "
+                       "line and that they can tap it if they are sure; do not propose it again")
+        else:
+            outcome = "failed"
         out = {"action_id": action_id, "title": action["title"], "method": action["method"],
-               "path": action["path"], "http_status": result.status,
-               "outcome": ("payment prompt sent, NOT paid yet: M-Pesa is asking for the PIN on the phone. Say "
-                           "so (check the phone, enter the PIN); the card shows when it is paid. Never say it is "
-                           "bought, paid or done.") if awaiting else "done" if result.ok else "failed"}
+               "path": action["path"], "http_status": result.status, "outcome": outcome}
         if isinstance(action.get("body"), dict) and action["body"]:
             out["sent"] = shaping.mask(action["body"])  # what really ran, form edits included
         if result.ok:
@@ -1259,15 +1491,21 @@ class Turn:
         form = bool(args.get("form")) and editable
         if form and body is None and action.body_schema is not None:
             body = {}
+        # "do it anyway" is the person's to say, on the API's own refusal: never set ahead of it
+        query, body = _without_overrides(action, query, body)
+        if isinstance(body, dict) and "idempotency_key" in ((action.body_schema or {}).get("properties") or {}) \
+                and not body.get("idempotency_key"):
+            body = {**body, "idempotency_key": uuid.uuid4().hex}  # one per proposal: a retry never runs twice
         problems = body_problems(action, body)
         if form:  # the person fills in what is missing
             problems = [p for p in problems if not p.endswith("is required") and p != "this action needs a JSON body"]
         context = await self._record_kind(action, method, path, body) if editable and body is not None else None
-        fields_for_form = form_fields(action, body, context) if editable and body is not None else None
+        zone = await self._zone()
+        fields_for_form = form_fields(action, body, context, zone) if editable and body is not None else None
         if fields_for_form and not self.caller.is_admin:  # Bitwave-only fields (an ad's advertiser) are not asked
             fields_for_form = [f for f in fields_for_form if not f.get("admin_only")] or None
-        narrowed = await self._offer_choices(fields_for_form, args.get("narrow"), method in ("PUT", "PATCH")) \
-            if fields_for_form else {}
+        narrowed = await self._offer_choices(fields_for_form, args.get("narrow"), method in ("PUT", "PATCH"),
+                                             params, body) if fields_for_form else {}
         empty = {name: n for name, n in narrowed.items() if not n["fit"]}
         if empty:
             # nothing fits (no PPPoE plan for a PPPoE customer): a prerequisite is missing, so no form
@@ -1301,6 +1539,7 @@ class Turn:
             "sensitive": bool(permission and permission in _sensitive()),
             "expires_at": pending["expires_at"], "status": "pending",
             **({"form": fields_for_form} if fields_for_form else {}),
+            **({"previews": True} if action.previews else {}),
         })
         return self._tool_result(tool_use_id, {
             "status": "waiting_for_confirmation",
@@ -1359,6 +1598,70 @@ class Turn:
         return self._tool_result(tool_use_id, out)
 
 
+def _without_overrides(action: Action, query: Optional[dict], body: Any) -> tuple:
+    """The request without its "do it anyway" flags: those are set by the person, on a refusal."""
+    if not action.overrides:
+        return query, body
+    if isinstance(query, dict):
+        query = {k: v for k, v in query.items() if k not in action.overrides} or None
+    if isinstance(body, dict):
+        body = {k: v for k, v in body.items() if k not in action.overrides}
+    return query, body
+
+
+def _for_real(spec: Action, query: Optional[dict], body: Any) -> tuple:
+    """A confirmed change runs for real: apply=true, and a dry-run flag off even where it defaults on."""
+    query = dict(query) if isinstance(query, dict) else query
+    body = dict(body) if isinstance(body, dict) else body
+    wanted = [(spec.apply_flag, True)] if spec.apply_flag else []
+    wanted += [(f, False) for f in spec.flags]
+    # "confirm": true is what the person just did by tapping Confirm (enable load balancing, reboot)
+    props = (spec.body_schema or {}).get("properties") or {}
+    wanted += [(f, True) for f in ("confirm", "confirmed") if f in props or spec.in_query(f)]
+    for flag, value in wanted:
+        forced = flag == spec.apply_flag
+        if spec.in_query(flag):
+            if forced or flag not in (query or {}):
+                query = {**(query or {}), flag: value}
+        elif isinstance(body, dict) or body is None:
+            if forced or flag not in (body or {}):
+                body = {**(body or {}), flag: value}
+    return query, body
+
+
+def _flag_set(action: dict, flag: str) -> bool:
+    return any(isinstance(s, dict) and s.get(flag) in (True, "true", "1", 1)
+               for s in (action.get("query"), action.get("body")))
+
+
+def _refusal(result) -> str:
+    """The API's own words for a refusal, without the JSON around them."""
+    data = result.data
+    if isinstance(data, dict) and isinstance(data.get("detail"), dict):
+        words = data["detail"].get("message") or data["detail"].get("detail") or data["detail"].get("human_message")
+        if isinstance(words, str):
+            return words[:500]
+    return ""
+
+
+def _names_override(result, spec: Action, reason: str) -> bool:
+    """A refusal a flag can push past: a conflict (409), or a refusal that names the flag."""
+    if result.ok:
+        return False
+    if result.status == 409:
+        return True
+    text = (reason or result.detail()).lower()
+    return result.status in (400, 422) and any(f"{flag}=true" in text for flag in spec.overrides)
+
+
+def _fingerprint(action: dict) -> str:
+    import hashlib
+
+    raw = json.dumps([action["method"], action["path"], action.get("query"), action.get("body")],
+                     sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
 # At most this many results are drawn for one answer.
 MAX_DRAWN = 2
 
@@ -1378,10 +1681,13 @@ _CLAIMS_A_CARD = re.compile(
     r"(tap confirm|bonyeza confirm|fill (it|them|this|the form|in the form)? ?in|form is ready|"
     r"fomu iko tayari|jaza fomu)", re.I)
 
-# Form fields that pick one of the person's own records, and where to list them from.
-_CHOICE_SOURCES = {"plan_id": "/api/plans", "router_id": "/api/routers"}
-# lists of customers in a form (who gets an SMS): shown by name
-_PEOPLE_SOURCES = {"customer_ids": "/api/customers", "exclude_customer_ids": "/api/customers"}
+# A state read from a live thing, as people say it ("ether2 · PPPoE").
+_STATE_WORDS = {"pppoe": "PPPoE", "plain": "Plain (no login)", "dual": "PPPoE + hotspot", "hotspot": "Hotspot",
+                "unassigned": "Not in use", "true": "Yes", "false": "No"}
+
+
+def _option_words(label: str) -> str:
+    return " · ".join(_STATE_WORDS.get(p.strip().lower(), p.strip()) for p in label.split(" · "))
 
 
 def _sensitive() -> frozenset:

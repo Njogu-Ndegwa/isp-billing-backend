@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import delete as sql_delete, inspect, or_, select, update, func, case, text
 from sqlalchemy.orm import selectinload
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import ConfigDict, BaseModel, field_validator, model_validator
 from typing import Literal, Optional, List
 from datetime import datetime, timedelta
 import httpx
@@ -171,6 +171,10 @@ class RouterIdentityUpdate(BaseModel):
 
 
 class RouterStatusAlertsRequest(BaseModel):
+    # the assistant's form shows the settings as they are now, read from the router's own record
+    model_config = ConfigDict(json_schema_extra={"x-current": {"fields": {
+        "enabled": "status_alerts_enabled", "delay_minutes": "status_alert_delay_minutes"}}})
+
     enabled: Optional[bool] = None
     delay_minutes: Optional[AlertDelayMinutes] = None
 

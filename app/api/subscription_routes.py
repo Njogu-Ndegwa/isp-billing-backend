@@ -1626,7 +1626,8 @@ class AdminSubscriptionPatch(BaseModel):
     subscription_expires_at: Optional[str] = None
     adjust_days: Optional[int] = None
     # Country market (KE, CM, UG, TZ, ZM, HT): sets currency, pricing, payment methods.
-    market_code: Optional[str] = None
+    market_code: Optional[str] = Field(None, json_schema_extra={"x-enum-labels": {
+        "KE": "Kenya", "CM": "Cameroon", "UG": "Uganda", "TZ": "Tanzania", "ZM": "Zambia", "HT": "Haiti"}})
     # Price in the market's subscription currency (flat fee, or the minimum
     # for usage markets). Send clear_price_override=true to remove it.
     price_override: Optional[float] = None

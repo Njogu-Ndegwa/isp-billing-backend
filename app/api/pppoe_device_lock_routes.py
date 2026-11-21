@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import ConfigDict, BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,6 +50,9 @@ class DeviceLockRequest(BaseModel):
 
 
 class DeviceLockDefaultRequest(BaseModel):
+    # the assistant's form shows the switch as it is now, read from the router's own record
+    model_config = ConfigDict(json_schema_extra={"x-current": {"fields": {"enabled": "pppoe_lock_new_customers"}}})
+
     enabled: bool
 
 

@@ -4544,10 +4544,15 @@ async def get_port_config_job(
     return _public_port_config_job(job)
 
 
-def _ports_field(mode: str):
+def _ports_field(mode: str, current: str):
+    # In the assistant's form: the router's own ports to tick, each with its mode now, starting
+    # from the ones on this mode; what was ticked or unticked is sent as add/remove.
     return Field(None, description=(
         f"The complete list of {mode} ports. Any {mode} port left out goes back to hotspot. "
-        "To change one or two ports, use add/remove instead."))
+        "To change one or two ports, use add/remove instead."), json_schema_extra={"x-options-from": {
+            "path": "/api/routers/{router_id}/ports", "list": "ports", "value": "port",
+            "label": "{port} · {service}", "off": "link_up", "current": current, "changes": ["add", "remove"],
+        }})
 
 
 def _add_field(mode: str):
@@ -4586,7 +4591,7 @@ def refuse_wan_ports(router_obj, ports: List[str], mode: str) -> None:
 
 
 class SetPPPoEPortsRequest(BaseModel):
-    ports: Optional[List[str]] = _ports_field("PPPoE")
+    ports: Optional[List[str]] = _ports_field("PPPoE", "pppoe_ports")
     add: Optional[List[str]] = _add_field("PPPoE")
     remove: Optional[List[str]] = _remove_field("PPPoE")
 
@@ -4922,7 +4927,7 @@ async def set_pppoe_ports(
 # =========================================================================
 
 class SetPlainPortsRequest(BaseModel):
-    ports: Optional[List[str]] = _ports_field("plain (no login)")
+    ports: Optional[List[str]] = _ports_field("plain (no login)", "plain_ports")
     add: Optional[List[str]] = _add_field("plain (no login)")
     remove: Optional[List[str]] = _remove_field("plain (no login)")
 
@@ -5178,7 +5183,7 @@ async def set_plain_ports(
 # =========================================================================
 
 class SetDualPortsRequest(BaseModel):
-    ports: Optional[List[str]] = _ports_field("dual (PPPoE + hotspot)")
+    ports: Optional[List[str]] = _ports_field("dual (PPPoE + hotspot)", "dual_ports")
     add: Optional[List[str]] = _add_field("dual (PPPoE + hotspot)")
     remove: Optional[List[str]] = _remove_field("dual (PPPoE + hotspot)")
     repair_hotspot: Optional[bool] = None

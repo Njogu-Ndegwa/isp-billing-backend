@@ -1538,7 +1538,7 @@ async def test_an_sms_form_names_the_chosen_customers_and_never_widens_to_everyo
     events = sse_events((await client.post("/api/assistant/chat", json={"message": "text Amina"}, headers=auth(token))).text)
     card = next(e for e in events if e["type"] == "action")
     fields = {f["name"]: f for f in card["form"]}
-    assert fields["customer_ids"]["option_labels"] == {str(amina.id): "Amina Wanjiru"}
+    assert fields["customer_ids"]["option_labels"] == {str(amina.id): "Amina Wanjiru · 254711000001"}
     assert fields["filter"]["kind"] == "select" and "active" in fields["filter"]["options"]
     # unticking her must not send to everyone
     use_model([text_reply("ok")])
@@ -1696,7 +1696,8 @@ def test_plan_customer_and_sms_forms_follow_the_choices_that_matter():
 
     customer = {f["name"]: f for f in form_fields(act("POST", "/api/customers/register"), {})}
     assert customer["pppoe_username"]["when"] == {"plan_id.connection_type": ["pppoe"]}
-    assert customer["static_ip"]["when"] == {"plan_id.connection_type": ["static_ip"]}
+    # a fixed address for a static-IP customer, and optionally for a PPPoE one (as on the classic page)
+    assert customer["static_ip"]["when"] == {"plan_id.connection_type": ["pppoe", "static_ip"]}
     assert customer["mac_address"]["when"] == {"plan_id.connection_type": ["hotspot"]}
 
     send = act("POST", "/api/messaging/send")
