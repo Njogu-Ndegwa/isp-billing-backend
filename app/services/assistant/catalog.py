@@ -576,21 +576,32 @@ def form_fields(action: Action, body: Any, context: Optional[dict] = None) -> Op
         for bound in ("minimum", "maximum", "maxLength"):
             if isinstance(prop.get(bound), (int, float)):
                 f[bound] = prop[bound]
+        if isinstance(prop.get("x-upload"), dict):
+            # a photo or video the person picks on their phone: the page uploads it and fills in its address
+            f["upload"] = {k: v for k, v in prop["x-upload"].items() if k in ("accept", "ticket")}
+        if prop.get("x-admin-only"):
+            f["admin_only"] = True
         if kind == "password":
             pass  # never sent back to the page, never pre-filled
         elif current.get(key) is not None:
             f["value"] = current[key]
+        elif isinstance(context, dict) and context.get(key) is not None and not is_secret_key(key):
+            f["value"] = context[key]  # an edit: the record's value now, so nothing reads as blank or "off"
         elif prop.get("default") is not None:
             f["value"] = prop["default"]
+            f["default"] = True  # the API's own default, not something the person or assistant chose
         out.append(f)
     out = _fit_to_choices(schema, out, current, context)
     out.sort(key=lambda f: not f["required"])  # stable: required first, schema order within
     # the limit is what is on screen at once: fields of one kind are shown one kind at a time
+    # a choice that other fields hang on (photo or video) is never the one left out
+    deciding = {c.split(".", 1)[0] for c in choice_groups(schema)}
+    out.sort(key=lambda f: (not f["required"], f["name"] not in deciding, bool(f.get("admin_only"))))
     shown, kept = 0, []
     for f in out:
         if "when" not in f:
             shown += 1
-            if shown > FORM_FIELD_LIMIT:
+            if shown > FORM_FIELD_LIMIT and f["name"] not in deciding:
                 continue
         kept.append(f)
     return kept or None
