@@ -1681,129 +1681,133 @@ async def check_illegal_connections(
                         connected_devices[normalized_mac]["has_queue"] = True
                         connected_devices[normalized_mac]["queue_name"] = queue.get("name", "")
             
-            # Build set of MACs that are actually using internet (hotspot active or bypassed)
-            actually_using_internet = set()
-            for mac, device_info in connected_devices.items():
-                if device_info.get("hotspot_active") or device_info.get("has_bypass"):
-                    actually_using_internet.add(mac)
+        # Build set of MACs that are actually using internet (hotspot active or bypassed)
+        actually_using_internet = set()
+        for mac, device_info in connected_devices.items():
+            if device_info.get("hotspot_active") or device_info.get("has_bypass"):
+                actually_using_internet.add(mac)
+        
+        # Now compare: connected devices vs active customers
+        unauthorized_devices = []
+        expired_still_connected = []
+        skipped_protected = []
+        skipped_not_bypassing = 0  # Count of ARP-only devices (blocked by captive portal)
+        
+        for mac, device_info in connected_devices.items():
+            # PROTECTION CHECK: Skip system/infrastructure devices
+            ip_addr = device_info.get("ip_address", "")
+            interface = device_info.get("interface", "")
+            hostname = device_info.get("dhcp_hostname", "")
             
-            # Now compare: connected devices vs active customers
-            unauthorized_devices = []
-            expired_still_connected = []
-            skipped_protected = []
-            skipped_not_bypassing = 0  # Count of ARP-only devices (blocked by captive portal)
+            # an access point, switch or router (known vendor or model name) is equipment, not a
+            # stranger using the internet: the same classifier the port view uses
+            equipment = classify_device(mac_address=mac, hostnames=(hostname,), source_ip=ip_addr,
+                                        hotspot_subnets=None)["device_class"] == "infrastructure"
+            if equipment or is_protected_device(ip_address=ip_addr, interface=interface, hostname=hostname):
+                skipped_protected.append({
+                    "mac_address": device_info["mac_address"],
+                    "ip_address": ip_addr,
+                    "interface": interface,
+                    "hostname": hostname,
+                    "reason": "Equipment (access point, switch or router)" if equipment else "Protected system/infrastructure device"
+                })
+                logger.debug(f"[ILLEGAL-CHECK] Skipping protected device: {ip_addr} on {interface}")
+                continue
             
-            for mac, device_info in connected_devices.items():
-                # PROTECTION CHECK: Skip system/infrastructure devices
-                ip_addr = device_info.get("ip_address", "")
-                interface = device_info.get("interface", "")
-                hostname = device_info.get("dhcp_hostname", "")
+            # If only_bypassing is True, skip devices that are just in ARP
+            # (they're connected to WiFi but blocked by captive portal)
+            is_actually_using = mac in actually_using_internet
+            if only_bypassing and not is_actually_using:
+                skipped_not_bypassing += 1
+                continue
+            
+            customer_info = known_macs.get(mac)
+            
+            if not customer_info:
+                # MAC not in database at all - UNAUTHORIZED
+                bytes_total = device_info.get("bytes_in", 0) + device_info.get("bytes_out", 0)
+                severity = "CRITICAL" if is_actually_using else "LOW"  # Lower severity if just in ARP
+                if bytes_total > 1000000:
+                    severity = "CRITICAL"
+                elif is_actually_using:
+                    severity = "HIGH"
                 
-                if is_protected_device(ip_address=ip_addr, interface=interface, hostname=hostname):
-                    skipped_protected.append({
-                        "mac_address": device_info["mac_address"],
-                        "ip_address": ip_addr,
-                        "interface": interface,
-                        "hostname": hostname,
-                        "reason": "Protected system/infrastructure device"
-                    })
-                    logger.debug(f"[ILLEGAL-CHECK] Skipping protected device: {ip_addr} on {interface}")
-                    continue
-                
-                # If only_bypassing is True, skip devices that are just in ARP
-                # (they're connected to WiFi but blocked by captive portal)
-                is_actually_using = mac in actually_using_internet
-                if only_bypassing and not is_actually_using:
-                    skipped_not_bypassing += 1
-                    continue
-                
-                customer_info = known_macs.get(mac)
-                
-                if not customer_info:
-                    # MAC not in database at all - UNAUTHORIZED
-                    bytes_total = device_info.get("bytes_in", 0) + device_info.get("bytes_out", 0)
-                    severity = "CRITICAL" if is_actually_using else "LOW"  # Lower severity if just in ARP
-                    if bytes_total > 1000000:
-                        severity = "CRITICAL"
-                    elif is_actually_using:
-                        severity = "HIGH"
-                    
-                    unauthorized_devices.append({
-                        "type": "UNAUTHORIZED",
-                        "severity": severity,
-                        "mac_address": device_info["mac_address"],
-                        "ip_address": device_info["ip_address"],
-                        "source": device_info["source"],
-                        "interface": device_info.get("interface", ""),
-                        "hostname": device_info.get("dhcp_hostname", ""),
-                        "uptime": device_info.get("uptime", ""),
-                        "is_bypassing": is_actually_using,  # True = actually using internet
-                        "bytes_downloaded": device_info.get("bytes_in", 0),
-                        "bytes_uploaded": device_info.get("bytes_out", 0),
-                        "bytes_total_mb": round(bytes_total / 1048576, 2),
-                        "has_queue": device_info.get("has_queue", False),
-                        "issue": "Device using internet but NOT registered in customer database!"
-                    })
-                elif customer_info["status"] != "active":
-                    # Customer exists but is NOT ACTIVE - should not have access
-                    bytes_total = device_info.get("bytes_in", 0) + device_info.get("bytes_out", 0)
-                    severity = "CRITICAL" if is_actually_using else "MEDIUM"
-                    expired_still_connected.append({
-                        "type": "EXPIRED_CONNECTED",
-                        "severity": severity,
-                        "mac_address": device_info["mac_address"],
-                        "ip_address": device_info["ip_address"],
-                        "source": device_info["source"],
-                        "customer_id": customer_info["id"],
-                        "customer_name": customer_info["name"],
-                        "customer_status": customer_info["status"],
-                        "expiry": customer_info["expiry"],
-                        "plan_name": customer_info.get("plan_name", ""),
-                        "uptime": device_info.get("uptime", ""),
-                        "is_bypassing": is_actually_using,  # True = actually using internet
-                        "bytes_downloaded": device_info.get("bytes_in", 0),
-                        "bytes_uploaded": device_info.get("bytes_out", 0),
-                        "bytes_total_mb": round(bytes_total / 1048576, 2),
-                        "has_queue": device_info.get("has_queue", False),
-                        "issue": f"Customer is {customer_info['status']} but still {'USING INTERNET!' if is_actually_using else 'in ARP table'}"
-                    })
-            
-            # Combine all issues
-            all_issues = unauthorized_devices + expired_still_connected
-            
-            # Sort by severity
-            severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-            all_issues.sort(key=lambda x: severity_order.get(x.get("severity", "LOW"), 99))
-            
-            # Count how many are actually bypassing vs just in ARP
-            bypassing_unauthorized = len([i for i in unauthorized_devices if i.get("is_bypassing")])
-            bypassing_expired = len([i for i in expired_still_connected if i.get("is_bypassing")])
-            
-            return {
-                "router_id": router_id,
-                "router_name": router_obj.name,
-                "scan_time": datetime.utcnow().isoformat(),
-                "filter_mode": "only_bypassing" if only_bypassing else "all_devices",
-                "summary": {
-                    "total_connected_devices": len(connected_devices),
-                    "actually_using_internet": len(actually_using_internet),  # Hotspot active or bypassed
-                    "active_customers": len(active_macs),
-                    "total_issues": len(all_issues),
-                    "critical": len([i for i in all_issues if i.get("severity") == "CRITICAL"]),
-                    "high": len([i for i in all_issues if i.get("severity") == "HIGH"]),
-                    "unauthorized_devices": len(unauthorized_devices),
-                    "unauthorized_bypassing": bypassing_unauthorized,  # Actually using internet!
-                    "expired_still_connected": len(expired_still_connected),
-                    "expired_bypassing": bypassing_expired,  # Actually using internet!
-                    "skipped_protected": len(skipped_protected),
-                    "skipped_not_bypassing": skipped_not_bypassing if only_bypassing else 0
-                },
-                "issues": all_issues,
-                "protected_devices": skipped_protected,
-                "note": "Devices with is_bypassing=true are ACTUALLY using internet. Others are just in ARP (blocked by captive portal).",
-                "recommendation": f"Focus on {bypassing_unauthorized + bypassing_expired} devices with is_bypassing=true - these are actively using internet without paying!" if (bypassing_unauthorized + bypassing_expired) > 0 else ("Use POST /api/routers/{router_id}/remove-illegal-users to remove all" if all_issues else "No illegal connections found")
-            }
-            
+                unauthorized_devices.append({
+                    "type": "UNAUTHORIZED",
+                    "severity": severity,
+                    "mac_address": device_info["mac_address"],
+                    "ip_address": device_info["ip_address"],
+                    "source": device_info["source"],
+                    "interface": device_info.get("interface", ""),
+                    "hostname": device_info.get("dhcp_hostname", ""),
+                    "uptime": device_info.get("uptime", ""),
+                    "is_bypassing": is_actually_using,  # True = actually using internet
+                    "bytes_downloaded": device_info.get("bytes_in", 0),
+                    "bytes_uploaded": device_info.get("bytes_out", 0),
+                    "bytes_total_mb": round(bytes_total / 1048576, 2),
+                    "has_queue": device_info.get("has_queue", False),
+                    "issue": "Device using internet but NOT registered in customer database!"
+                })
+            elif customer_info["status"] != "active":
+                # Customer exists but is NOT ACTIVE - should not have access
+                bytes_total = device_info.get("bytes_in", 0) + device_info.get("bytes_out", 0)
+                severity = "CRITICAL" if is_actually_using else "MEDIUM"
+                expired_still_connected.append({
+                    "type": "EXPIRED_CONNECTED",
+                    "severity": severity,
+                    "mac_address": device_info["mac_address"],
+                    "ip_address": device_info["ip_address"],
+                    "source": device_info["source"],
+                    "customer_id": customer_info["id"],
+                    "customer_name": customer_info["name"],
+                    "customer_status": customer_info["status"],
+                    "expiry": customer_info["expiry"],
+                    "plan_name": customer_info.get("plan_name", ""),
+                    "uptime": device_info.get("uptime", ""),
+                    "is_bypassing": is_actually_using,  # True = actually using internet
+                    "bytes_downloaded": device_info.get("bytes_in", 0),
+                    "bytes_uploaded": device_info.get("bytes_out", 0),
+                    "bytes_total_mb": round(bytes_total / 1048576, 2),
+                    "has_queue": device_info.get("has_queue", False),
+                    "issue": f"Customer is {customer_info['status']} but still {'USING INTERNET!' if is_actually_using else 'in ARP table'}"
+                })
+        
+        # Combine all issues
+        all_issues = unauthorized_devices + expired_still_connected
+        
+        # Sort by severity
+        severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        all_issues.sort(key=lambda x: severity_order.get(x.get("severity", "LOW"), 99))
+        
+        # Count how many are actually bypassing vs just in ARP
+        bypassing_unauthorized = len([i for i in unauthorized_devices if i.get("is_bypassing")])
+        bypassing_expired = len([i for i in expired_still_connected if i.get("is_bypassing")])
+        
+        return {
+            "router_id": router_id,
+            "router_name": router_obj.name,
+            "scan_time": datetime.utcnow().isoformat(),
+            "filter_mode": "only_bypassing" if only_bypassing else "all_devices",
+            "summary": {
+                "total_connected_devices": len(connected_devices),
+                "actually_using_internet": len(actually_using_internet),  # Hotspot active or bypassed
+                "active_customers": len(active_macs),
+                "total_issues": len(all_issues),
+                "critical": len([i for i in all_issues if i.get("severity") == "CRITICAL"]),
+                "high": len([i for i in all_issues if i.get("severity") == "HIGH"]),
+                "unauthorized_devices": len(unauthorized_devices),
+                "unauthorized_bypassing": bypassing_unauthorized,  # Actually using internet!
+                "expired_still_connected": len(expired_still_connected),
+                "expired_bypassing": bypassing_expired,  # Actually using internet!
+                "skipped_protected": len(skipped_protected),
+                "skipped_not_bypassing": skipped_not_bypassing if only_bypassing else 0
+            },
+            "issues": all_issues,
+            "protected_devices": skipped_protected,
+            "note": "Devices with is_bypassing=true are ACTUALLY using internet. Others are just in ARP (blocked by captive portal).",
+            "recommendation": f"Focus on {bypassing_unauthorized + bypassing_expired} devices with is_bypassing=true - these are actively using internet without paying!" if (bypassing_unauthorized + bypassing_expired) > 0 else ("Use POST /api/routers/{router_id}/remove-illegal-users to remove all" if all_issues else "No illegal connections found")
+        }
+        
     except HTTPException:
         raise
     except Exception as e:
@@ -3145,7 +3149,13 @@ def _analyze_port_rows(
         if address
     )
 
-    known_customer_macs = set(customer_by_mac.keys())
+    # A PPPoE session's device (the customer's own router) is that customer's, whatever its MAC:
+    # the lookup carries logins as "login:<username>" keys next to the MACs.
+    for mac in active_ppp_macs:
+        owner = customer_by_mac.get(f"login:{device_meta.get(mac, {}).get('ppp_user', '')}")
+        if owner and mac not in customer_by_mac:
+            customer_by_mac = {**customer_by_mac, mac: {**owner, "pppoe": True, "via": "pppoe_login"}}
+    known_customer_macs = {k for k in customer_by_mac if not k.startswith("login:")}
     ethernet_port_names = [
         row.get("name")
         for row in interface_rows
@@ -3244,7 +3254,8 @@ def _analyze_port_rows(
                     metadata.get("identity"), metadata.get("hostname")
                 )
                 sample["name"] = hardware_name or None
-            if _looks_like_infrastructure_device(mac, metadata, known_customer_macs):
+            if (_looks_like_infrastructure_device(mac, metadata, known_customer_macs)
+                    or sample["device_class"] == "infrastructure"):
                 infra = {
                     "mac": mac,
                     "name": _first_nonempty(metadata.get("identity"), metadata.get("hostname")),
@@ -3362,7 +3373,7 @@ def _analyze_port_rows(
                     "hotspot_bypassed": len([mac for mac in learned_macs if mac in hotspot_bypassed]),
                     "active_hotspot_sessions": len([mac for mac in learned_macs if mac in active_hotspot_macs]),
                     "active_ppp_sessions": len([mac for mac in learned_macs if mac in active_ppp_macs]),
-                    "unknown_devices": len(unknown_macs),
+                    "unknown_devices": sum(1 for x in downstream_samples if x["kind"] == "unknown_device"),
                     "infrastructure_devices": len(infrastructure_here),
                 },
                 "health": {
@@ -3735,22 +3746,38 @@ async def get_router_port_analytics(
             Customer.mac_address,
             Customer.status,
             Customer.pppoe_username,
-        ).where(
-            Customer.router_id == router_id,
-            Customer.mac_address.isnot(None),
-        )
+            Customer.pppoe_bound_mac,
+        ).where(Customer.router_id == router_id)
         customer_result = await db.execute(stmt)
         customer_by_mac = {}
-        for customer_id, name, mac_address, status, pppoe_username in customer_result.all():
-            normalized_mac = _normalize_mac_safe(mac_address)
-            if not normalized_mac:
-                continue
-            customer_by_mac[normalized_mac] = {
+        by_id = {}
+        for customer_id, name, mac_address, status, pppoe_username, bound_mac in customer_result.all():
+            info = {
                 "id": customer_id,
                 "name": name,
                 "status": status.value if status else None,
                 "pppoe": bool(pppoe_username),
             }
+            by_id[customer_id] = info
+            for raw in (mac_address, bound_mac):
+                normalized_mac = _normalize_mac_safe(raw)
+                if normalized_mac and normalized_mac not in customer_by_mac:
+                    customer_by_mac[normalized_mac] = info
+            if pppoe_username:
+                # matched to a live PPPoE session's device in _analyze_port_rows
+                customer_by_mac[f"login:{pppoe_username}"] = info
+        # a customer's other devices (a TV, a second phone) are theirs too
+        if by_id:
+            from app.db.models import DevicePairing
+
+            pairs = await db.execute(
+                select(DevicePairing.customer_id, DevicePairing.device_mac)
+                .where(DevicePairing.customer_id.in_(list(by_id)))
+            )
+            for owner_id, device_mac in pairs.all():
+                normalized_mac = _normalize_mac_safe(device_mac)
+                if normalized_mac and normalized_mac not in customer_by_mac:
+                    customer_by_mac[normalized_mac] = by_id[owner_id]
 
         # Revenue per port from RECORDED attribution: each payment is stamped
         # with the port the customer's device was on around payment time (see
