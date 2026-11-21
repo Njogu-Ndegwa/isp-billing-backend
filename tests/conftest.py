@@ -305,3 +305,22 @@ def _reset_realtime_state():
     yield
     realtime_state.reset_realtime_state()
     customer_events.reset_session_tracker()
+
+
+# -- CI sharding ---------------------------------------------------------------------
+# CI_SHARD="i/n" keeps only this shard's tests, so CI can run the suite as n jobs at
+# once. A test's shard comes from a hash of its id, the same on every machine and every
+# xdist worker, so the shards together are exactly the whole suite. Unset: everything.
+
+def pytest_collection_modifyitems(config, items):
+    shard = os.environ.get("CI_SHARD", "")
+    if not shard:
+        return
+    import zlib
+
+    index, total = (int(x) for x in shard.split("/"))
+    keep, drop = [], []
+    for item in items:
+        (keep if zlib.crc32(item.nodeid.encode()) % total == index - 1 else drop).append(item)
+    items[:] = keep
+    config.hook.pytest_deselected(items=drop)

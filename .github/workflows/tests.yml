@@ -16,8 +16,17 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  pytest:
+  # The suite is CPU-bound on one 4-core runner (about 10 min), so it runs as three
+  # jobs at once, each with its own Postgres, each taking a third of the tests
+  # (CI_SHARD, see conftest). The "pytest" job below is the one branch protection
+  # requires: it passes only when every shard passed.
+  pytest-shard:
+    name: pytest (shard ${{ matrix.shard }}/3)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     # Headroom, not a fix: the real cure for a slow suite is fewer round trips
     # (see the single catalog query in conftest). This only stops a legitimately
     # passing run from being killed while the suite grows.
@@ -48,6 +57,7 @@ jobs:
     env:
       # conftest reads this; app.config.Settings picks it up too.
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/isp_billing_test
+      CI_SHARD: ${{ matrix.shard }}/3
 
     steps:
       - uses: actions/checkout@v4
@@ -86,9 +96,7 @@ jobs:
         # -n auto splits across the runner's cores. Each xdist worker gets its
         # own Postgres schema (see conftest), so workers cannot truncate each
         # other's tables mid-assertion.
-        # Database tests mostly wait on Postgres, so more workers than cores keeps
-        # the CPU busy.
-        run: pytest -q --tb=short -n 8 --junitxml=pytest-report.xml
+        run: pytest -q --tb=short -n auto --junitxml=pytest-report.xml
 
       # Renders the run as a pass/fail table on the Actions summary page, naming
       # any failing test, so the result is readable without opening the log.
@@ -105,9 +113,18 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pytest-report
+          name: pytest-report-${{ matrix.shard }}
           path: pytest-report.xml
           if-no-files-found: ignore
+
+  pytest:
+    needs: pytest-shard
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Every shard passed
+        run: test "${{ needs.pytest-shard.result }}" = "success"
 
   # The ad media Cloudflare Worker. Nothing here deploys it.
   media-worker:
