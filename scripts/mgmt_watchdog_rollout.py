@@ -1,7 +1,9 @@
 """Bring the management-tunnel watchdog already on routers to the current
-template (app/services/mgmt_watchdog_script.py): SSTP v4 / WireGuard v5, which
+template (app/services/mgmt_watchdog_script.py): SSTP v4 / WireGuard v6, which
 re-check the tunnel after the splay delay instead of restarting a tunnel that
-has just come back (router 715, 2026-11-13).
+has just come back (router 715, 2026-11-13). The WireGuard listen-port rotation
+is kept as installed: this script never switches it on (only
+standard_runtime_enrol does, after its firewall check).
 
 New installs already get the current template. Routers that have the
 watchdog are never revisited by standard_runtime_enrol, so they need this.
