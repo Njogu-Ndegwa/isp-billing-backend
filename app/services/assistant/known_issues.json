@@ -1,0 +1,1260 @@
+{
+  "version": "2026-11-21",
+  "issues": [
+    {
+      "id": "triage-order",
+      "title": "Check in this order before guessing",
+      "symptoms": [
+        "hotspot not working",
+        "the whole system is down",
+        "system nzima haifanyi",
+        "haina internet",
+        "connected, no internet",
+        "imeconnect lakini hakuna net",
+        "the login page doesn't show",
+        "pays then no internet",
+        "some sites work, some don't",
+        "some APs work and the one next to it doesn't",
+        "it started after the load balancing"
+      ],
+      "keywords": [
+        "not working",
+        "haifanyi",
+        "system wide",
+        "entire system",
+        "whole system",
+        "no internet",
+        "hakuna net",
+        "haina internet",
+        "connected no internet",
+        "down"
+      ],
+      "cause": "Many different faults look the same to a customer ('connected, no internet'). Payments, the router's own numbers and one real phone tell them apart in minutes; guessing costs hours.",
+      "checks": [
+        "1. Pin down which router, which AP or SSID, and which port the person means, and say it back to them. If they have several routers, look at all of them: an old or reset router is often the broken or 'free' network. A device's IP alone does not tell you which router it is on.",
+        "2. Is it really everywhere? GET /api/mpesa/transactions?router_id={router_id} for today. If payments keep arriving after the time of the complaint, the hotspot works somewhere, so the fault is one AP, one area or one line; say so with the numbers. Check that payers got time with GET /api/customers/{customer_id} (ACTIVE, expiry after the payment). Short plans running out is not a fault.",
+        "3. Is the router online and steady? GET /api/routers/{router_id}/uptime for drops in the last day, GET /api/routers/{router_id}/live for CPU, board and line traffic. If the router is up but nobody has internet, check the ISP line itself (modem lights, a phone straight on the modem) and that the internet cable is in the router's internet port, not a LAN port.",
+        "4. Is load balancing on? GET /api/routers/{router_id}/load-balancing. If yes, first rule out a second line that answers but drops traffic (lb-line-dropping-traffic).",
+        "5. Go AP by AP: which ones work, which model, anything new, reset or replaced recently, any radio links or extra routers. Look for an AP in router or PPPoE mode, a radio link with WDS off, a second DHCP server, or a far end with no power.",
+        "6. Trace one real phone. Ask for its Wi-Fi details screenshot (tap the gear on the connected network): it shows the IP, the gateway and the MAC the phone uses on that network. The 'device MAC' under About phone is not what the router sees. Compare with a phone that works, then run GET /api/routers/{router_id}/diagnose/{mac_address}, or GET /api/pppoe/{router_id}/diagnose/{username} for a PPPoE customer. For the whole hotspot, GET /api/routers/by-identity/{identity}/hotspot-diagnostics.",
+        "7. Only after all that, look at Wi-Fi signal quality and idle logouts (wifi-drops-sessions)."
+      ],
+      "fix": "Report numbers, not theories. Don't say 'found it' until the fix is shown working (their phone browses). Put the fix in the same message as the finding, for example 'set that AP to AP mode, DHCP off'. When the login page doesn't show, never just tell them to pay: tell them to open neverssl.com in the browser to bring the page up. If you got something wrong, correct it plainly in one line. Don't drop a finding because of a mix-up over who said what; recheck the evidence instead.",
+      "bitwave": "When the checks point to something only Bitwave can change on the router, say so and tell the reseller exactly what to send Bitwave support: the router name, the AP or port, the time it started, and a phone's Wi-Fi details screenshot.",
+      "not_this_if": null
+    },
+    {
+      "id": "ap-in-router-mode",
+      "title": "An access point is in router mode or dialing PPPoE on the hotspot",
+      "symptoms": [
+        "some APs work and the one next to it doesn't",
+        "same switch, two APs work, the rest don't, swapping ports changes nothing",
+        "connected but no internet on one AP",
+        "AP moja inafanya, ingine haifanyi",
+        "imeconnect lakini hakuna net kwa AP moja",
+        "no login page on some APs",
+        "one AP gives free internet",
+        "AP moja wanatumia bure",
+        "all the APs say obtaining IP",
+        "a new SSID shows connected without internet"
+      ],
+      "keywords": [
+        "access point",
+        "access points",
+        "aps",
+        "tenda",
+        "mercusys",
+        "tp-link",
+        "router mode",
+        "nat mode",
+        "wisp",
+        "repeater",
+        "ap mode",
+        "bridge mode",
+        "obtaining ip",
+        "one ap",
+        "new ap",
+        "free internet",
+        "bure",
+        "pppoe on the ap"
+      ],
+      "cause": "An AP plugged into a hotspot port is set up as a router (router, NAT or WISP mode) or is dialing PPPoE itself. Its Wi-Fi users are hidden behind that one AP: they sit stuck at the login page, or all ride one paid or staff login for free, or depend on the AP's own PPPoE account and go dead when it expires. A separate router broadcasting its own SSID that isn't wired into the hotspot gives the same 'connected without internet'.",
+      "checks": [
+        "Ask which APs or SSIDs work and which don't, and whether the bad one is new, was reset or was replaced recently. 'It worked for months' does not rule this out.",
+        "Ask for the Wi-Fi details screenshot from a phone on the bad AP and one on a good AP. If the bad one's IP and gateway are in a different range from the good one, something on that AP is acting as a router.",
+        "GET /api/routers/{router_id}/access-points to see which APs the router knows about.",
+        "GET /api/routers/by-identity/{identity}/hotspot-diagnostics: one device with very many connections that never logs in, or hotspot users that never log in, points to a router-mode AP.",
+        "GET /api/pppoe/{router_id}/logs: repeated PPPoE logins or failures for one account coming from the hotspot side mean an AP is dialing PPPoE.",
+        "GET /api/routers/{router_id}/routeros?menu=/interface/bridge/host: which MACs sit behind each port. A port with one MAC and many connections (or GET /api/routers/{router_id}/routeros?menu=/ip/hotspot/host showing one host with heavy traffic that never logs in) is a device routing for others."
+      ],
+      "fix": "Open the AP's settings and set it to Access Point (bridge) mode, with its DHCP server off and PPPoE off. The cable from the MikroTik goes into the AP's LAN port, not its WAN or internet port. Then customers turn Wi-Fi off and on once. If the AP dials PPPoE on purpose (a staff or free account), know that everyone on that AP gets internet without paying; if the account expired, that AP goes dead until it is renewed.",
+      "bitwave": "If the AP is already in AP mode and the problem stays, tell Bitwave support which AP or SSID and which port, and send a phone's Wi-Fi details screenshot from it. Bitwave support can check from our side what the router sees on that port.",
+      "not_this_if": "Every AP fails the same way (look at the line, the router or load balancing instead), or phones on the bad AP get the same address range as phones on good APs."
+    },
+    {
+      "id": "radio-link-wds-off",
+      "title": "A radio link with WDS off lets many phones share one paid login",
+      "symptoms": [
+        "one AP gives free internet",
+        "many phones on one plan",
+        "a whole building rides one voucher",
+        "customers behind the radio link don't need to pay",
+        "mtu mmoja analipa na wengi wanatumia",
+        "wanatumia bure upande wa radio",
+        "people on the far site keep getting logged in and out"
+      ],
+      "keywords": [
+        "nanostation",
+        "litebeam",
+        "ubiquiti",
+        "radio link",
+        "point to point",
+        "ptp",
+        "wds",
+        "transparent bridge",
+        "far site",
+        "far end",
+        "backhaul",
+        "one voucher",
+        "free internet",
+        "bure"
+      ],
+      "cause": "A point-to-point radio link (Ubiquiti NanoStation, LiteBeam and similar) with WDS off rewrites every device behind it to the radio's own MAC address. The hotspot sees one device, so one paid login or voucher serves everyone behind the link, and the login keeps flipping between them.",
+      "checks": [
+        "Ask which ports or APs sit behind a radio link, and whether WDS (Transparent Bridge mode) is on at BOTH ends.",
+        "GET /api/hotspot/{router_id}/logs: one device logging in and out over and over is the sign.",
+        "GET /api/routers/by-identity/{identity}/hotspot-diagnostics: one MAC with many connections or addresses behind the radio port.",
+        "GET /api/routers/{router_id}/diagnose/{mac_address} for the MAC that holds the plan: it will be the radio, not a phone.",
+        "GET /api/routers/{router_id}/routeros?menu=/ip/hotspot/host?contains={mac}: one MAC that keeps changing IP or logging in and out is a radio link rewriting the phones behind it."
+      ],
+      "fix": "Turn on WDS (on Ubiquiti: 'WDS (Transparent Bridge Mode)') on BOTH ends of the radio link and save. Each phone behind it then shows up on its own and has to pay for itself. Also check the far end has power: a radio that's switched off makes that whole area go dead.",
+      "bitwave": "If WDS is on at both ends and one MAC still carries many phones, tell Bitwave support which port the link is on. Bitwave support can check from our side.",
+      "not_this_if": "Phones behind the link each show up separately and pay separately."
+    },
+    {
+      "id": "rogue-dhcp",
+      "title": "A second router on the hotspot LAN is handing out addresses",
+      "symptoms": [
+        "connected, no internet",
+        "imeconnect lakini hakuna net",
+        "devices keep dropping",
+        "the login page shows sometimes and sometimes not",
+        "it started after I plugged in another router",
+        "the MikroTik has internet but customers don't",
+        "phones get a strange IP"
+      ],
+      "keywords": [
+        "dhcp",
+        "second router",
+        "another router",
+        "extra router",
+        "router ingine",
+        "lan to lan",
+        "wrong ip",
+        "different ip",
+        "strange ip",
+        "obtaining ip",
+        "rogue",
+        "connected without internet"
+      ],
+      "cause": "A second router or AP plugged into the hotspot LAN still has its own DHCP server switched on. Phones take an address from whichever answers first; those that take the wrong one get no internet and no login page, while the MikroTik and the internet line are fine.",
+      "checks": [
+        "Ask what was plugged in recently and into which port.",
+        "Compare a failing phone's Wi-Fi details (IP and gateway) with a working phone's. A different range means a second DHCP server.",
+        "GET /api/hotspot/{router_id}/logs: phones logged out with 'limiting addresses per mac', or one phone with two addresses.",
+        "GET /api/routers/by-identity/{identity}/hotspot-diagnostics.",
+        "GET /api/routers/{router_id}/routeros?menu=/ip/dhcp-server and GET /api/routers/{router_id}/routeros?menu=/ip/dhcp-server/lease: one DHCP server on the hotspot bridge is ours; leases from an address range we did not set, or phones reporting a gateway outside the hotspot range, point to a second DHCP server on the LAN."
+      ],
+      "fix": "Find the extra device on that port and turn its DHCP server off (it should run as an access point, with the cable in its LAN port), or unplug it to test. Customers then turn Wi-Fi off and on once to get a correct address. Right after the fix, give it about ten minutes before judging; old entries clear slowly.",
+      "bitwave": "If you can't find the device, tell Bitwave support the router and when it started. Bitwave support can see from our side which port the wrong addresses come from.",
+      "not_this_if": "Failing phones get the same address range as working ones, or the router itself has no internet."
+    },
+    {
+      "id": "station-radio-joined-other-network",
+      "title": "The router's own Wi-Fi joined another network, so strange devices appear",
+      "symptoms": [
+        "hundreds of devices I don't know under wlan1",
+        "many unknown devices on my router",
+        "vifaa mingi sijui zimetoka wapi",
+        "my list shows other people's APs",
+        "my router's Wi-Fi name disappeared"
+      ],
+      "keywords": [
+        "wlan1",
+        "unknown devices",
+        "strange devices",
+        "hundreds of devices",
+        "station mode",
+        "client mode",
+        "joined another wifi",
+        "built-in wifi",
+        "vifaa"
+      ],
+      "cause": "The MikroTik's built-in Wi-Fi radio was set to client (station) mode and joined someone else's Wi-Fi while still part of the hotspot. That other network's devices then appear in your list. They are not using your internet; it's a setting mistake, not an attack.",
+      "checks": [
+        "Ask whether the router's own Wi-Fi is meant to broadcast your hotspot or to pick up internet from another network.",
+        "GET /api/routers/{router_id}/wifi to see the radio's mode and network name."
+      ],
+      "fix": "If the router's Wi-Fi should broadcast your hotspot, it has to be in AP mode with your hotspot's name. Ask Bitwave to change it, then connect a phone to that name and check the sign-in page appears.",
+      "bitwave": "Tell Bitwave support the router and that its radio should broadcast the hotspot. Bitwave support can switch the radio to AP mode from our side. If that radio is your internet source on purpose, say so, because then it must not be changed.",
+      "not_this_if": "The 'unknown' devices are really your customers on your own SSID, or the router has no built-in Wi-Fi."
+    },
+    {
+      "id": "lb-line-dropping-traffic",
+      "title": "With load balancing, one line answers but drops traffic",
+      "symptoms": [
+        "some sites work, some don't",
+        "baadhi ya sites zinafungua, zingine hapana",
+        "since the load balancing",
+        "tangu load balancing net inasumbua",
+        "pays then no internet",
+        "connected, no internet for some customers",
+        "slow since load balancing",
+        "WhatsApp works but YouTube doesn't"
+      ],
+      "keywords": [
+        "load balancing",
+        "load balance",
+        "dual wan",
+        "two lines",
+        "second line",
+        "line two",
+        "wan2",
+        "failover",
+        "some sites",
+        "fup",
+        "bundle",
+        "modem",
+        "5g modem",
+        "4g modem"
+      ],
+      "cause": "On a router with two internet lines, one line can still answer the health checks (ping looks fine) but drop a large share of the traffic sent through it: out of bundle, under the ISP's fair-use limit, behind a proxy, or a home 4G/5G modem that can't hold many connections. Load balancing keeps sending part of every customer's traffic down it, so random sites and payments fail. Failover only notices a line that is completely dead, not one that is half broken.",
+      "checks": [
+        "GET /api/routers/{router_id}/load-balancing to confirm load balancing is on and see each line's state.",
+        "Ask if the second line came back recently (after a power cut, a new SIM or a new bundle).",
+        "GET /api/mpesa/transactions?router_id={router_id} for today: if payments still arrive, the hotspot works and this is a partial fault.",
+        "One phone on line two can look fine while a whole hotspot isn't; a test with one phone does not clear the line."
+      ],
+      "fix": "Have Bitwave put all traffic on the good line (the other stays as backup), then take the bad line up with your ISP: bundle, fair-use throttling, or the modem's connection limit. Turn load balancing back on only after the ISP confirms that line is fixed.",
+      "bitwave": "Tell Bitwave support 'some sites fail since load balancing' and the router. Bitwave support can measure from our side how much traffic each line drops and move everything to the good line in minutes. Ask before switching load balancing off yourself: on some setups turning it off the wrong way can leave the router with no working internet route.",
+      "not_this_if": "The router has only one internet line, or the same failure happens with load balancing off."
+    },
+    {
+      "id": "lb-portal-broken",
+      "title": "The login page died after load balancing was added",
+      "symptoms": [
+        "the login page stopped after load balancing",
+        "login page haionekani tangu load balancing",
+        "no one can pay since I added a second line",
+        "portal dead after setting up two lines"
+      ],
+      "keywords": [
+        "load balancing",
+        "pcc",
+        "portal",
+        "login page",
+        "second line",
+        "dual wan",
+        "my own load balancing",
+        "winbox load balancing"
+      ],
+      "cause": "Ordinary MikroTik load-balancing rules also catch customers who haven't logged in yet and send their login page out of an internet line instead of to the hotspot, so the sign-in page never loads. Bitwave's own load balancing is built to avoid this; hand-made or third-party rules usually aren't.",
+      "checks": [
+        "Ask who set up the load balancing (Bitwave or someone else) and when the login page stopped.",
+        "GET /api/routers/{router_id}/load-balancing.",
+        "Ask a phone that hasn't paid to open neverssl.com and say what it shows."
+      ],
+      "fix": "Don't add your own load-balancing rules on a hotspot router. Ask Bitwave to remove them and set up Bitwave's hotspot-safe load balancing instead.",
+      "bitwave": "Tell Bitwave support the router, that load balancing was added and by whom. Bitwave support can check and replace the rules from our side.",
+      "not_this_if": "The load balancing is Bitwave's own and the sign-in page works but some sites fail (see lb-line-dropping-traffic)."
+    },
+    {
+      "id": "login-page-missing",
+      "title": "The hotspot sign-in page is gone, so nobody can pay",
+      "symptoms": [
+        "the login page doesn't show",
+        "login page haionekani",
+        "haionyeshi page ya kulipa",
+        "the sign-in page says 404 / page not found",
+        "nobody can pay",
+        "payments stopped",
+        "it stopped after someone used WebFig or Winbox and restarted the router"
+      ],
+      "keywords": [
+        "login page",
+        "sign in page",
+        "sign-in page",
+        "portal",
+        "captive portal",
+        "404",
+        "page not found",
+        "popup",
+        "no popup",
+        "haionekani",
+        "webfig",
+        "winbox",
+        "kulipa"
+      ],
+      "cause": "The login page file on the router was deleted or emptied (usually during a WebFig or Winbox session followed by a reboot), or the portal's website isn't allowed before login. The router and the line are fine, but nobody reaches the payment page, so payments stop.",
+      "checks": [
+        "GET /api/mpesa/transactions?router_id={router_id} for today: no payments at all since a certain time, on a router that's online, makes the sign-in page the suspect.",
+        "GET /api/routers/{router_id}/uptime to confirm the router is online.",
+        "Ask someone on the Wi-Fi to open neverssl.com: a 404 or blank page instead of the payment page confirms it.",
+        "GET /api/routers/by-identity/{identity}/hotspot-diagnostics.",
+        "GET /api/routers/{router_id}/routeros?menu=/ip/hotspot and GET /api/routers/{router_id}/routeros?menu=/ip/hotspot/profile: the hotspot server is there, enabled, on the right interface, and its profile's html directory exists (GET /api/routers/{router_id}/routeros?menu=/file)."
+      ],
+      "fix": "Don't delete or edit files in the router's hotspot folder, and never copy another router's login page. Ask Bitwave to reinstall the login page, then open neverssl.com on a phone to check the payment page shows. Tell Bitwave who used WebFig or Winbox around the time it stopped; the file doesn't vanish on its own.",
+      "bitwave": "Tell Bitwave support: 'login page not showing on (router) since (time); router online'. Bitwave support can check and restore the login page from our side.",
+      "not_this_if": "Payments are still arriving from that router (the page works somewhere; check per-AP causes), or the router is offline (see router-offline-flapping)."
+    },
+    {
+      "id": "hotspot-setup-incomplete",
+      "title": "The router's hotspot was never fully set up",
+      "symptoms": [
+        "new router, nothing works on the hotspot",
+        "router mpya haifanyi",
+        "phones get an IP but no internet and no login page",
+        "second-hand router not working",
+        "it fails on cable and Wi-Fi alike",
+        "hotspot haistart"
+      ],
+      "keywords": [
+        "new router",
+        "second hand",
+        "second-hand",
+        "used router",
+        "previous provider",
+        "provisioning",
+        "setup",
+        "reset",
+        "no hotspot",
+        "hotspot not running",
+        "gets ip",
+        "mpya"
+      ],
+      "cause": "The router wasn't set up completely: it came from another provider with old settings (an old address range, old hotspot files), provisioning didn't finish, or the hotspot package is missing. Phones may get an address but no internet and no sign-in page, on cable and Wi-Fi alike.",
+      "checks": [
+        "Ask whether the router is new, second-hand or was reset, and whether it ever worked on Bitwave.",
+        "GET /api/routers to see that it is listed and online.",
+        "GET /api/routers/by-identity/{identity}/hotspot-diagnostics.",
+        "GET /api/routers/{router_id}/routeros?menu=/ip/hotspot, GET /api/routers/{router_id}/routeros?menu=/ip/dhcp-server and GET /api/routers/{router_id}/routeros?menu=/ip/firewall/nat: a hotspot server, a DHCP server on the hotspot bridge and the masquerade rule must all be there."
+      ],
+      "fix": "Factory-reset a second-hand router fully before onboarding it. Don't serve hotspot files from a previous provider's folder. Ask Bitwave to finish or redo the setup.",
+      "bitwave": "Tell Bitwave support the router, whether it's new, second-hand or reset, and what phones show. Bitwave support can check the setup and re-run it from our side.",
+      "not_this_if": "The same router worked before and only some APs fail (see ap-in-router-mode)."
+    },
+    {
+      "id": "free-internet-bypass",
+      "title": "People get internet without paying",
+      "symptoms": [
+        "wanatumia bure",
+        "users are online without paying",
+        "watu wanatumia bila kulipa",
+        "they use HTTP Injector",
+        "someone sells configs, 'send them the ID'",
+        "many devices online but no payments",
+        "unpaid devices using my bandwidth"
+      ],
+      "keywords": [
+        "http injector",
+        "injector",
+        "ehi",
+        "vpn",
+        "bypass",
+        "bure",
+        "free internet",
+        "without paying",
+        "bila kulipa",
+        "unpaid",
+        "config files",
+        "tunnel",
+        "illegal"
+      ],
+      "cause": "There are a few ways people get free internet: a tunnelling app (HTTP Injector and similar, sold as config files) that slips out through the router before login; an AP or radio link that hides many phones behind one paid device; staff login credentials shared around; or a device given free time on purpose. Bitwave routers carry a fix against the tunnelling apps, but a router that missed it is open.",
+      "checks": [
+        "GET /api/routers/{router_id}/illegal-connections?only_bypassing=true lists devices using internet that are not paying customers.",
+        "GET /api/routers/by-identity/{identity}/hotspot-diagnostics: its findings flag bypassed devices, too-broad allow rules and unpaid devices using bandwidth.",
+        "If the free users are all on one AP or behind one radio link, check ap-in-router-mode and radio-link-wds-off first.",
+        "Check whether the free devices use staff credentials (Account credentials) you created."
+      ],
+      "fix": "If it's a tunnelling app, ask Bitwave to check the anti-tunnel fix is on the router. If it's one AP or radio link, fix that AP (AP mode, or WDS on). If staff credentials leaked, change them. Don't try blocking the tunnel servers one by one; they change addresses all the time.",
+      "bitwave": "Tell Bitwave support 'unpaid users online on (router)' and, if you know it, the app they use. Bitwave support can check the anti-tunnel fix on that router and apply it from our side.",
+      "not_this_if": "The 'free' devices are customers with a paid plan on another of your routers, or devices you or Bitwave gave free time on purpose."
+    },
+    {
+      "id": "paid-not-delivered",
+      "title": "The customer paid and shows active, but the device has no access",
+      "symptoms": [
+        "customer paid but not connected",
+        "amelipa lakini hana net",
+        "pesa imekatwa lakini hajapata internet",
+        "it's charging but not connecting",
+        "the dashboard shows the plan active but the device can't browse",
+        "the TV connects to the Wi-Fi but can't browse even after I put it on a plan",
+        "online in the system but no internet"
+      ],
+      "keywords": [
+        "paid",
+        "amelipa",
+        "wamelipa",
+        "pesa imekatwa",
+        "active plan",
+        "plan active",
+        "not connected",
+        "hajaconnect",
+        "hajapata",
+        "can't browse",
+        "cannot browse",
+        "smart tv",
+        "tv haina"
+      ],
+      "cause": "The payment went through and the customer is ACTIVE in the dashboard, but the router never got their access: it was offline or flapping when the payment came in, or the plan was later moved to another device (see tv-second-device-loses-plan). Delivery retries by itself once the router is reachable.",
+      "checks": [
+        "GET /api/customers/{customer_id}: status ACTIVE and expiry after the payment time?",
+        "GET /api/customers/{customer_id}/payment-summary or GET /api/mpesa/transactions?customer_id={customer_id} to confirm the payment completed.",
+        "GET /api/routers/{router_id}/uptime: was the router offline or going on and off around the payment time?",
+        "GET /api/routers/{router_id}/diagnose/{mac_address} with the device's MAC (from the phone's Wi-Fi details, not About phone): does the router hold access for it?"
+      ],
+      "fix": "If the router was offline, fix its line or power first; access is delivered when it's back. Once access is on the router, the device turns Wi-Fi off and on (a TV: switch it off and on). If the very first page fails right after paying, reload once.",
+      "bitwave": "If the customer is ACTIVE, the router is online and diagnose shows no access for that MAC, tell Bitwave support the customer, the MAC and the payment time. Bitwave support can re-deliver it from our side without charging again.",
+      "not_this_if": "The customer isn't ACTIVE or the expiry is already past (the payment didn't attach: see payment-missing-from-statement), or the router is offline (see router-offline-flapping)."
+    },
+    {
+      "id": "tv-second-device-loses-plan",
+      "title": "A TV or second device loses the plan when another device uses the code",
+      "symptoms": [
+        "the TV loses internet when the owner's phone reconnects",
+        "the TV keeps losing internet after someone uses the code",
+        "tv imepoteza internet",
+        "the plan moved to another phone",
+        "one customer, a phone and a TV on one plan",
+        "client amebuy plan, the rest plus TV wataingia aje",
+        "how do I connect a TV"
+      ],
+      "keywords": [
+        "smart tv",
+        "television",
+        "tv yake",
+        "the tv",
+        "my tv",
+        "second device",
+        "two devices",
+        "another device",
+        "voucher code",
+        "reconnect",
+        "add device",
+        "connect link",
+        "console",
+        "devices per plan"
+      ],
+      "cause": "Most hotspot plans allow one device. When the customer types their code or number on another device, the plan moves there, and the TV (which can't open a login page by itself) loses it. Group or sharing plans add a device instead, and Bitwave now keeps a paired TV's own purchase from being moved.",
+      "checks": [
+        "GET /api/customers/{customer_id}: which plan, and how many devices it allows.",
+        "GET /api/customers/{customer_id}/devices: which devices are attached.",
+        "GET /api/routers/{router_id}/diagnose/{mac_address} with the TV's MAC: does it still have access?"
+      ],
+      "fix": "For a TV or a second device, send the customer the connect link from your site: it asks for their number and gives a code, or lets them add the device by MAC. If customers want several devices, sell a plan that allows several; keep ordinary plans at one device, or people share. Don't add the TV by hand on the router: it would never expire.",
+      "bitwave": "If a paying TV lost its plan to another device, tell Bitwave support the customer and the TV's MAC; Bitwave support can put it back on the same plan as a shared device from our side. For free time on one device (a comp), give Bitwave support the MAC and how long.",
+      "not_this_if": "The TV never had a plan, or the TV has access on the router but one app (for example YouTube) still fails: that's the TV or the app; tell Bitwave support which app."
+    },
+    {
+      "id": "shared-plan-problems",
+      "title": "A group or sharing plan is throttled early or loses devices",
+      "symptoms": [
+        "the group plan was throttled long before its data ran out",
+        "data bado iko lakini speed iko chini",
+        "devices dropped after a voucher",
+        "after renewing they got the old plan's data",
+        "a one-device voucher replaced the group plan",
+        "the sharing plan is slow though they have data left"
+      ],
+      "keywords": [
+        "group plan",
+        "shared plan",
+        "sharing plan",
+        "family plan",
+        "data cap",
+        "throttled",
+        "renewal",
+        "renewed",
+        "voucher",
+        "devices dropped",
+        "data left"
+      ],
+      "cause": "Two known faults: renewing by voucher kept the previous plan's smaller data allowance for the new period, so the group was throttled early; or a single-device voucher used on the group owner's device replaced the whole group plan and the other devices dropped. Both are fixed for new purchases; older groups may still carry the problem.",
+      "checks": [
+        "GET /api/customers/{customer_id} and GET /api/customers/{customer_id}/usage: compare the allowance shown with what the plan they paid for gives.",
+        "GET /api/customers/{customer_id}/devices: how many devices are on the group against the plan's limit."
+      ],
+      "fix": "Renew a group with a group voucher, not a single-device one on the owner's device. Speed comes back by itself a few minutes after the allowance is corrected, unless the group really used all its data.",
+      "bitwave": "Tell Bitwave support the customer, the plan they paid for and the allowance shown. Bitwave support can correct the allowance or restore the group from our side.",
+      "not_this_if": "Usage really has reached the plan's allowance; then the slowdown is the plan's fair-use speed working as set."
+    },
+    {
+      "id": "fup-throttle",
+      "title": "After the data cap the speed is too slow to use",
+      "symptoms": [
+        "the TV can't play video after the cap",
+        "baada ya kumaliza data haiplay video",
+        "after the data limit it's unusable",
+        "after FUP upload is fast but download is very slow"
+      ],
+      "keywords": [
+        "fup",
+        "fair use",
+        "after cap",
+        "cap",
+        "throttle",
+        "throttled",
+        "data limit",
+        "can't play video",
+        "buffering"
+      ],
+      "cause": "Once the data allowance is used, the plan drops to its fair-use (FUP) speed. A fixed bug sent some of these limits to routers the wrong way round (fast upload, very slow download); routers correct themselves as their speed limits are refreshed.",
+      "checks": [
+        "GET /api/customers/{customer_id}/usage: is the customer over the cap?",
+        "Look at the plan's FUP speed: is it enough for what the customer does?"
+      ],
+      "fix": "If the FUP speed is too low for video, give new plans a higher FUP speed, or tell customers that after the cap the plan is for light use only.",
+      "bitwave": "If upload and download look swapped, tell Bitwave support the customer and the plan's FUP speed. Bitwave support can check the limit on the router from our side and re-apply it.",
+      "not_this_if": "The customer hasn't reached the cap (see slow-internet or shared-plan-problems)."
+    },
+    {
+      "id": "expired-still-online",
+      "title": "An expired or disconnected customer still has internet",
+      "symptoms": [
+        "PPPoE client disconnected in the system but still gets internet",
+        "clients wa ppoe ukimdisconnect bado anapata net",
+        "expired customers still browsing",
+        "muda umeisha lakini bado anatumia",
+        "suspended customer still online"
+      ],
+      "keywords": [
+        "expired",
+        "still online",
+        "still browsing",
+        "disconnect",
+        "disconnected",
+        "suspend",
+        "suspended",
+        "bado anapata net",
+        "muda umeisha",
+        "anatumia"
+      ],
+      "cause": "Billing says expired or disconnected, but the router still holds the customer's access: the router was unreachable when removal ran, an old access entry was left behind, or the device is riding on someone else's access (a shared login, a router-mode AP).",
+      "checks": [
+        "GET /api/customers/{customer_id}: confirm status and expiry.",
+        "Hotspot: GET /api/routers/{router_id}/diagnose/{mac_address} shows exactly what the router still has for that MAC.",
+        "PPPoE: GET /api/pppoe/{router_id}/diagnose/{username} shows whether the login or session still exists.",
+        "GET /api/routers/{router_id}/uptime: was the router offline when they expired?"
+      ],
+      "fix": "Make sure the router is online; removal happens when it can be reached. If an AP or a shared login is carrying them, fix that (see ap-in-router-mode).",
+      "bitwave": "This costs you money, so report it: tell Bitwave support the customer, the router and when they expired, with what diagnose shows. Bitwave support can remove the leftover access and find out why from our side.",
+      "not_this_if": "The customer actually renewed (check their latest payment), or was given free time on purpose."
+    },
+    {
+      "id": "pppoe-login-rejected",
+      "title": "A PPPoE customer can't log in",
+      "symptoms": [
+        "PPPoE login rejected",
+        "ppoe haiconnect",
+        "the customer's router keeps dialing and failing",
+        "authentication failed",
+        "I created the user but there's no internet",
+        "I can log into the app but the PPPoE test fails",
+        "expiry iko future lakini haiconnect"
+      ],
+      "keywords": [
+        "pppoe",
+        "ppoe",
+        "authentication",
+        "auth failed",
+        "login failed",
+        "rejected",
+        "username",
+        "password",
+        "cpe",
+        "dialing",
+        "inactive",
+        "haiconnect"
+      ],
+      "cause": "Logging into the Bitwave app and the customer's PPPoE login are separate things. A PPPoE login fails when the username or password on the customer's router doesn't match exactly (capital letters count), when the account is INACTIVE even though its expiry is in the future (its login was removed from the router), or when the customer's cable is in a port that doesn't serve PPPoE.",
+      "checks": [
+        "GET /api/pppoe/{router_id}/diagnose/{username} with the exact username: account status, whether the login exists on the router, recent failures, and the session.",
+        "GET /api/customers/{customer_id}: ACTIVE or INACTIVE, and the expiry.",
+        "GET /api/pppoe/{router_id}/logs for repeated failures of that username.",
+        "Ask which MikroTik port the customer's cable goes into."
+      ],
+      "fix": "Type the username and password on the customer's router exactly as saved, same capitals. Plug the customer's line into a port set up for PPPoE. If the account is INACTIVE with time left, don't record a new payment just to bring it back.",
+      "bitwave": "If the account is INACTIVE with a future expiry and you didn't suspend it, tell Bitwave support the username and router. Bitwave support can restore the existing login and keep the original expiry from our side, without a new payment.",
+      "not_this_if": "The PPPoE session is up but nothing loads (see pppoe-connected-no-internet)."
+    },
+    {
+      "id": "pppoe-connected-no-internet",
+      "title": "A PPPoE customer is connected but nothing loads",
+      "symptoms": [
+        "the PPPoE client is online in the system but has no internet",
+        "ppoe imeconnect lakini hakuna net",
+        "all PPPoE customers lost internet at once but the hotspot works",
+        "PPPoE clients have no internet after a Starlink change",
+        "it shows connected, no internet"
+      ],
+      "keywords": [
+        "pppoe",
+        "ppoe",
+        "dns",
+        "starlink",
+        "online but no internet",
+        "connected no internet",
+        "session up",
+        "hakuna net"
+      ],
+      "cause": "The PPPoE session is up but browsing fails. A known cause: after the upstream line (often Starlink) changes its addressing, the DNS that PPPoE customers were given stops working, so every PPPoE customer loses internet while hotspot users are fine. A single customer can also have a fault on their own router or cable.",
+      "checks": [
+        "GET /api/pppoe/{router_id}/diagnose/{username}: is the session up, and is traffic moving?",
+        "Is it one customer or all PPPoE customers on that router? Does the hotspot on the same router work?",
+        "Ask the customer to restart their own router and test with a cable.",
+        "GET /api/routers/{router_id}/routeros?menu=/ppp/active?contains={username} and GET /api/routers/{router_id}/routeros?menu=/ip/firewall/nat: the session has an address and PPPoE traffic is masqueraded out of the internet port."
+      ],
+      "fix": "One customer: check their router and cable, and that it's set for PPPoE with the right login. All PPPoE customers at once, after an upstream change: contact Bitwave.",
+      "bitwave": "Tell Bitwave support 'all PPPoE customers on (router) lost internet, hotspot fine, since (time)'. Bitwave support can check and fix the PPPoE DNS from our side.",
+      "not_this_if": "The session isn't up at all (see pppoe-login-rejected), or the router itself has no internet (see router-offline-flapping)."
+    },
+    {
+      "id": "static-ip-no-internet",
+      "title": "A static-IP customer has no internet",
+      "symptoms": [
+        "static IP customer has no internet",
+        "static client stopped after changing the router or device",
+        "static IP imekataa",
+        "I think the gateway was changed"
+      ],
+      "keywords": [
+        "static ip",
+        "static",
+        "fixed ip",
+        "gateway",
+        "static client",
+        "changed device",
+        "changed router",
+        "new router"
+      ],
+      "cause": "A static-IP customer is tied to the device MAC saved on their account, so nobody else can copy the IP. If the customer changes their router or device, the new MAC is blocked on that IP. A wrong gateway, or a port on a different network, has the same effect.",
+      "checks": [
+        "GET /api/customers/{customer_id}/static/status.",
+        "GET /api/customers/{customer_id}: is the saved static MAC the device they use now, and is the account ACTIVE?",
+        "Ask for the device's IP, mask and gateway, and which port it's plugged into."
+      ],
+      "fix": "If they changed device or router, update the static MAC on the customer's account to the new device. Set the device's gateway to the one for that network and plug it into a port on that network.",
+      "bitwave": "If the MAC and settings match and it still fails, tell Bitwave support the customer and what the device shows. Bitwave support can check from our side.",
+      "not_this_if": "The customer is a hotspot or PPPoE customer."
+    },
+    {
+      "id": "router-offline-flapping",
+      "title": "The router keeps going offline",
+      "symptoms": [
+        "router iko offline",
+        "the router keeps going offline",
+        "router inaenda offline kila mara",
+        "inakuja na kuenda",
+        "everyone loses internet for a few minutes again and again",
+        "customer paid but not connected, and the router keeps going on and off",
+        "router imepotea kwa dashboard"
+      ],
+      "keywords": [
+        "offline",
+        "flapping",
+        "going offline",
+        "keeps dropping",
+        "router offline",
+        "power",
+        "ups",
+        "isp",
+        "modem",
+        "starlink",
+        "line down",
+        "uptime",
+        "inaenda"
+      ],
+      "cause": "The router keeps losing its internet line or its power for short spells. Usually the line from the ISP, modem or Starlink is dropping packets, or the power is unstable; sometimes it's a loose cable or a failing router. While it's offline, new payments wait and are delivered when it's back.",
+      "checks": [
+        "GET /api/routers/{router_id}/uptime: how often and for how long it was offline in the last day.",
+        "GET /api/routers for its current online status.",
+        "Ask: do the modem or Starlink lights drop at the same moment? Does the router restart (power) or only lose internet? Any power cuts?",
+        "Test the ISP line directly (a phone or laptop on the modem) at a time it drops.",
+        "GET /api/routers/{router_id}/routeros?menu=/log: the newest lines show why the link or tunnel went down."
+      ],
+      "fix": "Fix it physically: check the power and use a UPS if power is unstable; reseat or replace the cable from the modem (it goes into the router's internet port); restart the modem; and raise the packet loss with your ISP. Nothing in the Bitwave setup changes this.",
+      "bitwave": "Bitwave support can measure from our side whether the loss is before or after your modem; tell them the router and the times it dropped. If the router's own internet is solid but it still shows offline, see router-offline-but-internet-works.",
+      "not_this_if": "Uptime shows the router steadily online while customers have no internet (follow triage-order)."
+    },
+    {
+      "id": "router-offline-but-internet-works",
+      "title": "The dashboard shows the router offline though its internet works",
+      "symptoms": [
+        "router iko offline lakini net iko",
+        "the router is offline in the dashboard but the internet works",
+        "paid customers aren't getting internet but those already online are fine",
+        "two of my routers take turns being online",
+        "I can't open the router from the dashboard"
+      ],
+      "keywords": [
+        "offline",
+        "dashboard offline",
+        "takes turns",
+        "same sim",
+        "same isp",
+        "cgnat",
+        "webfig",
+        "remote access",
+        "management",
+        "not delivering"
+      ],
+      "cause": "The router has internet, but Bitwave's management connection to it keeps failing, so the dashboard shows offline and new payments wait to be delivered. Known causes: older RouterOS routers that share one public address with another router on the same ISP take turns being reachable; and on some older routers the management connection gets stuck and redials over and over.",
+      "checks": [
+        "GET /api/routers/{router_id}/uptime and GET /api/routers: offline or on-and-off while customers on it still browse?",
+        "GET /api/mpesa/transactions?router_id={router_id}: payments arriving while new payers don't get access.",
+        "Ask whether you have another router on the same ISP or SIM provider, and whether they go offline at different times."
+      ],
+      "fix": "Switching the router off for a few seconds and on again often clears a stuck management connection; do it outside busy hours. Then tell Bitwave.",
+      "bitwave": "Tell Bitwave support 'router shows offline but its internet works', and name any other router on the same ISP. Bitwave support can see from our side why the management connection fails and move the router to a connection type that works behind a shared address.",
+      "not_this_if": "The router's own internet is down too (see router-offline-flapping)."
+    },
+    {
+      "id": "reboot-at-peak",
+      "title": "Everyone dropped at once after a restart or upgrade",
+      "symptoms": [
+        "everyone dropped at once in the evening",
+        "wote walitoka at the same time",
+        "all customers disconnected together",
+        "I restarted the router from the MikroTik app",
+        "nimerestart router",
+        "I upgraded the router"
+      ],
+      "keywords": [
+        "reboot",
+        "restart",
+        "restarted",
+        "nimerestart",
+        "upgrade",
+        "upgraded",
+        "update",
+        "mikrotik app",
+        "evening",
+        "everyone dropped",
+        "all disconnected",
+        "wote"
+      ],
+      "cause": "Restarting or upgrading the router, from the MikroTik app or Winbox, drops every customer at once, and the router can take minutes to come back. In the evening that hits the most people.",
+      "checks": [
+        "GET /api/routers/{router_id}/uptime: an offline gap at the moment everyone dropped.",
+        "Ask whether anyone restarted or upgraded it then."
+      ],
+      "fix": "Restart or upgrade only when needed and only in quiet hours (late night or early morning). After an upgrade, check that the sign-in page still shows.",
+      "bitwave": null,
+      "not_this_if": "Nobody touched the router and it keeps happening (see router-offline-flapping)."
+    },
+    {
+      "id": "wifi-drops-sessions",
+      "title": "Customers keep dropping off or getting logged out",
+      "symptoms": [
+        "users are not completing their sessions, inajitoa toa",
+        "sessions zinajitoa",
+        "customers keep getting logged out",
+        "they have to log in again and again",
+        "the router is online and healthy but customers still complain",
+        "phones drop off the Wi-Fi"
+      ],
+      "keywords": [
+        "drop",
+        "drops",
+        "dropping",
+        "logged out",
+        "inajitoa",
+        "jitoa",
+        "disconnecting",
+        "weak signal",
+        "ssid",
+        "same ssid",
+        "roaming",
+        "channel",
+        "range",
+        "coverage"
+      ],
+      "cause": "Phones keep falling off weak or crowded Wi-Fi: APs placed badly, neighbouring APs on overlapping channels, or several APs with the same SSID that phones hop between. A phone that goes quiet for a couple of minutes is logged out by the hotspot and logged back in on its next use, so weak Wi-Fi shows up as 'sessions dropping'.",
+      "checks": [
+        "Ask: is the same SSID used on every AP? Do drops happen far from the AP or everywhere?",
+        "GET /api/hotspot/{router_id}/logs for the same devices being logged out again and again.",
+        "GET /api/routers/{router_id}/wifi for the router's own radio."
+      ],
+      "fix": "Improve the Wi-Fi: move APs closer or higher, put neighbouring APs on different non-overlapping channels, and don't crowd too many users onto one AP. If you use the same SSID everywhere, make sure every AP is in AP mode on the same hotspot.",
+      "bitwave": "If the Wi-Fi is good and customers still get logged out, tell Bitwave support the router. Bitwave support can check from our side and, if it fits, lengthen the idle logout time on that router.",
+      "not_this_if": "Everyone drops at the same moment (see reboot-at-peak or router-offline-flapping)."
+    },
+    {
+      "id": "slow-internet",
+      "title": "Customers say the internet is slow",
+      "symptoms": [
+        "speed iko chini",
+        "net iko slow",
+        "speeds drop through the MikroTik but Starlink direct is fine",
+        "it's slow in the evening",
+        "customers complain the speed is low",
+        "the speed test is low"
+      ],
+      "keywords": [
+        "slow",
+        "speed",
+        "speeds",
+        "speedtest",
+        "speed test",
+        "mbps",
+        "starlink",
+        "peak hours",
+        "evening",
+        "buffering",
+        "lag",
+        "chini"
+      ],
+      "cause": "Usually the line, not the billing. The billing system only lets customers in and out at their plan's speed; it never slows them below it. Starlink and other ISPs limit speeds at busy hours, so a Starlink speed test that looks fine in the morning says little about the evening, when customers complain. Each customer is also capped at their plan's speed, and a busy small router can be the bottleneck. The live rate in the dashboard is what the customer is using right now, not the speed they can get.",
+      "checks": [
+        "Ask when it is slow: if it is the evening, test Starlink itself at that hour, not in the morning.",
+        "Ask for a speed test on the customer's device, whether on cable or Wi-Fi, and the time.",
+        "Compare with a test straight on the ISP or Starlink at the same time.",
+        "GET /api/customers/{customer_id}: the plan's speed.",
+        "GET /api/routers/{router_id}/live: CPU and how busy the router is."
+      ],
+      "fix": "If the ISP is slow at peak, take it up with the ISP or add a second line. If it's one customer, check their Wi-Fi signal and plan speed. If the router is maxed out, see router-overloaded.",
+      "bitwave": "If the ISP tests fast at the same time the customer tests slow through the router, tell Bitwave support the router, the times and both results. Bitwave support can check the router's load and the customer's speed limit from our side.",
+      "not_this_if": "The customer is past their data cap (see fup-throttle), or only some sites fail (see lb-line-dropping-traffic)."
+    },
+    {
+      "id": "router-overloaded",
+      "title": "The router is too small for the number of users",
+      "symptoms": [
+        "router CPU is at 100%",
+        "the router is slow when many users are on",
+        "the more users, the more problems",
+        "it got worse after more customers joined",
+        "router inahang"
+      ],
+      "keywords": [
+        "cpu",
+        "overload",
+        "overloaded",
+        "hang",
+        "hangs",
+        "inahang",
+        "hap lite",
+        "rb951",
+        "many users",
+        "upgrade router",
+        "bigger router",
+        "capacity"
+      ],
+      "cause": "Small MikroTik boards (hAP lite, RB951 class) run out of power on a busy hotspot: a few dozen users and a few tens of Mbps in total. When CPU sits near full at peak, speeds drop and some phones show 'connected without internet'. Load balancing itself adds almost nothing; the board is the limit. One quiet CPU reading doesn't prove there are no peaks.",
+      "checks": [
+        "GET /api/routers/{router_id}/live: CPU, board and active users right now.",
+        "Ask when it happens and how many users are on at that time; check again at that time."
+      ],
+      "fix": "For a busy site, move to a stronger router; ask Bitwave which model fits your user count. Don't remove speed limits or security rules to bring CPU down.",
+      "bitwave": "Tell Bitwave support the router and when it's slow. Bitwave support can measure CPU at peak from our side and say whether the board is the bottleneck.",
+      "not_this_if": "CPU stays low at the times customers complain."
+    },
+    {
+      "id": "mpesa-stk-outage",
+      "title": "The M-Pesa prompt doesn't reach customers' phones",
+      "symptoms": [
+        "STK push not going through",
+        "stk haiendi",
+        "STK haifiki kwa simu",
+        "customers don't get the M-Pesa prompt",
+        "tuko na safcom issues za kulipa",
+        "payments stopped for hours"
+      ],
+      "keywords": [
+        "stk",
+        "stk push",
+        "mpesa",
+        "m-pesa",
+        "prompt",
+        "safaricom",
+        "safcom",
+        "payment prompt",
+        "pin prompt",
+        "haiendi",
+        "haifiki",
+        "kulipa"
+      ],
+      "cause": "When the M-Pesa prompt fails for many resellers at once, it's almost always Safaricom's side, not your setup. If only your customers are affected, look at your payment method setup (see payment-collection-setup) or the customer's own phone and line.",
+      "checks": [
+        "GET /api/mpesa/transactions/failed for recent failed attempts and their errors.",
+        "GET /api/mpesa/transactions?router_id={router_id}: when did the last completed payment come in?",
+        "Ask whether other resellers have the same problem now; ask the customer to retry with the phone unlocked and enough balance."
+      ],
+      "fix": "If it's Safaricom-wide, it's not your setup: tell customers and wait for it to clear. If it's one customer, have them retry with the phone unlocked.",
+      "bitwave": "If only your account fails while others work, tell Bitwave support the router, the time and the error the customer saw. Bitwave support can check the payment attempts from our side.",
+      "not_this_if": "The prompt arrives and the customer pays but gets no internet (see paid-not-delivered)."
+    },
+    {
+      "id": "payment-collection-setup",
+      "title": "Payments fail because of the payment method setup",
+      "symptoms": [
+        "my bank or till shows Active but customers' payments fail",
+        "the customer gets an 'incorrect account' message",
+        "the prompt comes but no money is taken",
+        "payments don't reach my till",
+        "I want to use my own till or paybill",
+        "do you support mobile money in my country"
+      ],
+      "keywords": [
+        "till",
+        "paybill",
+        "bank",
+        "account number",
+        "incorrect account",
+        "payment method",
+        "own till",
+        "direct",
+        "mtn",
+        "momo",
+        "airtel money",
+        "country",
+        "currency"
+      ],
+      "cause": "An 'Active' payment method only means it's switched on in the app; it doesn't prove the provider accepts it. A wrong till or bank reference format, or the wrong method selected for the router, makes payments fail with errors such as 'incorrect account'. Outside Kenya, a mobile-money brand existing doesn't mean Bitwave already supports that country.",
+      "checks": [
+        "Check which payment method is selected for this router in the dashboard, and that its details match exactly what the bank or provider issued (for a bank till, the bank-issued till reference).",
+        "GET /api/mpesa/transactions/failed for the exact error.",
+        "For a new country or provider, ask Bitwave before taking customers on it."
+      ],
+      "fix": "Enter the details exactly as the bank or provider gives them, select that method for the router, then make one small test payment.",
+      "bitwave": "Tell Bitwave support the router, the method and the exact error text. Bitwave support can check the payment attempts and the provider's reply from our side. For a new country or provider, ask Bitwave support to confirm it's supported before you sell.",
+      "not_this_if": "Payments show as completed in the transactions list (then it's delivery or payout, not collection)."
+    },
+    {
+      "id": "payment-missing-from-statement",
+      "title": "A customer's payment isn't in the statement or isn't matched",
+      "symptoms": [
+        "the customer paid but it's not in my transactions",
+        "payment haionekani kwa statement",
+        "the customer put the wrong account number",
+        "amelipa na account number ingine",
+        "mwambie aangalie hii M-Pesa message",
+        "I forwarded the M-Pesa SMS but there's no record"
+      ],
+      "keywords": [
+        "statement",
+        "missing payment",
+        "wrong account",
+        "account number",
+        "typo",
+        "mpesa message",
+        "m-pesa message",
+        "receipt",
+        "transaction code",
+        "reconcile",
+        "haionekani"
+      ],
+      "cause": "The money reached the till but wasn't matched to the right customer, usually because the customer typed a wrong account number, or it's being looked for under the wrong account or router. A forwarded M-Pesa message alone doesn't show which billing account it belongs to.",
+      "checks": [
+        "GET /api/mpesa/transactions?router_id={router_id} around the payment time and amount; the M-Pesa transaction code identifies it.",
+        "GET /api/customers/{customer_id}/payment-summary for the customer it should belong to.",
+        "If you have several routers or accounts, make sure you're looking at the right one."
+      ],
+      "fix": "If it shows under another customer, note both. Don't record a second payment or give time by hand before it's matched, or it gets counted twice.",
+      "bitwave": "Tell Bitwave support the transaction code, amount, time and the account it should belong to (and your registered email if you have several accounts). Bitwave support can find and match it from our side.",
+      "not_this_if": "The payment is listed and attached to the customer (then check delivery: paid-not-delivered)."
+    },
+    {
+      "id": "payout-not-received",
+      "title": "A payout to the reseller hasn't arrived",
+      "symptoms": [
+        "sijapokea pesa ya jana",
+        "payout haijaingia",
+        "I didn't receive yesterday's money",
+        "please push my payout",
+        "hold and cash out doesn't work",
+        "my withdrawal hasn't come"
+      ],
+      "keywords": [
+        "payout",
+        "payouts",
+        "withdraw",
+        "withdrawal",
+        "cash out",
+        "settlement",
+        "disburse",
+        "sijapokea",
+        "pesa ya jana",
+        "haijaingia"
+      ],
+      "cause": "When Bitwave collects payments for you, they're paid out to your payout destination once a day. A missing payout is usually a delay in the daily run, a wrong or changed payout destination, or money still waiting in your balance for a manual withdrawal.",
+      "checks": [
+        "GET /api/reseller/payout-settings: is the payout destination right?",
+        "Check your account statement in the dashboard for that day's collections and any withdrawal.",
+        "GET /api/mpesa/transactions?router_id={router_id} for that day's completed payments."
+      ],
+      "fix": "Correct the payout destination if it's wrong. If you withdraw manually, request the withdrawal from the dashboard.",
+      "bitwave": "Tell Bitwave support which day's payout is missing and roughly how much you expected. Bitwave support can check the payout status from our side.",
+      "not_this_if": "You collect on your own till or paybill directly; then the money goes straight to you and there is no Bitwave payout for it."
+    },
+    {
+      "id": "platform-charges",
+      "title": "A question about Bitwave's platform charge or invoice",
+      "symptoms": [
+        "the platform charge isn't showing",
+        "my invoice looks wrong",
+        "how much do I pay Bitwave",
+        "naeza ona invoice yangu",
+        "please add the platform charge"
+      ],
+      "keywords": [
+        "invoice",
+        "platform charge",
+        "platform fee",
+        "subscription",
+        "bitwave fee",
+        "charges",
+        "billing fee",
+        "pricing",
+        "trial"
+      ],
+      "cause": "Platform billing is usually already set up on the account; a 'missing charge' is often a question of which page shows it. New accounts start on a free trial, then pay the current Bitwave tariff, which the invoice shows.",
+      "checks": [
+        "GET /api/subscription/current-invoice for the current invoice.",
+        "GET /api/subscription/invoices and GET /api/subscription/payments for past ones.",
+        "Ask which page or which charge they expected to see."
+      ],
+      "fix": "Read the current invoice on the subscription page in the dashboard. Go by the invoice, not by old prices quoted in chat.",
+      "bitwave": "If the amount looks wrong, tell Bitwave support which invoice and what you expected. Bitwave support can check your tariff from our side.",
+      "not_this_if": null
+    },
+    {
+      "id": "sms-not-sending",
+      "title": "SMS won't send or credits look wrong",
+      "symptoms": [
+        "sms haziendi",
+        "SMS not delivered",
+        "credits show zero when I compose",
+        "I bought credits but it shows zero",
+        "the Messaging page shows a red warning",
+        "I want my business name as the sender"
+      ],
+      "keywords": [
+        "sms",
+        "messages",
+        "credits",
+        "sms credits",
+        "compose",
+        "campaign",
+        "sender id",
+        "sender name",
+        "messaging",
+        "bulk sms",
+        "haziendi"
+      ],
+      "cause": "Usually one of: the campaign needs more credits than you have (each recipient costs credits per message part, so long messages cost more); an old failure still shown as a warning on the Messaging page though newer messages went out; or a custom sender name that isn't registered with the provider yet.",
+      "checks": [
+        "GET /api/messaging/credits for the real balance.",
+        "Count recipients times message parts against that balance.",
+        "GET /api/messaging/gateway/status and GET /api/messaging/campaigns for the latest attempt and its time, not old errors."
+      ],
+      "fix": "Send to fewer people, shorten the message, or top up. If recent messages went, an old red warning isn't a current fault. A custom sender name has to be registered through the provider first.",
+      "bitwave": "If you have enough credits and a fresh send fails now, tell Bitwave support the time and the error. Bitwave support can check the provider's reply from our side. Don't resend over and over because of an old error.",
+      "not_this_if": null
+    },
+    {
+      "id": "tls-certificate-warning",
+      "title": "A browser shows a certificate or 'not private' warning",
+      "symptoms": [
+        "the page says 'Your connection is not private'",
+        "a certificate warning on the login page",
+        "the browser blocks the dashboard",
+        "a 'not secure' warning",
+        "the warning comes sometimes and goes after reloads"
+      ],
+      "keywords": [
+        "certificate",
+        "ssl",
+        "tls",
+        "not secure",
+        "not private",
+        "warning",
+        "hsts",
+        "https",
+        "security warning"
+      ],
+      "cause": "Bitwave's public certificate normally checks out, so a warning that one customer sees usually comes from their own path: the device's date and time are wrong, the device is old, or something on the network in between. Which certificate their device actually received is what settles it.",
+      "checks": [
+        "Ask whether it shows on Wi-Fi and on mobile data on the same phone.",
+        "Ask for a screenshot of the certificate details (who issued it) shown in the warning, and check the phone's date and time.",
+        "Ask which web address the warning appears on."
+      ],
+      "fix": "Fix the device's date and time if they're wrong. Don't tell customers to click past the warning or install anything to get rid of it.",
+      "bitwave": "Send Bitwave support the screenshot with the certificate details, the address, the time, and whether it also happens on mobile data. Bitwave support can compare it with our certificate.",
+      "not_this_if": null
+    },
+    {
+      "id": "usage-not-updating",
+      "title": "Usage figures are zero or not updating",
+      "symptoms": [
+        "PPPoE usage shows 0 MB",
+        "hii function hairead kama client anatumia net",
+        "usage isn't updating",
+        "bandwidth figures are old",
+        "the router is online but usage doesn't move"
+      ],
+      "keywords": [
+        "usage",
+        "0 mb",
+        "0mb",
+        "zero usage",
+        "data used",
+        "consumption",
+        "bandwidth",
+        "not updating",
+        "hairead"
+      ],
+      "cause": "Usage is collected from the router separately from the online check, so a router can show online while its usage numbers are old or zero.",
+      "checks": [
+        "GET /api/customers/{customer_id}/usage and compare its time with now.",
+        "GET /api/routers/{router_id}/live: the report age shows how fresh the router's own report is."
+      ],
+      "fix": "Nothing to change on the router. Check again a little later; if it stays stuck, report it.",
+      "bitwave": "Tell Bitwave support the router and the customer whose usage is stuck, and since when. Bitwave support can check usage collection from our side.",
+      "not_this_if": "The customer really isn't using the internet (check whether they're online)."
+    },
+    {
+      "id": "package-order",
+      "title": "Packages on the purchase page are in the wrong order",
+      "symptoms": [
+        "the packages on the purchase page aren't in price order",
+        "how do I put the cheapest plan first",
+        "do I have to delete and recreate plans to reorder them"
+      ],
+      "keywords": [
+        "package order",
+        "plan order",
+        "cheapest first",
+        "sort plans",
+        "arrange plans",
+        "reorder",
+        "portal customization",
+        "branding"
+      ],
+      "cause": "The order of plans on the customer purchase page is a portal setting, separate from the Plans list in the dashboard.",
+      "checks": [
+        "Ask whether they mean the customer purchase page or the Plans list in the dashboard."
+      ],
+      "fix": "On a computer: Portal Configuration. On a phone: Settings, then Portal Customization. Then Branding, Package Order, Cheapest first, and Save. There's no need to delete or recreate plans. Special or emergency offers stay at the top.",
+      "bitwave": "If the setting is saved and the page still shows the old order, tell Bitwave support the router. Bitwave support can check from our side.",
+      "not_this_if": null
+    },
+    {
+      "id": "plan-edit-not-saving",
+      "title": "Editing a plan doesn't save or doesn't reach customers",
+      "symptoms": [
+        "kwanini huezi edit plans",
+        "iyo kitu ya kusave inapotea",
+        "my plan edit doesn't save",
+        "I changed the plan but customers still have the old speed"
+      ],
+      "keywords": [
+        "edit plan",
+        "editing plans",
+        "edit plans",
+        "plan edit",
+        "kusave",
+        "inapotea",
+        "change plan",
+        "plan price",
+        "plan speed"
+      ],
+      "cause": "Editing a plan that customers are on right now is risky: they're already on the router with the old settings. There's also a reported bug where plan edits don't save.",
+      "checks": [
+        "Ask which plan, what was changed, and whether customers are on it now.",
+        "GET /api/customers?router_id={router_id} to see who is on that plan."
+      ],
+      "fix": "To change a price or speed, create a new plan and stop selling the old one, rather than editing a plan that people are on.",
+      "bitwave": "If an edit doesn't save, tell Bitwave support the plan and what you changed, so it's recorded as a bug. Bitwave support can check from our side.",
+      "not_this_if": null
+    },
+    {
+      "id": "port-shows-down-pwr-line",
+      "title": "A port called pwr-line (or an unused port) shows down",
+      "symptoms": [
+        "power line 1 iko down",
+        "pwr-line is down",
+        "why is one port down",
+        "port moja iko down",
+        "mbona port hii iko down"
+      ],
+      "keywords": [
+        "pwr-line",
+        "power line",
+        "pwr line",
+        "port down",
+        "port iko down",
+        "powerline"
+      ],
+      "cause": "Some MikroTik boards (hAP, hEX PoE and others) list a pwr-line or PoE-in port that is only for power. It shows down because nothing uses it as a network port. Any port with no cable in it shows down too.",
+      "checks": [
+        "GET /api/routers/{router_id}/ports: look only at ether1 (internet) and the ports the APs and customers use."
+      ],
+      "fix": "Ignore pwr-line. Focus on ether1 to ether4 (or ether5): ether1 should be up with the internet line, and every port with an AP should be up with traffic.",
+      "bitwave": null,
+      "not_this_if": "A port with an AP or cable plugged in shows down: that is the cable, the AP's power or the AP itself."
+    },
+    {
+      "id": "static-ip-instead-of-pppoe",
+      "title": "Connecting a customer with a static IP instead of PPPoE",
+      "symptoms": [
+        "can I connect pppoe through static ip",
+        "configure their home router with a static ip",
+        "static ip badala ya pppoe",
+        "customer router haina pppoe"
+      ],
+      "keywords": [
+        "static ip",
+        "static-ip",
+        "fixed ip",
+        "home router static",
+        "badala ya pppoe"
+      ],
+      "cause": "A customer's home router does not have to dial PPPoE. Bitwave also supports static-IP customers: their router is given a fixed IP, mask and gateway (and its MAC is pinned on the account), and the dashboard activates, suspends and cuts them off at expiry like any other customer.",
+      "checks": [
+        "GET /api/plans: a static-IP customer needs a plan of the right connection type."
+      ],
+      "fix": "Yes, it is possible. Register the customer as a static-IP customer and set their router's WAN to the fixed IP, mask, gateway and DNS the dashboard gives. Keep PPPoE for customers whose router can dial it.",
+      "bitwave": null,
+      "not_this_if": null
+    },
+    {
+      "id": "new-ap-not-showing",
+      "title": "A newly added access point does not show in the system",
+      "symptoms": [
+        "nimeweka another access point nadai ionyeshe kwa system",
+        "new AP not showing",
+        "AP mpya haionekani",
+        "added an access point but it's not in the dashboard"
+      ],
+      "keywords": [
+        "new ap",
+        "ap mpya",
+        "another access point",
+        "haionekani",
+        "not showing",
+        "ionyeshe"
+      ],
+      "cause": "An access point plugged into a hotspot port in access-point (bridge) mode needs no setup in Bitwave: phones on it simply reach the router's hotspot. It shows up by itself once it is connected and passing traffic. If it never appears, it is usually not wired into a hotspot port, still in router mode, or a brand-new router that has not been set up yet.",
+      "checks": [
+        "GET /api/routers/{router_id}/access-points",
+        "GET /api/routers/{router_id}/routeros?menu=/interface/bridge/host: is the AP's MAC learnt on a hotspot port?"
+      ],
+      "fix": "Plug the AP into a hotspot port, set it to Access Point / bridge mode with DHCP off, and give it the same Wi-Fi name as the others. Then connect a phone to it: the login page should appear. A new MikroTik router (not an AP) is added and set up from the dashboard instead.",
+      "bitwave": "For a new router, or if it still does not show, Bitwave can set it up remotely (AnyDesk, RustDesk or UltraViewer).",
+      "not_this_if": "Phones on the new AP already get the login page: it is working, whatever the list shows."
+    }
+  ]
+}

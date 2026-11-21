@@ -803,7 +803,9 @@ async def test_the_assistant_knows_bitwave_product_answers(client, owner):
     model = use_model([text_reply("Use Access Credentials.")])
     await client.post("/api/assistant/chat", json={"message": "staff internet?"}, headers=auth(token))
     system = model.requests[0]["system"][0]["text"]
-    assert "Access Credentials (/access-credentials" in system and "same Wi-Fi name (SSID)" in system
+    assert "Access Credentials (/access-credentials" in system
+    # what support has learnt about faults: every entry listed, the full entry on request
+    assert "- wifi-drops-sessions:" in system and "- paid-not-delivered:" in system
 
 
 # ---------------------------------------------------------------------------
@@ -1533,3 +1535,86 @@ def _action(method, template, schema):
     from app.services.assistant.catalog import Action
 
     return Action(method=method, template=template, title="X", description="", tag="t", body_schema=schema)
+def test_known_issues_find_the_fault_from_the_persons_own_words():
+    from app.services.assistant import known_issues
+
+    for words, expected in [
+        ("amelipa lakini hana net", "paid-not-delivered"),
+        ("router iko offline kila saa", "router-offline-flapping"),
+        ("some sites work some don't since the load balancing", "lb-line-dropping-traffic"),
+        ("one AP gives free internet", "ap-in-router-mode"),
+        ("SMS haziendi", "sms-not-sending"),
+    ]:
+        found = known_issues.search(words)
+        assert found["matches"][0]["id"] == expected, (words, [m["id"] for m in found["matches"]])
+        assert found["check_in_this_order"]["id"] == "triage-order"
+        assert all("keywords" not in m for m in found["matches"])  # matching aid, not knowledge
+    assert known_issues.search(issue_id="rogue-dhcp")["matches"][0]["id"] == "rogue-dhcp"
+    assert "error" in known_issues.search(issue_id="no-such-thing")
+
+
+def test_known_issues_name_no_reseller_router_or_server():
+    """Every reseller reads these: past cases stay general."""
+    import re
+    from pathlib import Path
+
+    text = (Path(__file__).parent.parent / "app/services/assistant/known_issues.json").read_text(encoding="utf-8")
+    assert not re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text)  # IP addresses
+    assert not re.search(r"(?<![\d-])(?:\+?254|07|01)\d{8}\b", text)  # phone numbers
+    assert not re.search(r"\b(?:[0-9A-F]{2}:){5}[0-9A-F]{2}\b", text, re.I)  # MACs
+    assert not re.search(r"(?i)\b(router[- ]?\d{2,}|ssh|hetzner|aws|vault|wireguard|accel-ppp)\b", text)
+
+
+def test_plan_customer_and_sms_forms_follow_the_choices_that_matter():
+    """The dashboard's own rules, read from the API schema: a free trial has no 'was' price,
+    FUP fields wait for a data cap, a customer's login fields follow the picked plan's type,
+    and a plan picker appears only for an SMS to one plan."""
+    import main
+    from app.services.assistant.catalog import apply_form_values, form_fields, get_catalog
+
+    catalog = get_catalog(main.app)
+    act = lambda m, t: next(a for a in catalog.actions if a.method == m and a.template == t)  # noqa: E731
+    plan = {f["name"]: f for f in form_fields(act("POST", "/api/plans/create"), {"plan_type": "free_trial"})}
+    assert sorted(plan["original_price"]["when"]["plan_type"]) == ["emergency", "regular", "special_offer"]
+    assert plan["trial_once_per_customer"]["when"] == {"connection_type": ["hotspot"], "plan_type": ["free_trial"]}
+    assert plan["fup_throttle_profile"]["when"] == {"data_cap_mb": ["*"], "fup_action": ["throttle"]}
+    # no cap: the FUP values typed before it was cleared are not sent
+    body, _, problems = apply_form_values(act("POST", "/api/plans/create"), {}, {
+        "name": "P", "speed": "5M/5M", "price": "50", "duration_value": "1", "duration_unit": "DAYS",
+        "connection_type": "hotspot", "data_cap_mb": "", "fup_action": "throttle", "fup_throttle_profile": "1M/1M"})
+    assert not problems and not {"fup_action", "fup_throttle_profile"} & set(body)
+
+    customer = {f["name"]: f for f in form_fields(act("POST", "/api/customers/register"), {})}
+    assert customer["pppoe_username"]["when"] == {"plan_id.connection_type": ["pppoe"]}
+    assert customer["static_ip"]["when"] == {"plan_id.connection_type": ["static_ip"]}
+    assert customer["mac_address"]["when"] == {"plan_id.connection_type": ["hotspot"]}
+
+    send = act("POST", "/api/messaging/send")
+    assert {f["name"]: f for f in form_fields(send, {})}["plan_id"]["when"] == {"filter": ["by_plan"]}
+    assert apply_form_values(send, {}, {"body": "hi", "filter": "by_plan"})[2] == ["'plan_id' is required"]
+    body, _, _ = apply_form_values(send, {}, {"body": "hi", "filter": "all", "plan_id": "3"})
+    assert "plan_id" not in body
+
+
+@pytest.mark.asyncio
+async def test_a_customer_form_tells_the_page_each_plans_type(client, owner, db):
+    from app.db.models import ConnectionType
+
+    reseller, token = owner
+    router = await make_router(db, reseller, name="Main")
+    hotspot = await make_plan(db, reseller, name="Daily", price=50, duration_value=1)
+    pppoe = await make_plan(db, reseller, name="Home", price=2000, duration_value=30,
+                            connection_type=ConnectionType.PPPOE, speed="10M/10M")
+    ids = (str(router.id), str(hotspot.id), str(pppoe.id))
+    await db.commit()
+    use_model([
+        tool_reply("describe_action", {"method": "POST", "path": "/api/customers/register"}, "tu_d"),
+        tool_reply("call_api", {"method": "POST", "path": "/api/customers/register", "form": True,
+                                "body": {"name": "John", "phone": "0712345678", "plan_id": pppoe.id}}),
+        text_reply("Fill in the PPPoE login and tap Confirm."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "new pppoe customer"},
+                                           headers=auth(token))).text)
+    form = {f["name"]: f for f in next(e for e in events if e["type"] == "action")["form"]}
+    assert form["plan_id"]["option_attrs"]["connection_type"] == {ids[1]: "hotspot", ids[2]: "pppoe"}
+    assert form["plan_id"]["value"] == ids[2]

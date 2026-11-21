@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from app.config import settings
-from app.services.assistant import executor, shaping, store
+from app.services.assistant import executor, known_issues, shaping, store
 from app.services.assistant.usage import TurnUsage
 from app.services.assistant.caller import Caller
 from app.services.assistant.catalog import (
@@ -156,6 +156,22 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "known_issues",
+        "description": (
+            "What Bitwave support has learnt about a fault: give the person's own words (or an id "
+            "from the known issues list) and get the matching entries: the cause, what to check first, "
+            "the fix, and when Bitwave has to act. Use it whenever something does not work."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "symptom": {"type": "string", "description": "What the person reported, in their words."},
+                "id": {"type": "string", "description": "One entry's id from the known issues list."},
+            },
+            "additionalProperties": False,
+        },
+    },
 ]
 
 SYSTEM_TEMPLATE = """You are the Bitwave assistant, built into the Bitwave ISP billing dashboard. You work for the person signed in. You can do anything they can do on the dashboard, by calling the dashboard's own API with their access: the API refuses whatever their account may not do.
@@ -195,10 +211,6 @@ Product facts (Bitwave support's own answers to resellers; check live data for n
 - A customer with a TV or several devices: send them the connect link; it asks for their number and gives a code, or add the device to the customer by its MAC address.
 - SMS "can't send" or "shows zero": a send needs credits for every recipient × message part; check the balance and how many people they want to reach.
 - A new access point or router should show up by itself once it is added and provisioned; if it does not, check its provisioning.
-- Speed complaints (often Starlink): the billing system lets customers in and out; Starlink slows down at peak hours. Still check the router's CPU and queues: a hAP lite struggles with many users, an RB951 handles about 30–50.
-- Sessions dropping: first ask whether every access point uses the same Wi-Fi name (SSID), then check the router log (keepalive timeouts) and CPU.
-- Paid but no internet: find the customer (by phone), check their status and expiry, then their router's uptime: a router going on and offline is the common cause.
-- STK prompts failing for many customers at once: usually a Safaricom-wide problem, not the reseller's setup.
 - Bitwave can set routers up remotely (RustDesk, AnyDesk or UltraViewer) for resellers who are stuck.
 
 Photos
@@ -236,6 +248,17 @@ What next
 - End a finished answer with one last line in exactly this form: NEXT: question one | question two | question three
 - That is two or three short questions this person is likely to ask next, in their language, each one something you can answer or do with the index. The page shows them as buttons, so write them as the person would ask them.
 - Leave the NEXT line out when a Confirm card is waiting, when you asked the person a question, or when something failed.
+
+When something does not work
+- No internet, a router offline, no login page, slow, people dropping off, free internet, a payment, payout or SMS that did not arrive: Bitwave support has seen these before. Their causes and fixes are in the known issues below, one line each. Call known_issues with the person's own words (or an entry's id) for the full entry: what is really happening, what to check first and in what order, what the person does, and when Bitwave has to act.
+- Then check the live data the entry names (the customer, the router's status, uptime and live figures, the diagnose actions, payments, and inside the router with the routeros reads) to see which cause it is. Lead with the likely cause and the one next step. Say what the data showed. Never present a cause as found when you did not see it in the data.
+- When the cause of a fault turns on something only the person can see or say (which access point, whether every AP has the same Wi-Fi name, what the phone shows), ask that one question first, in one line, the way support would, instead of building a diagnosis out of data that does not decide it. One question, then stop. This is for faults only: to add, send or change something, open the form and leave what you do not know (a message's text, a phone number) for the person to fill in.
+- When a form fixes the cause (paying a suspended subscription, buying SMS credits), say the cause in words first, then that the form fixes it: "Your Bitwave subscription is suspended, so customers cannot buy internet. Pay the KES 1,500 here to restore it."
+- A how-to question ("can I...", "how do I...", "what should I put") gets the plain answer first: yes or no and how, in a sentence or two. Look at the account only when the answer depends on it.
+- Never name other resellers, routers or customers from past cases; the entries are general on purpose.
+
+Known issues ({known_count})
+{known}
 
 API index ({count} actions)
 {index}"""
@@ -574,6 +597,7 @@ class Turn:
     def __init__(self, app, caller: Caller, conversation: dict, queue: asyncio.Queue):
         self._form_secrets: dict[str, dict] = {}  # passwords typed in a form, for one request
         self._choice_cache: dict[str, list[tuple[str, str]]] = {}
+        self._choice_rows: dict[str, dict[str, dict]] = {}  # the rows behind each picker, by id
         self.app = app
         self.caller = caller
         self.catalog: Catalog = get_catalog(app)
@@ -639,6 +663,8 @@ class Turn:
             max_proposals=MAX_PROPOSALS_PER_TURN,
             count=len(actions),
             index=self.catalog.index_text(self.caller),
+            known=known_issues.index_text(),
+            known_count=len(known_issues.index()),
         )
         return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
 
@@ -746,6 +772,11 @@ class Turn:
                      option_labels=dict(choices))
             if "value" in f:
                 f["value"] = str(f["value"])
+            # what other fields hang on in the picked record ("plan_id.connection_type"): each option's value
+            attrs = {c.split(".", 1)[1] for g in fields for c in (g.get("when") or {}) if c.split(".", 1)[0] == f["name"]}
+            if attrs:
+                rows = self._choice_rows.get(source, {})
+                f["option_attrs"] = {a: {i: str(rows.get(i, {}).get(a, "")) for i in f["options"]} for a in sorted(attrs)}
 
     async def _record_kind(self, action: Action, method: str, path: str, body: Any) -> Optional[dict]:
         """For an edit whose fields depend on what kind of record it is (a till or a bank
@@ -753,20 +784,46 @@ class Turn:
         if method not in ("PUT", "PATCH"):
             return None
         given = body if isinstance(body, dict) else {}
-        missing = [c for c in choice_groups(action.body_schema) if given.get(c) in (None, "")]
+        # the record's own value for each choice the change leaves out (for "plan_id.connection_type":
+        # its plan_id, whose type the page reads from the plan picker)
+        missing = list(dict.fromkeys(c.split(".", 1)[0] for c in choice_groups(action.body_schema)
+                                     if given.get(c.split(".", 1)[0]) in (None, "")))
         if not missing:
             return None
-        try:
-            result = await executor.call_api(self.app, self.caller, "GET", path, None, None)
-        except Exception:
-            logger.warning("[assistant] could not read %s for its kind", path, exc_info=True)
-            return None
-        data = result.data if result.ok else None
-        if isinstance(data, dict) and len(data) == 1 and isinstance(next(iter(data.values())), dict):
-            data = next(iter(data.values()))  # {"payment_method": {...}}
+        data = await self._record(path)
         if not isinstance(data, dict):
             return None
-        return {c: data[c] for c in missing if data.get(c) not in (None, "")} or None
+        out = {}
+        for c in missing:
+            value = data.get(c)
+            if value in (None, "") and c.endswith("_id") and isinstance(data.get(c[:-3]), dict):
+                value = data[c[:-3]].get("id")  # {"plan": {"id": 3, ...}}
+            if value not in (None, ""):
+                out[c] = value
+        return out or None
+
+    async def _record(self, path: str) -> Optional[dict]:
+        """The record at this path, or, where there is no single read, its row in the list above it."""
+        tries = [path]
+        head, _, last = path.rstrip("/").rpartition("/")
+        if last.isdigit():
+            tries.append(head)
+        for attempt in tries:
+            try:
+                result = await executor.call_api(self.app, self.caller, "GET", attempt, None, None)
+            except Exception:
+                logger.warning("[assistant] could not read %s for its kind", attempt, exc_info=True)
+                continue
+            data = result.data if result.ok else None
+            if attempt != path:  # a list (or a page of one): the row with this id
+                rows = data if isinstance(data, list) else next(
+                    (v for v in (data or {}).values() if isinstance(v, list)), []) if isinstance(data, dict) else []
+                data = next((r for r in rows if isinstance(r, dict) and str(r.get("id")) == last), None)
+            elif isinstance(data, dict) and len(data) == 1 and isinstance(next(iter(data.values())), dict):
+                data = next(iter(data.values()))  # {"payment_method": {...}}
+            if isinstance(data, dict):
+                return data
+        return None
 
     async def _choices(self, path: str) -> list[tuple[str, str]]:
         if path not in self._choice_cache:
@@ -779,6 +836,7 @@ class Turn:
                 for row in (data or [])[:200]:
                     if isinstance(row, dict) and row.get("id") is not None:
                         out.append((str(row["id"]), str(row.get("name") or row.get("identity") or f"#{row['id']}")[:80]))
+                        self._choice_rows.setdefault(path, {})[str(row["id"])] = row
             except Exception:  # a convenience: without it the field is a plain input
                 logger.warning("[assistant] could not list %s for a form", path, exc_info=True)
             self._choice_cache[path] = out
@@ -1015,6 +1073,9 @@ class Turn:
                 return await self._describe(block["id"], args)
             if name == "call_api":
                 return await self._call(block["id"], args)
+            if name == "known_issues":
+                found = known_issues.search(str(args.get("symptom") or ""), args.get("id") or None)
+                return self._tool_result(block["id"], found, "error" in found)
             return self._tool_result(block["id"], {"error": f"Unknown tool {name}"}, True)
         except Exception as exc:  # never let one tool break the conversation
             logger.exception("[assistant] tool %s failed", name)

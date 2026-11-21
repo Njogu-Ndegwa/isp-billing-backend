@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional, Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -468,6 +468,10 @@ async def list_recipients(filter: str = Query("all"),
 
 
 class SendRequest(BaseModel):
+    # a plan to pick only when sending to one plan's customers
+    model_config = ConfigDict(json_schema_extra={"x-fields-for": {"filter": {"by_plan": ["plan_id"]}},
+                                                 "x-required-for": {"filter": {"by_plan": ["plan_id"]}}})
+
     body: str = Field(..., min_length=1, max_length=1000)
     # who gets it when no customer is picked: everyone, active, time ending within 7 days, one plan
     filter: Literal["all", "active", "expiring", "by_plan"] = "all"
