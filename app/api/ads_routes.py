@@ -523,6 +523,10 @@ async def create_ad(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
+    """Create an ad. For a reseller this is their own promo for their WiFi: it shows their
+    network's name and support number, so a support phone must be set in portal settings
+    (portal_support_phone) first, and ads show only while show_ads is on there. An ad for
+    another business is sold through POST /api/ad-sales instead."""
     user = await get_current_user(token, db)
     enforce_active_subscription(user)
     admin = _is_admin(user)
