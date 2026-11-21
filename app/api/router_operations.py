@@ -3276,7 +3276,8 @@ def _analyze_port_rows(
         # WAN ports are routed interfaces: bridge MAC learning says nothing
         # about their health. Only trust configured WANs that are unbridged;
         # stale LB configuration must not hide an access-port warning.
-        is_wan = port_name in wan_ports and not bridge_port.get("bridge")
+        # without load balancing the internet line is ether1 on every router Bitwave sets up
+        is_wan = (port_name in wan_ports or (not wan_ports and port_name.lower() == "ether1"))             and not bridge_port.get("bridge")
         if link_up and (learned_macs or is_wan):
             health = "active"
         elif link_up:
@@ -3322,6 +3323,7 @@ def _analyze_port_rows(
         port_summaries.append(
             {
                 "port": port_name,
+                "uplink": bool(is_wan),  # the internet line: no devices behind it is normal
                 "bridge": bridge_port.get("bridge", ""),
                 "bridge_status": bridge_port.get("status", ""),
                 "link": {
