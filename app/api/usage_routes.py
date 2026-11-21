@@ -712,7 +712,10 @@ async def list_realtime_online_customers(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Which of the caller's customers are online right now on live routers.
+    """IDs only, for the Customers page's Online filter. To show who is online, read
+    GET /api/customers?online=true (names, plans, live state).
+
+    Which of the caller's customers are online right now on live routers.
 
     Feeds the Online / Offline filter on the Customers page. Only routers on
     real-time push are covered (``router_ids``, the same set as

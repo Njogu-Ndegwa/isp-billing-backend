@@ -1449,6 +1449,27 @@ async def test_the_router_list_keeps_only_online_or_offline_ones(client, owner, 
 
 
 @pytest.mark.asyncio
+async def test_any_list_is_narrowed_by_its_rows_before_it_is_drawn(client, owner, db):
+    reseller, token = owner
+    weekly = await make_plan(db, reseller, name="Weekly 300", price=300, duration_value=7)
+    daily = await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    await make_customer(db, reseller, weekly, name="On Weekly", phone="254700000011")
+    await make_customer(db, reseller, daily, name="On Daily", phone="254700000012")
+    await db.commit()
+    model = use_model([
+        tool_reply("call_api", {"method": "GET", "path": "/api/customers", "show": "table",
+                                "where": [{"field": "plan.name", "op": "eq", "value": "weekly 300"}]}, "tu_1"),
+        text_reply("One customer is on Weekly 300."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "who is on weekly 300?"},
+                                           headers=auth(token))).text)
+    drawn = [e for e in events if e["type"] == "data"]
+    assert [c["name"] for c in drawn[0]["payload"]] == ["On Weekly"]
+    told = [res for req in model.requests for res in tool_results(req)]
+    assert told[0]["narrowed"] == {"rows_read": 2, "rows_kept": 1}
+
+
+@pytest.mark.asyncio
 async def test_a_filter_an_action_does_not_have_is_refused_not_ignored(client, owner, db):
     """"Active customers" once came back with inactive ones: the unknown filter was
     dropped and the whole list drawn. Now nothing runs and the model is told why."""

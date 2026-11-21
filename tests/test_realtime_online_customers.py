@@ -113,3 +113,30 @@ async def test_a_router_that_stopped_reporting_is_not_covered(db, monkeypatch):
     # endpoints rather than reporting its customers from a stale push.
     assert result.router_ids == []
     assert result.online_customer_ids == []
+
+
+@pytest.mark.asyncio
+async def test_the_customer_list_keeps_only_who_is_online(db, monkeypatch):
+    """"Show me those online now" reads the customer list with online=true: whole
+    customer rows (names, plans), not bare ids the chat cannot draw."""
+    from app.api import customer_routes
+
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller)
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
+    expiry = datetime.utcnow() + timedelta(days=2)
+    on = await make_customer(db, reseller, plan, router, name="Calvins", mac_address="AA:00:00:00:00:21",
+                             status=CustomerStatus.ACTIVE, expiry=expiry)
+    off = await make_customer(db, reseller, plan, router, name="Idle", mac_address="AA:00:00:00:00:22",
+                              status=CustomerStatus.ACTIVE, expiry=expiry)
+    _push(router.id, hosts=[HostSample(mac="AA:00:00:00:00:21", ip="10.5.50.21", bytes_in=1, bytes_out=1)],
+          live_customers={"AA:00:00:00:00:21": on.id, "AA:00:00:00:00:22": off.id})
+
+    async def _current_user(_token, _db):
+        return reseller
+
+    monkeypatch.setattr(customer_routes, "get_current_user", _current_user)
+    online = await customer_routes.get_customers_api(router_id=None, tier=None, online=True, db=db, token="t")
+    offline = await customer_routes.get_customers_api(router_id=None, tier=None, online=False, db=db, token="t")
+    assert [c["name"] for c in online] == ["Calvins"]
+    assert [c["name"] for c in offline] == ["Idle"]

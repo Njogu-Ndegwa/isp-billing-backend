@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from app.config import settings
-from app.services.assistant import executor, known_issues, shaping, store
+from app.services.assistant import executor, known_issues, shaping, store, listing
 from app.services.assistant.usage import TurnUsage
 from app.services.assistant.caller import Caller
 from app.services.assistant.catalog import (
@@ -116,6 +116,9 @@ TOOLS = [
                 "path": {"type": "string",
                          "description": "Concrete path with real ids filled in, e.g. /api/customers/1234"},
                 "query": {"type": "object", "description": "Query parameters, if any."},
+                "where": listing.WHERE_SCHEMA,
+                "sort": listing.SORT_SCHEMA,
+                "limit": listing.LIMIT_SCHEMA,
                 "body": {"description": "JSON body for POST/PUT/PATCH, if the action takes one."},
                 "narrow": {
                     "type": "object",
@@ -260,7 +263,7 @@ Answering
 - Prefer the action or filter that answers the question directly (the API index lists each action's query parameters) over fetching everything and sifting through it.
 
 Showing results
-- Draw only what was asked for. When the question narrows a list (active customers, offline routers, failed payments, one router's customers), pass the action's own filter for it; if no action can filter that way, read it with show none and name the matching ones in words. Never draw the whole list as the answer to a narrower question.
+- Draw only what was asked for. When the question narrows a list (active customers, offline routers, failed payments, one router's customers), pass the action's own filter for it, and for anything it has no filter for, add where rules on the rows' fields (plan.name, amount, expiry, router.name...), with sort and limit for a top N. Never draw the whole list as the answer to a narrower question.
 - The page draws a read's result for the person when you choose how with "show": tiles for a few totals, table for a list, card for one record, trend for figures per day, week or month, bars for a top-N or a comparison between names, share for a split of one whole (by status, plan or payment method), none for a lookup only you need. Pick the drawing that answers the question, and prefer an action that already returns the grouping you need (per day, per plan, per router) over a long raw list.
 - For trend, bars and share you may add "fields" naming the fields of the result rows to draw (label and value). Leave it out when you are unsure of the names; the page then picks them itself.
 - The numbers on screen always come from the data, never from you. So say the answer in one or two sentences, the headline figure and what stands out, and never repeat rows, lists or tables in your text.
@@ -1193,6 +1196,7 @@ class Turn:
         requested = args.get("show")
         show = requested if requested in SHOW_VALUES else ("auto" if requested else "none")
         fields = clean_fields(args.get("fields"))
+        narrowing = {k: args.get(k) for k in ("where", "sort", "limit") if args.get(k) is not None}
 
         if query is not None and not isinstance(query, dict):
             return self._tool_result(tool_use_id, {"error": "query must be an object"}, True)
@@ -1235,12 +1239,12 @@ class Turn:
             have = ", ".join(sorted(known)) or "none"
             return self._tool_result(tool_use_id, {
                 "error": f"{action.method} {action.template} has no filter {', '.join(dropped)}; it would return "
-                         f"everything unfiltered. Its filters are: {have}. Use one of those, another action that "
-                         "can filter this way, or read it without the filter and say in words which ones match "
-                         "(show none, so the unfiltered list is not drawn).",
+                         f"everything unfiltered. Its filters are: {have}. Use one of those, or send the same "
+                         "read with where (rules on the rows' own fields) to narrow what comes back.",
             }, True)
         if action.is_read(query, body):
-            return await self._read(tool_use_id, action, method, path, query, body, show, dropped, fields)
+            return await self._read(tool_use_id, action, method, path, query, body, show, dropped, fields,
+                                    narrowing)
         if action.key not in self._described():
             return self._tool_result(tool_use_id, {
                 "error": f"Before proposing a change, call describe_action for {action.method} "
@@ -1309,7 +1313,7 @@ class Turn:
         })
 
     async def _read(self, tool_use_id, action: Action, method, path, query, body, show, dropped,
-                    fields: Optional[dict] = None) -> dict:
+                    fields: Optional[dict] = None, narrowing: Optional[dict] = None) -> dict:
         call_id = uuid.uuid4().hex[:12]
         await self.emit("step", {"call_id": call_id, "label": action.title, "phase": "start",
                                  "method": method, "path": path}, keep=False)
@@ -1318,13 +1322,20 @@ class Turn:
                                  "ok": result.ok, "status": result.status}, keep=False)
         if not result.ok:
             return self._tool_result(tool_use_id, {"status": result.status, "error": result.detail()}, True)
+        data, narrowed_note = result.data, None
+        if narrowing:
+            # what was asked, not the whole list: narrowed before anything is drawn
+            try:
+                data, narrowed_note = listing.narrow(data, **narrowing)
+            except listing.ListingError as exc:
+                return self._tool_result(tool_use_id, {"error": str(exc)}, True)
         note = None
         if show != "none":
             # What reaches the screen is the answer, not the search for it: an empty
             # result is said in words, the same lookup again replaces the first one,
             # and an answer shows at most MAX_DRAWN results.
             replaces = self.drawn.get(action.key)
-            if _is_empty(result.data):
+            if _is_empty(data):
                 show, note = "none", "Empty, so not drawn: say so in words."
             elif replaces is None and len(self.drawn) >= MAX_DRAWN:
                 show, note = "none", (f"Not drawn: {MAX_DRAWN} results are already on screen for this answer. "
@@ -1335,11 +1346,13 @@ class Turn:
                     "call_id": call_id, "title": action.title, "method": method, "path": path,
                     "query": query or None, "show": show, **({"fields": fields} if fields else {}),
                     **({"replaces": replaces} if replaces else {}),
-                    "payload": shaping.for_screen(result.data),
+                    "payload": shaping.for_screen(data),
                 })
-        out: dict = {"status": result.status, "data": localize_times(shaping.for_model(result.data), await self._zone())}
+        out: dict = {"status": result.status, "data": localize_times(shaping.for_model(data), await self._zone())}
         if note:
             out["display"] = note
+        if narrowed_note:
+            out["narrowed"] = narrowed_note
         if dropped:
             out["ignored_query_params"] = dropped
         return self._tool_result(tool_use_id, out)
