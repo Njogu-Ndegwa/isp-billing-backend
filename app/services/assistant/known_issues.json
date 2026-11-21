@@ -816,8 +816,9 @@
         "lag",
         "chini"
       ],
-      "cause": "Usually the line, not the billing: Starlink and other ISPs limit speeds at peak hours, each customer is capped at their plan's speed, and a busy small router can be the bottleneck. The live rate in the dashboard is what the customer is using right now, not the speed they can get.",
+      "cause": "Usually the line, not the billing. The billing system only lets customers in and out at their plan's speed; it never slows them below it. Starlink and other ISPs limit speeds at busy hours, so a Starlink speed test that looks fine in the morning says little about the evening, when customers complain. Each customer is also capped at their plan's speed, and a busy small router can be the bottleneck. The live rate in the dashboard is what the customer is using right now, not the speed they can get.",
       "checks": [
+        "Ask when it is slow: if it is the evening, test Starlink itself at that hour, not in the morning.",
         "Ask for a speed test on the customer's device, whether on cable or Wi-Fi, and the time.",
         "Compare with a test straight on the ISP or Starlink at the same time.",
         "GET /api/customers/{customer_id}: the plan's speed.",
