@@ -65,7 +65,26 @@ def load_cases() -> list[dict]:
     return cases
 
 
-CASES = load_cases()
+RESOLVED_FILE = CASES_FILE.with_name("eval-resolved.jsonl")
+
+
+def load_resolved() -> list[dict]:
+    """More resolved conversations, mined from the raw threads (one JSON object per line)."""
+    if not RESOLVED_FILE.is_file():
+        return []
+    out = []
+    for line in RESOLVED_FILE.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("question") and row.get("gold"):
+            out.append({"category": row.get("category", ""), "question": row["question"],
+                        "context": row.get("context", ""), "gold": row["gold"]})
+    return out
+
+
+CASES = load_cases() + load_resolved()
 
 
 async def _healthy_routers(db, reseller, monkeypatch):
@@ -150,7 +169,7 @@ async def _grade(question: str, context: str, gold: str, reply: str, actions: li
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", CASES, ids=[c["question"][:40] for c in CASES])
+@pytest.mark.parametrize("case", CASES, ids=[f"{i:02d}-{c['question'][:36]}" for i, c in enumerate(CASES)])
 async def test_answers_like_bitwave_support_did(client, owner, db, monkeypatch, case):  # noqa: F811
     only = os.environ.get("ASSISTANT_EVAL_ONLY")
     if only and only.lower() not in case["question"].lower():
