@@ -468,9 +468,21 @@ def _owners(groups: dict[str, list[str]]) -> dict[str, list[str]]:
 def _chosen(choice: str, current: dict, context: Optional[dict]) -> Optional[str]:
     for source in (current, context or {}):
         value = source.get(choice)
-        if value not in (None, ""):
+        if value not in (None, "", []):
             return str(value)
     return None
+
+
+def choice_matches(chosen: Any, values: list[str]) -> bool:
+    """"*" is any value at all (a data cap filled in); otherwise one of the listed ones."""
+    if chosen in (None, "", []):
+        return False
+    return "*" in values or str(chosen).lower() in {v.lower() for v in values}
+
+
+def _base(choice: str) -> str:
+    """"plan_id.connection_type" is decided by the plan picked: its connection type."""
+    return choice.split(".", 1)[0]
 
 
 def _fit_to_choices(schema: dict, fields: list[dict], current: dict, context: Optional[dict]) -> list[dict]:
@@ -484,16 +496,19 @@ def _fit_to_choices(schema: dict, fields: list[dict], current: dict, context: Op
         for f in fields:
             if f["name"] == choice and chosen is not None and f.get("value") is None:
                 f = {**f, "value": chosen}  # an edit: the record's own choice
+            elif f["name"] == _base(choice) != choice and f.get("value") is None                     and (context or {}).get(f["name"]) not in (None, ""):
+                f = {**f, "value": context[f["name"]]}  # an edit: the record's own plan
             values = owners.get(f["name"])
             if values is None:
                 kept.append(f)
-            elif choice in on_form:  # the person may still change it: the page decides
+            elif _base(choice) in on_form:  # the person may still change it: the page decides
                 required = all(f["name"] in need.get(v, ()) for v in values)
-                kept.append({**f, "when": {choice: values}, **({"required": True} if required else {})})
+                f = {**f, "when": {**(f.get("when") or {}), choice: values}}
+                kept.append({**f, "required": True} if required else f)
             elif chosen is None:
                 kept.append(f)  # unknown kind: nothing to go by, show everything as before
-            elif chosen.lower() in {v.lower() for v in values}:
-                kept.append({**f, **({"required": True} if f["name"] in need.get(chosen, ()) else {})})
+            elif choice_matches(chosen, values):
+                kept.append({**f, "required": True} if f["name"] in need.get(chosen, ()) else f)
         fields = kept
     return fields
 
@@ -502,11 +517,13 @@ def drop_unchosen(schema: Any, body: dict, context: Optional[dict] = None) -> di
     """Leave out values for fields of a kind that was not chosen (typed, then switched)."""
     out = dict(body)
     for choice, groups in choice_groups(schema).items():
+        if "." in choice:
+            continue  # decided by another record (the plan's type): the page sends only the right ones
         chosen = _chosen(choice, out, context)
-        if chosen is None:
-            continue
+        if chosen is None and "*" not in groups:
+            continue  # unknown kind: keep everything (an empty data cap does drop its FUP fields)
         for name, values in _owners(groups).items():
-            if chosen.lower() not in {v.lower() for v in values}:
+            if not choice_matches(chosen, values):
                 out.pop(name, None)
     return out
 
@@ -670,7 +687,7 @@ def apply_form_values(action: Action, base: Any, values: dict,
         # the chosen kind's own required fields, which the schema alone cannot require
         when = f.get("when") or {}
         if f.get("required") and when and f["kind"] != "password" and body.get(f["name"]) in (None, ""):
-            if all(str(body.get(c, "")).lower() in {v.lower() for v in vs} for c, vs in when.items()):
+            if all("." not in c and choice_matches(body.get(c), vs) for c, vs in when.items()):
                 problems.append(f"'{f['name']}' is required")
     return body, secrets, problems
 

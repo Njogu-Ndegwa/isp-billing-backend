@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, update, text, and_, or_, func
 from sqlalchemy.orm import selectinload
 from sqlalchemy.exc import StatementError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Annotated, Optional
 from datetime import datetime, timedelta
 import asyncio
@@ -287,7 +287,20 @@ async def _pay_by_mpesa_map(db: AsyncSession, customers, paybills: dict) -> dict
 router = APIRouter(tags=["customers"])
 
 
+# Which fields go with which kind of plan, as the dashboard's register form shows
+# them: a hotspot customer's device MAC, a PPPoE login, a static IP. The kind is the
+# picked plan's connection type ("plan_id.connection_type"), published in the schema
+# so a form shows only the fields of the plan chosen.
+_CUSTOMER_FIELDS_FOR = {"x-fields-for": {"plan_id.connection_type": {
+    "hotspot": ["mac_address"],
+    "pppoe": ["pppoe_username", "pppoe_password", "activate_paid_until"],
+    "static_ip": ["static_ip", "static_mac"],
+}}}
+
+
 class CustomerRegisterRequest(BaseModel):
+    model_config = ConfigDict(json_schema_extra=_CUSTOMER_FIELDS_FOR)
+
     name: str
     phone: str
     plan_id: int
@@ -454,6 +467,8 @@ async def register_customer_api(
 
 
 class CustomerEditRequest(BaseModel):
+    model_config = ConfigDict(json_schema_extra=_CUSTOMER_FIELDS_FOR)
+
     name: Optional[str] = None
     phone: Optional[str] = None
     plan_id: Optional[int] = None

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, update, case, or_
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import List, Optional
 from datetime import datetime, timedelta
 import asyncio
@@ -199,7 +199,40 @@ async def _validate_router_scope(
     return normalized
 
 
+# Which fields matter for which choice, as the dashboard's own plan form shows them
+# (app/plans/planType.ts there): a free trial has no "was" price and a hotspot trial
+# says how often it may be claimed; static IP is one device; the FUP fields only
+# mean something once a data cap is set ("*": any value), and the slow speed only
+# when the plan throttles. Published in the schema (x-fields-for), so a form built
+# from it shows a field only while it applies.
+_PLAN_FIELDS_FOR = {
+    "plan_type": {"regular": ["original_price"], "emergency": ["original_price"],
+                  "special_offer": ["original_price"], "free_trial": ["trial_once_per_customer"]},
+    "connection_type": {"hotspot": ["max_shared_users", "trial_once_per_customer"], "pppoe": ["max_shared_users"]},
+    "data_cap_mb": {"*": ["fup_action", "fup_period", "fup_throttle_profile"]},
+    "fup_action": {"throttle": ["fup_throttle_profile"]},
+}
+_PLAN_SCHEMA = {"x-fields-for": _PLAN_FIELDS_FOR}
+_PLAN_CHOICES = {
+    "connection_type": [c.value for c in ConnectionType],
+    "plan_type": [t.value for t in PlanType],
+    "fup_action": [a.value for a in FupAction],
+    "fup_period": ["plan", "daily"],
+}
+
+
+def _with_choices(schema: dict) -> None:
+    """The allowed values of the plan's string choices, so a form offers them as a pick."""
+    for name, values in _PLAN_CHOICES.items():
+        prop = schema.get("properties", {}).get(name)
+        if isinstance(prop, dict):
+            prop["enum"] = values
+    schema.update(_PLAN_SCHEMA)
+
+
 class PlanCreateRequest(BaseModel):
+    model_config = ConfigDict(json_schema_extra=_with_choices)
+
     name: str
     speed: str
     price: int
@@ -227,6 +260,8 @@ class PlanCreateRequest(BaseModel):
 
 
 class PlanUpdateRequest(BaseModel):
+    model_config = ConfigDict(json_schema_extra=_with_choices)
+
     name: Optional[str] = None
     speed: Optional[str] = None
     price: Optional[int] = None
