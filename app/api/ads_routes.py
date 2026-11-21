@@ -102,8 +102,10 @@ class AdCreateRequest(BaseModel):
     model_config = ConfigDict(json_schema_extra=_MEDIA_ADD)
 
     title: str
-    seller_name: str
-    phone_number: str
+    # Your own promo always shows your network's name and support number (ad_review
+    # fills them in), so a reseller is not asked for them; Bitwave's ads still need both.
+    seller_name: Optional[str] = None
+    phone_number: Optional[str] = None
     advertiser_id: Optional[int] = Field(None, json_schema_extra={"x-admin-only": True})
     description: Optional[str] = None
     image_url: Optional[str] = Field(None, json_schema_extra={"x-upload": {"accept": "image/*", "ticket": "/api/ads/media/upload-url"}})
@@ -559,6 +561,12 @@ async def create_ad(
     data = request.model_dump(exclude={"advertiser_id", "slot", "router_ids"})
     if not admin:
         data.pop("priority", None)  # ordering among paid ads is Bitwave's call
+    if slot == "house":
+        for field in ("seller_name", "phone_number"):  # the house lock fills them from the network
+            if not (data.get(field) or "").strip():
+                data.pop(field, None)
+    elif not ((request.seller_name or "").strip() and (request.phone_number or "").strip()):
+        raise HTTPException(status_code=400, detail="seller_name and phone_number are required")
     _apply_fields(ad, data)
     _check_media_complete(ad)
     ad.router_ids = await _check_router_scope(db, user, request.router_ids)

@@ -211,6 +211,7 @@ Product facts (Bitwave support's own answers to resellers; check live data for n
 - A customer with a TV or several devices: send them the connect link; it asks for their number and gives a code, or add the device to the customer by its MAC address.
 - SMS "can't send" or "shows zero": a send needs credits for every recipient × message part; check the balance and how many people they want to reach.
 - A new access point or router should show up by itself once it is added and provisioned; if it does not, check its provisioning.
+- Ads on the hotspot login page come in two kinds. Your own promo (POST /api/ads) advertises your own WiFi (bundles, offers) and always shows your support number from Settings. An ad for any other business, even a friend's shop, is an ad you sell (POST /api/ad-sales): the business pays by M-Pesa, Bitwave keeps 20% and the rest joins your payout. Ads only show when Show ads is on in portal settings. A photo or video is picked in the form, from the phone.
 - Bitwave can set routers up remotely (RustDesk, AnyDesk or UltraViewer) for resellers who are stuck.
 
 Photos
