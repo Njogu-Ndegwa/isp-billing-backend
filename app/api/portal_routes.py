@@ -61,11 +61,23 @@ VALID_ANNOUNCEMENT_TYPES = {"info", "warning", "success"}
 # Pydantic schemas
 # ─────────────────────────────────────────────────────────────────────────────
 
+# The built-in photos for the hero header, as the classic portal page offers them
+# (app/settings/portal-customization in the admin frontend); the Nature one is the default.
+HERO_PHOTO_PRESETS = (
+    ("City", "https://images.unsplash.com/photo-1477959858617-67f85cf4f1df?w=750&h=370&fit=crop&q=80"),
+    ("People", "https://images.unsplash.com/photo-1529156069898-49953e39b3ac?w=750&h=370&fit=crop&q=80"),
+    ("Nature", "https://images.unsplash.com/photo-1523805009345-7448845a9e53?w=750&h=370&fit=crop&q=80"),
+    ("Café", "https://images.unsplash.com/photo-1554118811-1e0d58224f24?w=750&h=370&fit=crop&q=80"),
+    ("Tech", "https://images.unsplash.com/photo-1518770660439-4636190af475?w=750&h=370&fit=crop&q=80"),
+)
+
+
 def _portal_form_schema(schema: dict) -> None:
     """What a form needs that the validators below already know: the allowed values of
     each choice (as picks, not free text), which fields only matter once their switch is
     on (an announcement's text, the welcome banner's words, the social links), and the
-    pictures the person uploads from their phone (logo, header photo)."""
+    pictures the person uploads from their phone (logo, header photo), with the built-in
+    hero photos to pick from instead."""
     props = schema.get("properties", {})
     for name, values in (("color_theme", OFFERED_THEMES), ("header_style", VALID_HEADER_STYLES),
                          ("portal_language", VALID_LANGUAGES), ("announcement_type", VALID_ANNOUNCEMENT_TYPES),
@@ -75,7 +87,11 @@ def _portal_form_schema(schema: dict) -> None:
     for name in ("company_logo_url", "header_bg_image_url"):
         if isinstance(props.get(name), dict):
             props[name]["x-upload"] = {"accept": "image/*", "ticket": "/api/ads/media/upload-url"}
+    if isinstance(props.get("header_bg_image_url"), dict):
+        props["header_bg_image_url"]["x-presets"] = [{"label": label, "value": url} for label, url in HERO_PHOTO_PRESETS]
     schema["x-fields-for"] = {
+        # the photo and the logo belong to the hero header, as on the classic page
+        "header_style": {"hero": ["header_bg_image_url", "company_logo_url"]},
         "show_announcement": {"true": ["announcement_type", "announcement_text"]},
         "show_welcome_banner": {"true": ["welcome_title", "welcome_subtitle"]},
         "show_social_links": {"true": ["facebook_url", "whatsapp_group_url", "instagram_url"]},
@@ -94,8 +110,8 @@ class PortalSettingsUpdate(BaseModel):
     welcome_title: Optional[str] = None
     welcome_subtitle: Optional[str] = None
     # Branding
-    company_logo_url: Optional[str] = None
-    header_bg_image_url: Optional[str] = None
+    company_logo_url: Optional[str] = Field(None, description="Shown above your title on the hero header, instead of the Wi-Fi icon. Square works best.")
+    header_bg_image_url: Optional[str] = Field(None, description="The photo behind your title on the hero header: pick a built-in one, or upload your own.")
     # Footer
     footer_text: Optional[str] = None
     # Support
