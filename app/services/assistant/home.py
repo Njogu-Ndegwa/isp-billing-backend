@@ -4,10 +4,12 @@ The assistant home is rolled out to a share of accounts before everyone:
 
 * a person's own choice always wins ("assistant" or "classic", kept in
   ``assistant_home_choices``, one row per (user_id, staff_id));
-* with no choice, a reseller account (owner and staff alike, so one office
-  sees one thing) is in when ``crc32("assistant-home:{user_id}") % 100`` is
-  below the rollout percentage. The bucket is fixed per account, so raising
-  the percentage only ever adds accounts;
+* with no choice, a paying reseller account (an active subscription; owner
+  and staff alike, so one office sees one thing) is in when
+  ``crc32("assistant-home:{user_id}") % 100`` is below the rollout
+  percentage. The bucket is fixed per account, so raising the percentage only
+  ever adds accounts, and an account that starts paying joins if its bucket
+  is inside. Trial and suspended accounts are not moved;
 * platform admins and View-as sessions are never moved by the percentage;
 * nobody starts there while the assistant is not ready.
 
@@ -24,7 +26,7 @@ from typing import Optional
 from sqlalchemy import delete, func, select
 
 from app.db import database as db_module
-from app.db.models import AppSetting, AssistantHomeChoice
+from app.db.models import AppSetting, AssistantHomeChoice, SubscriptionStatus, User
 from app.services.assistant.caller import Caller
 
 ROLLOUT_KEY = "assistant_home_percent"
@@ -32,11 +34,33 @@ CHOICES = ("assistant", "classic")
 PERCENT_TTL_SECONDS = 30.0
 
 _percent_cache: Optional[tuple[float, int]] = None
+PAYING_TTL_SECONDS = 300.0
+_paying_cache: dict[int, tuple[float, bool]] = {}
 
 
 def reset_cache() -> None:
     global _percent_cache
     _percent_cache = None
+    _paying_cache.clear()
+
+
+def _status_value(v) -> str:
+    return getattr(v, "value", v) or ""
+
+
+async def is_paying(user_id: int) -> bool:
+    """Whether the account has an active (paid) subscription; cached a few minutes."""
+    now = time.monotonic()
+    hit = _paying_cache.get(user_id)
+    if hit is not None and hit[0] > now:
+        return hit[1]
+    async with db_module.async_session() as db:
+        status = (await db.execute(select(User.subscription_status).where(User.id == user_id))).scalar_one_or_none()
+    paying = _status_value(status) == SubscriptionStatus.ACTIVE.value
+    if len(_paying_cache) > 5000:
+        _paying_cache.clear()
+    _paying_cache[user_id] = (now + PAYING_TTL_SECONDS, paying)
+    return paying
 
 
 def in_rollout(user_id: int, percent: int) -> bool:
@@ -128,7 +152,10 @@ async def home_for(caller: Caller, *, ready: bool) -> tuple[bool, Optional[str]]
         return False, choice
     if caller.role == "admin" or caller.viewer_sid is not None:
         return False, None
-    return in_rollout(caller.user_id, await get_percent()), None
+    percent = await get_percent()
+    if not in_rollout(caller.user_id, percent):
+        return False, None
+    return await is_paying(caller.user_id), None
 
 
 async def rollout_report() -> dict:
@@ -138,6 +165,12 @@ async def rollout_report() -> dict:
             select(AssistantHomeChoice.choice, func.count(AssistantHomeChoice.id))
             .group_by(AssistantHomeChoice.choice)
         )).all()
+        paying_ids = (await db.execute(
+            select(User.id).where(User.subscription_status == SubscriptionStatus.ACTIVE, User.role != "admin")
+        )).scalars().all()
     counts = {choice: int(n) for choice, n in rows}
     return {"percent": percent, "chose_assistant": counts.get("assistant", 0),
-            "chose_classic": counts.get("classic", 0)}
+            "chose_classic": counts.get("classic", 0),
+            # the rollout moves paying accounts only: how many there are, and how many are in
+            "paying_accounts": len(paying_ids),
+            "paying_inside": sum(1 for uid in paying_ids if in_rollout(uid, percent))}
