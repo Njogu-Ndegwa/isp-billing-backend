@@ -2,9 +2,18 @@
 # independent. Python version matches the Dockerfile (python:3.13-slim).
 name: Tests
 
+# Once per change: a branch with a PR is tested by the pull_request run, so a
+# push run for the same commit only doubled the bill and the queue. Pushes to
+# main (after a merge) and to codex/qa/ candidate branches (no PR) still run.
 on:
   push:
+    branches: [main, "codex/qa/**"]
   pull_request:
+
+# A newer commit on the same PR makes the older run pointless.
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   pytest:

@@ -131,14 +131,40 @@ async def _fresh_postgres_engine():
         for name in existing - known:
             await conn.execute(sa_text(f'DROP TABLE IF EXISTS "{name}" CASCADE'))
 
-        tables = ", ".join(f'"{t.name}"' for t in db_module.Base.metadata.sorted_tables)
-        if tables:
-            # RESTART IDENTITY so sequence-generated ids don't leak between
-            # tests; CASCADE because these tables reference each other.
-            await conn.execute(
-                sa_text(f"TRUNCATE TABLE {tables} RESTART IDENTITY CASCADE")
-            )
+        # Empty only what the previous test wrote to. TRUNCATE of every table
+        # (~150) took 1-3 s per test, about 3,500 s of a 4,400 s CI run, even
+        # when a test touched three tables. One round trip now finds the tables
+        # that have rows, truncates just those (CASCADE: they reference each
+        # other), and rewinds every sequence that was used, so ids still start
+        # at 1 in each test as RESTART IDENTITY used to guarantee.
+        await conn.execute(sa_text(_RESET_SQL.format(schema=_SCHEMA)))
     return eng
+
+
+_RESET_SQL = """
+DO $reset$
+DECLARE
+    r record;
+    has_rows boolean;
+    dirty text := '';
+BEGIN
+    FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = '{schema}' LOOP
+        EXECUTE format('SELECT EXISTS (SELECT 1 FROM %I.%I)', '{schema}', r.tablename) INTO has_rows;
+        IF has_rows THEN
+            dirty := dirty || CASE WHEN dirty = '' THEN '' ELSE ', ' END
+                     || format('%I.%I', '{schema}', r.tablename);
+        END IF;
+    END LOOP;
+    IF dirty <> '' THEN
+        EXECUTE 'TRUNCATE TABLE ' || dirty || ' RESTART IDENTITY CASCADE';
+    END IF;
+    FOR r IN SELECT sequencename FROM pg_sequences
+             WHERE schemaname = '{schema}' AND last_value IS NOT NULL LOOP
+        EXECUTE format('ALTER SEQUENCE %I.%I RESTART', '{schema}', r.sequencename);
+    END LOOP;
+END
+$reset$;
+"""
 
 
 async def _fresh_sqlite_engine():
