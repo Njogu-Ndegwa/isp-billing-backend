@@ -2,13 +2,31 @@
 # independent. Python version matches the Dockerfile (python:3.13-slim).
 name: Tests
 
+# Once per change: a branch with a PR is tested by the pull_request run, so a
+# push run for the same commit only doubled the bill and the queue. Pushes to
+# main (after a merge) and to codex/qa/ candidate branches (no PR) still run.
 on:
   push:
+    branches: [main, "codex/qa/**"]
   pull_request:
 
+# A newer commit on the same PR makes the older run pointless.
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  pytest:
+  # The suite is CPU-bound on one 4-core runner (about 10 min), so it runs as five
+  # jobs at once, each with its own Postgres, each taking a fifth of the tests
+  # (CI_SHARD, see conftest). The "pytest" job below is the one branch protection
+  # requires: it passes only when every shard passed.
+  pytest-shard:
+    name: pytest (shard ${{ matrix.shard }}/5)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
     # Headroom, not a fix: the real cure for a slow suite is fewer round trips
     # (see the single catalog query in conftest). This only stops a legitimately
     # passing run from being killed while the suite grows.
@@ -39,6 +57,7 @@ jobs:
     env:
       # conftest reads this; app.config.Settings picks it up too.
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/isp_billing_test
+      CI_SHARD: ${{ matrix.shard }}/5
 
     steps:
       - uses: actions/checkout@v4
@@ -59,6 +78,15 @@ jobs:
       # across RouterOS/httpx/payment-provider/sleep/to_thread I/O — the #1
       # cause of production DB-pool outages. False positives go in
       # scripts/session_discipline_allowlist.txt with a justification.
+      # A throwaway test database does not need to survive a power cut. Without
+      # these, every commit and TRUNCATE waits for the disk, which is most of
+      # what a database test costs. All three take effect on a reload.
+      - name: Tune Postgres for tests
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d isp_billing_test -v ON_ERROR_STOP=1             -c "ALTER SYSTEM SET fsync = off"             -c "ALTER SYSTEM SET synchronous_commit = off"             -c "ALTER SYSTEM SET full_page_writes = off"             -c "SELECT pg_reload_conf()"
+
       - name: Session discipline guard
         run: python scripts/check_session_discipline.py
 
@@ -85,9 +113,18 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pytest-report
+          name: pytest-report-${{ matrix.shard }}
           path: pytest-report.xml
           if-no-files-found: ignore
+
+  pytest:
+    needs: pytest-shard
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Every shard passed
+        run: test "${{ needs.pytest-shard.result }}" = "success"
 
   # The ad media Cloudflare Worker. Nothing here deploys it.
   media-worker:
