@@ -260,6 +260,7 @@ Answering
 - Prefer the action or filter that answers the question directly (the API index lists each action's query parameters) over fetching everything and sifting through it.
 
 Showing results
+- Draw only what was asked for. When the question narrows a list (active customers, offline routers, failed payments, one router's customers), pass the action's own filter for it; if no action can filter that way, read it with show none and name the matching ones in words. Never draw the whole list as the answer to a narrower question.
 - The page draws a read's result for the person when you choose how with "show": tiles for a few totals, table for a list, card for one record, trend for figures per day, week or month, bars for a top-N or a comparison between names, share for a split of one whole (by status, plan or payment method), none for a lookup only you need. Pick the drawing that answers the question, and prefer an action that already returns the grouping you need (per day, per plan, per router) over a long raw list.
 - For trend, bars and share you may add "fields" naming the fields of the result rows to draw (label and value). Leave it out when you are unsure of the names; the page then picks them itself.
 - The numbers on screen always come from the data, never from you. So say the answer in one or two sentences, the headline figure and what stands out, and never repeat rows, lists or tables in your text.
@@ -1228,6 +1229,16 @@ class Turn:
         if query:
             query = {k: v for k, v in query.items() if k in known}
 
+        if dropped and action.is_read(query, body):
+            # A filter the action does not have would be ignored and the whole list drawn
+            # ("active customers" came back with inactive ones): refuse before anything runs.
+            have = ", ".join(sorted(known)) or "none"
+            return self._tool_result(tool_use_id, {
+                "error": f"{action.method} {action.template} has no filter {', '.join(dropped)}; it would return "
+                         f"everything unfiltered. Its filters are: {have}. Use one of those, another action that "
+                         "can filter this way, or read it without the filter and say in words which ones match "
+                         "(show none, so the unfiltered list is not drawn).",
+            }, True)
         if action.is_read(query, body):
             return await self._read(tool_use_id, action, method, path, query, body, show, dropped, fields)
         if action.key not in self._described():

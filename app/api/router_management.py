@@ -1,9 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import delete as sql_delete, inspect, or_, select, update, func, case, text
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel, field_validator, model_validator
-from typing import Optional, List
+from typing import Literal, Optional, List
 from datetime import datetime, timedelta
 import httpx
 
@@ -1320,10 +1320,12 @@ def _rewrite_webfig_content(
 
 @router.get("/api/routers")
 async def get_routers(
+    status: Optional[Literal["online", "offline"]] = Query(
+        None, description="Only routers that are online, or only those that are offline, now"),
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
-    """Get routers visible to the current user."""
+    """Get routers visible to the current user (``status`` keeps only the online or offline ones)."""
     user = await get_current_user(token, db)
     is_admin = user.role == UserRole.ADMIN
     stmt = (
@@ -1467,6 +1469,8 @@ async def get_routers(
                 "insurance_backup_verification": backup_item.get("verification"),
             })
         router_payload.update(build_router_status(router_obj, now=now))
+        if status and router_payload.get("status") != status:
+            continue   # asked for online or offline only
         response.append(router_payload)
     return response
 

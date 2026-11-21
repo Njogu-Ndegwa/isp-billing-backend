@@ -4,7 +4,7 @@ from sqlalchemy import select, delete, update, text, and_, or_, func
 from sqlalchemy.orm import selectinload
 from sqlalchemy.exc import StatementError
 from pydantic import BaseModel, ConfigDict, Field
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 from datetime import datetime, timedelta
 import asyncio
 import re
@@ -1553,16 +1553,58 @@ def _page_envelope(items: list, page: int, per_page: int, total: int) -> dict:
     }
 
 
+def _list_filters(status, connection_type, overdue, search, now) -> list:
+    """The narrowing the Customers list can do on the server, so a question like
+    "my active customers" gets only those (an unknown filter used to be ignored
+    and the whole list came back)."""
+    out = []
+    if status:
+        out.append(Customer.status == CustomerStatus(status))
+    has_login = and_(Customer.pppoe_username.isnot(None), Customer.pppoe_username != "")
+    has_ip = and_(Customer.static_ip.isnot(None), Customer.static_ip != "")
+    if connection_type == "pppoe":
+        out.append(has_login)
+    elif connection_type == "static_ip":
+        out.append(and_(has_ip, ~has_login))
+    elif connection_type == "hotspot":
+        out.append(and_(~has_login, ~has_ip))
+    if overdue is not None:
+        ran_out = and_(Customer.expiry.isnot(None), Customer.expiry <= now, Customer.paused_at.is_(None))
+        out.append(ran_out if overdue else ~ran_out)
+    text_q = (search or "").strip()
+    if text_q:
+        like = f"%{text_q}%"
+        options = [Customer.name.ilike(like), Customer.account_number.ilike(like), Customer.pppoe_username.ilike(like),
+                   Customer.phone.ilike(like)]
+        digits = "".join(ch for ch in text_q if ch.isdigit())
+        if len(digits) >= 6:
+            # 0712..., 254712..., +254 712...: the last nine digits are the number
+            options.append(Customer.phone.ilike(f"%{digits[-9:]}%"))
+        out.append(or_(*options))
+    return out
+
+
 @router.get("/api/customers")
 async def get_customers_api(
     router_id: Optional[int] = None,
     tier: Optional[str] = None,
+    status: Annotated[Optional[Literal["active", "inactive", "pending"]],
+                      Query(description="Only customers with this status")] = None,
+    connection_type: Annotated[Optional[Literal["hotspot", "pppoe", "static_ip"]],
+                               Query(description="Only hotspot, PPPoE or static-IP customers")] = None,
+    overdue: Annotated[Optional[bool],
+                       Query(description="true: only those whose paid time has run out (paused ones excluded); false: leave them out")] = None,
+    search: Annotated[Optional[str],
+                      Query(max_length=80, description="Name, phone, account number or PPPoE username contains this")] = None,
     page: Annotated[Optional[int], Query(ge=1)] = None,
     per_page: Annotated[Optional[int], Query(ge=1, le=CUSTOMER_LIST_MAX_PER_PAGE)] = None,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
     """Get all customers for the authenticated user, optionally filtered by router.
+
+    `status`, `connection_type`, `overdue` and `search` narrow the list (all
+    optional, combined with AND).
 
     `tier` (optional, default "all") filters by payment history:
     "customer" = has at least one completed payment or currently-active paid
@@ -1586,6 +1628,7 @@ async def get_customers_api(
             conditions.append(has_paid)
         elif tier_filter == "visitor":
             conditions.append(~has_paid)
+        conditions.extend(_list_filters(status, connection_type, overdue, search, now))
         stmt = (
             select(Customer, has_paid.label("has_paid"))
             .where(*conditions)
