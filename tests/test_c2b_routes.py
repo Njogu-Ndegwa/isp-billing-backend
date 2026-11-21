@@ -147,11 +147,12 @@ async def _seed_pppoe(db, *, account_number=None, wallet=0):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("separator", ["", " "])
 async def test_confirmation_route_activates_customer_end_to_end(
-    db, session_factory, client, patched_provisioning, provision_calls
+    db, session_factory, client, patched_provisioning, provision_calls, separator
 ):
     customer = await _seed_pppoe(db)
-    body = _payload(trans_id="HTTP001", bill_ref=customer.account_number, amount=500)
+    body = _payload(trans_id="HTTP001", bill_ref=separator.join(customer.account_number), amount=500)
 
     resp = await client.post("/api/c2b/confirmation", json=body)
 
