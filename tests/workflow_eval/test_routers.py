@@ -172,6 +172,7 @@ async def test_pppoe_customer_when_no_pppoe_port_yet(client, owner, db, monkeypa
         [
             # no port on this router serves PPPoE yet: a good answer sets ether3 up (or says it must be) first
             any_of(body_has("/pppoe-ports", "ports", "ether3"), body_has("/dual-ports", "ports", "ether3"),
+                   body_has("/pppoe-ports", "add", "ether3"), body_has("/dual-ports", "add", "ether3"),
                    mentions(r"ether3.{0,80}(pppoe|port)|(pppoe|port).{0,80}ether3", "making ether3 a PPPoE port first")),
         ])
     assert not problems, problems
@@ -188,8 +189,9 @@ async def test_add_pppoe_port_keeps_existing_ones(client, owner, db, monkeypatch
         "ether2 is already PPPoE. Make ether4 PPPoE too, I have new home clients on that side.",
         [
             card_for("PUT", "/pppoe-ports"),
-            # the action replaces the whole list: dropping ether2 would cut its customers off
-            body_exact("/pppoe-ports", "ports", {"ether2", "ether4"}),
+            # "ports" replaces the whole list (dropping ether2 would cut its customers off);
+            # "add" changes it and keeps ether2
+            any_of(body_exact("/pppoe-ports", "ports", {"ether2", "ether4"}), body_exact("/pppoe-ports", "add", {"ether4"})),
         ])
     assert not problems, problems
 

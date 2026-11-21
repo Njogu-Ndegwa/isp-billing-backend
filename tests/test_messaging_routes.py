@@ -395,6 +395,39 @@ async def test_customer_event_settings_default_update_and_preview(db, client, mo
 
 
 @pytest.mark.asyncio
+async def test_customer_event_change_keeps_what_it_leaves_out(db, client, monkeypatch):
+    """Turning one switch on (as the assistant's form does) must not wipe the
+    reseller's own wording or flip the other switches."""
+    reseller = await make_reseller(db)
+    _auth_as(monkeypatch, reseller)
+
+    first = await client.put("/api/messaging/customer-events", json={
+        "payment_receipt_enabled": True, "receipt_include_hotspot": True, "welcome_enabled": False,
+        "templates": {"payment_receipt": "Got {amount}, thanks!", "welcome": "Karibu {name}"},
+    })
+    assert first.status_code == 200
+
+    # only the welcome switch
+    second = await client.put("/api/messaging/customer-events", json={"welcome_enabled": True})
+    assert second.status_code == 200
+    body = second.json()
+    assert body["welcome_enabled"] is True
+    assert body["payment_receipt_enabled"] is True
+    assert body["receipt_include_hotspot"] is True
+    assert body["templates"]["payment_receipt"] == "Got {amount}, thanks!"
+    assert body["templates"]["welcome"] == "Karibu {name}"
+
+    # one message changed, one restored: the third untouched
+    third = await client.put("/api/messaging/customer-events", json={
+        "templates": {"reminder": "Your internet ends {expiry}", "welcome": None},
+    })
+    t = third.json()["templates"]
+    assert t["reminder"] == "Your internet ends {expiry}"
+    assert t["welcome"] is None
+    assert t["payment_receipt"] == "Got {amount}, thanks!"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("templates", [
     {"expiry": "Paid {amount}"},       # receipt-only placeholder
     {"welcome": "Hi {nmae}"},          # typo
