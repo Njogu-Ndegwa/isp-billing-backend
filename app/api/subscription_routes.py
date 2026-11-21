@@ -311,11 +311,12 @@ def normalize_kenyan_msisdn(raw: str) -> Optional[str]:
 
 class SubscriptionPayRequest(BaseModel):
     invoice_id: int
-    phone_number: str
+    phone_number: str = Field(..., description="Your M-Pesa number: the payment prompt is sent to this phone, e.g. 0712345678.")
     amount: Optional[float] = None
 
 
-@router.post("/api/subscription/pay")
+@router.post("/api/subscription/pay",
+             openapi_extra={"x-payment-status": "/api/subscription/payments/{payment_id}"})
 async def pay_subscription(
     request: SubscriptionPayRequest,
     db: AsyncSession = Depends(get_db),
@@ -696,6 +697,26 @@ async def subscription_mpesa_callback(request: Request, db: AsyncSession = Depen
     except Exception:
         logger.exception("[SUBSCRIPTION] Error processing M-Pesa callback")
     return {"ResultCode": 0, "ResultDesc": "Accepted"}
+
+
+@router.get("/api/subscription/payments/{payment_id}")
+async def subscription_payment_status(
+    payment_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Whether a subscription payment is paid: pending (waiting for the M-Pesa PIN), completed or failed."""
+    user = await get_current_user(token, db)
+    payment = (await db.execute(
+        select(SubscriptionPayment).where(SubscriptionPayment.id == payment_id, SubscriptionPayment.user_id == user.id)
+    )).scalar_one_or_none()
+    if payment is None:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    status = getattr(payment.status, "value", payment.status)
+    return {"payment_id": payment.id, "status": status, "amount": payment.amount, "paid": status == "completed",
+            "summary": ("Paid: your subscription is renewed." if status == "completed"
+                        else "Not paid: the M-Pesa request was cancelled, timed out or failed." if status == "failed"
+                        else "Waiting for the M-Pesa PIN on the phone.")}
 
 
 @router.get("/api/subscription/payments")

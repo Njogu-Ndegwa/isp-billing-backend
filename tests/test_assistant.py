@@ -1714,3 +1714,50 @@ def test_the_portal_form_offers_hero_photos_with_the_hero_header():
     assert photo["upload"]["accept"] == "image/*"
     assert [p["label"] for p in photo["presets"]] == [label for label, _ in HERO_PHOTO_PRESETS]
     assert photo["when"] == {"header_style": ["hero"]} and fields["company_logo_url"]["when"] == {"header_style": ["hero"]}
+
+
+@pytest.mark.asyncio
+async def test_an_mpesa_payment_waits_for_the_pin_instead_of_saying_done(client, owner, db, monkeypatch):
+    """Buying SMS credits only sends a PIN prompt: the card waits on the order's status,
+    the model is told it is not paid, and the status read says when it is."""
+    import app.api.messaging_routes as mr
+    from app.db.models import SmsCreditOrder, SmsCreditOrderStatus
+
+    reseller, token = owner
+
+    class _Stk:
+        checkout_request_id = "ws_CO_9"
+        merchant_request_id = "mr_9"
+
+    async def _fake_stk(**kwargs):
+        assert kwargs["phone_number"] == "254712345678"   # "0712 345 678" cleaned the shared way
+        return _Stk()
+    monkeypatch.setattr(mr, "initiate_stk_push_direct", _fake_stk)
+
+    body = {"quantity": 100, "phone_number": "0712 345 678"}
+    use_model([
+        tool_reply("describe_action", {"method": "POST", "path": "/api/messaging/credits/purchase"}, "tu_d"),
+        tool_reply("call_api", {"method": "POST", "path": "/api/messaging/credits/purchase", "body": body,
+                                "summary": "Buy 100 SMS"}),
+        text_reply("Ready. Tap Confirm."),
+    ])
+    r = await client.post("/api/assistant/chat", json={"message": "Buy 100 SMS"}, headers=auth(token))
+    events = sse_events(r.text)
+    card = next(e for e in events if e["type"] == "action")
+    model = use_model([text_reply("Check your phone and enter your PIN.")])
+    r = await client.post(f"/api/assistant/conversations/{events[0]['id']}/decide",
+                          json={"decisions": [{"action_id": card["action_id"], "approve": True}]}, headers=auth(token))
+    result = next(e for e in sse_events(r.text) if e["type"] == "action_result")
+    order = (await db.execute(select(SmsCreditOrder))).scalar_one()
+    assert result["ok"] is True and result["payload"] is None
+    assert result["awaiting"]["poll"] == f"/api/messaging/credits/orders/{order.id}"
+    assert "254712345678" in result["awaiting"]["message"]
+    confirmation = model.requests[0]["messages"][-1]["content"][0]["text"]
+    assert "NOT paid yet" in confirmation and '"outcome":"done"' not in confirmation
+
+    status = (await client.get(result["awaiting"]["poll"], headers=auth(token))).json()
+    assert status["status"] == "pending" and status["paid"] is False
+    order.status = SmsCreditOrderStatus.COMPLETED
+    await db.commit()
+    status = (await client.get(result["awaiting"]["poll"], headers=auth(token))).json()
+    assert status["paid"] is True and status["summary"] == "Paid: 100 SMS added."
