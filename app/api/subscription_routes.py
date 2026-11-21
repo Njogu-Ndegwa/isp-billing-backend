@@ -687,7 +687,10 @@ async def subscription_mpesa_callback(request: Request, db: AsyncSession = Depen
                 f"amount={payment.amount}, activated={fully_paid}"
             )
         else:
+            from app.services.mpesa_results import failure_reason
+
             payment.status = SubscriptionPaymentStatus.FAILED
+            payment.failure_reason = failure_reason(result_code, stk_callback.get("ResultDesc"))
             logger.info(
                 f"[SUBSCRIPTION] Payment failed for reseller {payment.user_id}, "
                 f"code={result_code}, desc={stk_callback.get('ResultDesc')}"
@@ -715,7 +718,7 @@ async def subscription_payment_status(
     status = getattr(payment.status, "value", payment.status)
     return {"payment_id": payment.id, "status": status, "amount": payment.amount, "paid": status == "completed",
             "summary": ("Paid: your subscription is renewed." if status == "completed"
-                        else "Not paid: the M-Pesa request was cancelled, timed out or failed." if status == "failed"
+                        else f"Not paid: {payment.failure_reason or 'the M-Pesa request was cancelled, timed out or failed'}." if status == "failed"
                         else "Waiting for the M-Pesa PIN on the phone.")}
 
 

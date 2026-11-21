@@ -607,6 +607,8 @@ class SubscriptionPayment(Base):
     # external reference (SUBCARD-...) until the payment is confirmed.
     provider_reference = Column(String(120), nullable=True, unique=True, index=True)
     checkout_url = Column(String(500), nullable=True)
+    # why M-Pesa did not take the payment (app/services/mpesa_results.py)
+    failure_reason = Column(String(255), nullable=True)
     status = Column(
         Enum(SubscriptionPaymentStatus, name="subscriptionpaymentstatus",
              values_callable=lambda e: [x.value for x in e]),
@@ -2630,6 +2632,8 @@ class SmsCreditOrder(Base):
     mpesa_checkout_request_id = Column(String(128), nullable=True, index=True)
     mpesa_merchant_request_id = Column(String(128), nullable=True)
     payment_reference = Column(String(128), nullable=True)
+    # why M-Pesa did not take the payment (app/services/mpesa_results.py)
+    failure_reason = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

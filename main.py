@@ -1615,6 +1615,9 @@ async def run_subscription_migrations():
         await _run_sql("Index subscription_payments.invoice_id",
             "CREATE INDEX IF NOT EXISTS idx_sub_payments_invoice ON subscription_payments(invoice_id)"
         )
+        await _run_sql("subscription_payments.failure_reason",
+            "ALTER TABLE subscription_payments ADD COLUMN IF NOT EXISTS failure_reason VARCHAR(255)"
+        )
         await _run_sql("Index subscription_payments.checkout_id",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_payments_checkout "
             "ON subscription_payments(mpesa_checkout_request_id) "
@@ -2499,6 +2502,11 @@ async def run_messaging_migrations():
             "WHERE messaging_settings.price_per_sms_kes = 1.00 "
             "OR messaging_settings.provider = 'africastalking'"
         ))
+    async with async_engine.begin() as conn:
+        from sqlalchemy import text as _text
+
+        # why M-Pesa did not take a payment (shown on the chat's payment card)
+        await conn.execute(_text("ALTER TABLE sms_credit_orders ADD COLUMN IF NOT EXISTS failure_reason VARCHAR(255)"))
     logger.info("Migration: Messaging/SMS tables, enums, indexes ready")
 
 

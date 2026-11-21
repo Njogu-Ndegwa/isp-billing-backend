@@ -399,7 +399,7 @@ async def credit_order_status(order_id: int,
     return {"order_id": order.id, "status": status, "quantity": order.quantity, "amount": order.amount,
             "paid": status == "completed",
             "summary": (f"Paid: {order.quantity} SMS added." if status == "completed"
-                        else "Not paid: the M-Pesa request was cancelled, timed out or failed." if status == "failed"
+                        else f"Not paid: {order.failure_reason or 'the M-Pesa request was cancelled, timed out or failed'}." if status == "failed"
                         else "Waiting for the M-Pesa PIN on the phone.")}
 
 
@@ -439,7 +439,11 @@ async def credits_callback(request: Request, db: AsyncSession = Depends(get_db))
                                     reference=f"SMS-{order.id}")
             logger.info("SMS credits granted: order %s, qty %s", order.id, order.quantity)
         else:
+            from app.services.mpesa_results import failure_reason
+
             order.status = SmsCreditOrderStatus.FAILED
+            order.failure_reason = failure_reason(cb.get("ResultCode"), cb.get("ResultDesc"))
+            logger.warning("SMS credits order %s not paid: %s", order.id, order.failure_reason)
         await db.commit()
     except Exception:
         logger.exception("SMS credits callback error")
