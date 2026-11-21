@@ -3293,6 +3293,29 @@ def _analyze_port_rows(
             port_warnings.append("Configured WAN port has no physical link")
         if rx_errors or tx_errors:
             port_warnings.append("Interface errors are present")
+        # what the known issues say about the equipment found here: announced (neighbour, DHCP) or
+        # recognised (an AP vendor, a foreign gateway it claims)
+        equipment = {d["mac"]: d for d in downstream_samples if d.get("device_class") == "infrastructure"}
+        equipment.update({d["mac"]: d for d in infrastructure_here})
+        if len(equipment) >= 2:
+            port_warnings.append(
+                f"{len(equipment)} access points or switches share this port (a chain): they share one "
+                "cable's speed, and one of them in router mode hides every phone behind it "
+                "(known issue ap-in-router-mode)")
+        for infra in [d for d in equipment.values() if d.get("router_mode_suspect")][:3]:
+            what = infra.get("name") or infra.get("vendor") or infra.get("mac")
+            port_warnings.append(
+                f"{what} looks like it is in router mode: phones behind it may get no login page, or all ride one "
+                "paid login; set it to access point (bridge) mode with DHCP off (known issue ap-in-router-mode)")
+        link_downs = _safe_routeros_int(iface.get("link-downs"))
+        if link_downs >= 5:
+            port_warnings.append(
+                f"The link has dropped {link_downs} times since the router started: check the cable and the "
+                "power of what is plugged in (known issue router-offline-flapping)")
+        if link_up and not is_wan and not equipment and len(learned_macs) >= 40:
+            port_warnings.append(
+                f"{len(learned_macs)} devices behind this port and no access point recognised: a switch or an "
+                "unmanaged AP (it cannot be inspected or made a safe AP from here)")
         if port_warnings:
             warnings.append({"port": port_name, "warnings": port_warnings})
 
@@ -3504,9 +3527,10 @@ async def get_router_port_status(
     token: str = Depends(verify_token),
 ):
     """
-    Show every ethernet port with bridge assignment, service mode
+    How each ethernet port is configured: bridge, service mode
     (hotspot/pppoe/plain/dual/unassigned), link status, speed, and error counters.
-    Cached for 30s unless ?refresh=true.
+    For what is plugged into each port (equipment, devices, customers, warnings)
+    use /api/routers/{router_id}/port-analytics. Cached for 30s unless ?refresh=true.
     """
     user = await get_current_user(token, db)
     router_obj = await get_router_by_id(db, router_id, user.id, user.role.value)
@@ -3608,6 +3632,12 @@ async def get_router_port_analytics(
     token: str = Depends(verify_token),
 ):
     """
+    What is on each port: whether the link is up and at what speed, how often it dropped, the
+    equipment behind it (access points and switches with vendor and model, and whether one
+    looks like it is in router mode), the devices and paying customers there, revenue per
+    port, and warnings (a dead or silent link, a chain of APs, an AP in router mode, a link
+    that keeps dropping). Answers "what is on my ports" and "why is ether3 slow".
+
     Read-only downstream-device analytics for one router, including per-port
     customer counts and per-port revenue. Revenue attribution is RECORDED at
     payment time (customer_payments.port_name, stamped by the background

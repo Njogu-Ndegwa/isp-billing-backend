@@ -368,6 +368,12 @@ def test_port_analytics_classifies_vendor_aps_and_router_mode_suspects(monkeypat
     assert samples["AA:BB:CC:DD:EE:01"]["device_class"] == "customer"
     assert samples["AA:BB:CC:DD:EE:01"]["router_mode_suspect"] is False
 
+    # The port says so in words a reseller can act on: two APs share it (a chain), and
+    # one looks like it is in router mode, each tied to the known issue it matches.
+    said = " ".join(ether6["health"]["warnings"])
+    assert "share this port (a chain)" in said
+    assert "router mode" in said and "known issue ap-in-router-mode" in said
+
 
 def test_port_analytics_hardware_precedence_over_hotspot_accounts(monkeypatch):
     """Product ruling 2026-07-25: AP/CPE hardware renders as equipment even
