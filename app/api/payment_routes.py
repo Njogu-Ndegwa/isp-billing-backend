@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, and_, func
 from sqlalchemy.orm import selectinload
@@ -26,6 +26,7 @@ from app.services.hotspot_provisioning import (
     serialize_delivery_attempt,
 )
 from app.services.mpesa_transactions import update_mpesa_transaction_status
+from app.services.payment_numbers import PAYMENT_SEARCH_DESCRIPTION, payment_search_condition
 from app.services.billing import apply_failed_payment_customer_status, make_payment
 from app.services.plan_cache import FREE_TRIAL_NOT_PURCHASABLE, plan_model_allows_router
 from app.services.pppoe_provisioning import call_pppoe_provision, build_pppoe_payload
@@ -1362,8 +1363,11 @@ async def _customer_wallet_trail(db: AsyncSession, customer_id: int, reseller_id
     return trail
 
 
+# ``search`` comes first so it is among the parameters the assistant's API
+# index lists for this route (it shows the first eight).
 @router.get("/api/mpesa/transactions")
 async def get_mpesa_transactions(
+    search: Optional[str] = Query(None, description=PAYMENT_SEARCH_DESCRIPTION),
     router_id: Optional[int] = None,
     customer_id: Optional[int] = None,
     payment_method: Optional[str] = None,
@@ -1380,7 +1384,14 @@ async def get_mpesa_transactions(
     token: str = Depends(verify_token)
 ):
     """
-    Get all transactions (M-Pesa, voucher, cash, etc.) with filters.
+    Get all transactions (M-Pesa, voucher, cash, etc.) with filters; search=
+    finds one payment by its M-Pesa code or phone.
+
+    ``search`` finds one payment by its M-Pesa code or phone: an exact,
+    case-insensitive match on the receipt/transaction code (STK receipt,
+    paybill TransID, a payment's reference) or the payer's phone in any of
+    07…/7…/254…/+254…. It filters inside every ledger, so it works on any
+    account size and ``total`` counts only the matches.
 
     With both ``page`` and ``per_page`` (what the Transactions page sends) the
     response is ``{data, page, per_page, total, total_pages}``: one page plus
@@ -1406,11 +1417,14 @@ async def get_mpesa_transactions(
     - start_date: Range start (ISO format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS) (optional)
     - end_date: Range end (ISO format) (optional)
     - status: Filter by status -- completed, pending, failed, expired (optional)
+    - search: Find one payment by its M-Pesa code or phone (exact; optional)
     - limit: Max results per page (default 200)
     - offset: Skip first N results for pagination (default 0)
     """
     try:
         user = await get_current_user(token, db)
+        # Called directly (not over HTTP) the default is the Query() marker.
+        search = (search.strip() or None) if isinstance(search, str) else None
 
         # Parse date filters once
         date_start = None
@@ -1497,6 +1511,12 @@ async def get_mpesa_transactions(
                 mpesa_stmt = mpesa_stmt.where(or_(
                     MpesaTransaction.collection_mode.is_(None),
                     MpesaTransaction.collection_mode != CollectionMode.DIRECT,
+                ))
+            if search:
+                mpesa_stmt = mpesa_stmt.where(payment_search_condition(
+                    search,
+                    code_columns=(MpesaTransaction.mpesa_receipt_number,),
+                    phone_columns=(MpesaTransaction.phone_number, Customer.phone),
                 ))
 
             if paged:
@@ -1619,6 +1639,12 @@ async def get_mpesa_transactions(
                         cp_stmt = cp_stmt.where(CustomerPayment.status == cp_status)
                     except ValueError:
                         pass
+            if search:
+                cp_stmt = cp_stmt.where(payment_search_condition(
+                    search,
+                    code_columns=(CustomerPayment.payment_reference,),
+                    phone_columns=(Customer.phone,),
+                ))
 
             if paged:
                 total_rows += await _count(cp_stmt)
@@ -1746,6 +1772,13 @@ async def get_mpesa_transactions(
                         C2BTransaction.business_shortcode.is_(None),
                         C2BTransaction.business_shortcode != platform_sc,
                     ))
+            if search:
+                # Paybill payers often type their phone as the account number.
+                c2b_stmt = c2b_stmt.where(payment_search_condition(
+                    search,
+                    code_columns=(C2BTransaction.trans_id,),
+                    phone_columns=(C2BTransaction.msisdn, C2BTransaction.bill_ref_number, Customer.phone),
+                ))
 
             if paged:
                 total_rows += await _count(c2b_stmt)

@@ -16,6 +16,8 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+from sqlalchemy import func, or_
+
 # \s covers ASCII and Unicode whitespace incl. NBSP; zero-width characters
 # and the BOM are not whitespace to Python but are invisible in a form.
 _INVISIBLE = re.compile(r"[\s​‌‍⁠﻿]+")
@@ -66,3 +68,58 @@ def normalize_fields(obj, fields=None) -> dict[str, tuple[Optional[str], Optiona
             setattr(obj, field, after)
             changed[field] = (before, after)
     return changed
+
+
+# Every form a Kenyan number is stored in across the ledgers: STK rows keep
+# 2547..., customers are saved as typed (07..., +254..., 254...), and some
+# paybill account numbers are the bare 7... form.
+_PHONE_CHARS = re.compile(r"^\+?[\d\s()\-]+$")
+
+
+def phone_search_variants(raw: Optional[str]) -> list[str]:
+    """The stored forms of a phone typed in any of 07…/7…/254…/+254….
+
+    Returns [] when ``raw`` does not look like a phone number (an M-Pesa
+    receipt code, a name), so callers can skip the phone match. A number
+    that is not Kenyan is matched as typed, with and without a leading +.
+    """
+    value = (raw or "").strip()
+    if not value or not _PHONE_CHARS.match(value):
+        return []
+    digits = re.sub(r"\D", "", value)
+    national = None
+    if len(digits) == 12 and digits.startswith("254"):
+        national = digits[3:]
+    elif len(digits) == 10 and digits.startswith("0"):
+        national = digits[1:]
+    elif len(digits) == 9:
+        national = digits
+    if national is not None and national[0] in "17":
+        return ["0" + national, "254" + national, "+254" + national, national]
+    if len(digits) < 9:
+        return []
+    return [digits, "+" + digits]
+
+
+PAYMENT_SEARCH_DESCRIPTION = (
+    "Find one payment by its M-Pesa code or phone: exact, case-insensitive "
+    "receipt/transaction code, or the payer's phone as 07…, 7…, 254… or +254…."
+)
+
+
+def payment_search_condition(term: Optional[str], code_columns, phone_columns):
+    """WHERE clause for one exact payment lookup, or None when ``term`` is blank.
+
+    Matches the M-Pesa receipt code case-insensitively (``tkl3xy9q2m`` finds
+    ``TKL3XY9Q2M``) and, when ``term`` reads as a phone, any of its stored
+    forms (07…, 7…, 254…, +254…). Both are equality tests: a partial code
+    or a name is not a match.
+    """
+    term = (term or "").strip()
+    if not term:
+        return None
+    conditions = [func.upper(col) == term.upper() for col in code_columns]
+    variants = phone_search_variants(term)
+    if variants:
+        conditions.extend(col.in_(variants) for col in phone_columns)
+    return or_(*conditions)
