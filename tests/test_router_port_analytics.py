@@ -352,7 +352,8 @@ def test_port_analytics_classifies_vendor_aps_and_router_mode_suspects(monkeypat
     # Tenda OUI, no DHCP lease / neighbor entry: legacy "kind" is unchanged
     # but the computed classification recognizes the AP vendor.
     tenda = samples["B4:0F:3B:12:34:56"]
-    assert tenda["kind"] == "unknown_device"
+    # equipment the classifier recognises is equipment, never an "unknown device" (Dennis, 21 Nov)
+    assert tenda["kind"] == "infrastructure"
     assert tenda["device_class"] == "infrastructure"
     assert tenda["vendor"] == "Tenda"
     assert tenda["router_mode_suspect"] is False
@@ -642,3 +643,33 @@ async def test_port_analytics_returns_cached_result_when_refresh_already_running
     assert response["stale"] is True
     assert response["refresh_pending"] is True
     assert response["refresh_skip_reason"] == "refresh_already_running"
+
+
+
+def test_aps_and_customer_routers_are_not_unknown_devices():
+    """An AP known only by its model name, and a customer's router known only by its
+    PPPoE session, are equipment and a customer: neither is counted as unknown."""
+    rows = dict(
+        identity_rows=[{"name": "Router-A"}], resource_rows=[{}],
+        interface_rows=[{"name": "ether5", "type": "ether", "running": "true"}],
+        ethernet_rows=[{"name": "ether5"}], bridge_rows=[{"name": "bridge"}],
+        bridge_port_rows=[{"interface": "ether5", "bridge": "bridge"}],
+        bridge_host_rows=[
+            {"mac-address": "02:11:22:33:44:01", "on-interface": "ether5"},   # Ruijie AP, by name only
+            {"mac-address": "02:11:22:33:44:02", "on-interface": "ether5"},   # Jane's own router (PPPoE)
+            {"mac-address": "02:11:22:33:44:03", "on-interface": "ether5"},   # someone we do not know
+        ],
+        neighbor_rows=[],
+        dhcp_rows=[{"active-mac-address": "02:11:22:33:44:01", "active-address": "10.5.0.2",
+                    "host-name": "RAP6262G-A51ACD", "status": "bound"}],
+        arp_rows=[], hotspot_host_rows=[], hotspot_active_rows=[],
+        ppp_active_rows=[{"name": "jane01", "caller-id": "02:11:22:33:44:02", "address": "10.20.0.9"}],
+    )
+    customers = {"login:jane01": {"id": 41, "name": "Jane Wanjiru", "status": "active", "pppoe": True}}
+    result = router_operations._analyze_port_rows({"id": 10, "name": "A", "identity": "Router-A", "ip": "10.0.0.5"}, customers, {}, **rows)
+    port = next(p for p in result["ports"] if p["port"] == "ether5")
+    samples = {x["mac"]: x for x in port["downstream_devices_sample"]}
+    assert samples["02:11:22:33:44:01"]["kind"] == "infrastructure"
+    assert samples["02:11:22:33:44:02"]["kind"] == "known_customer" and samples["02:11:22:33:44:02"]["name"] == "Jane Wanjiru"
+    assert samples["02:11:22:33:44:03"]["kind"] == "unknown_device"
+    assert port["counts"]["unknown_devices"] == 1
