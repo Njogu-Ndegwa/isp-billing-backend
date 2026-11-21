@@ -65,6 +65,9 @@ def clean_fields(raw: Any) -> Optional[dict]:
     label = name(raw.get("label"))
     if label:
         out["label"] = label
+    highlight = raw.get("highlight")
+    if isinstance(highlight, (str, int)) and 0 < len(str(highlight).strip()) <= 120:
+        out["highlight"] = str(highlight).strip()  # the one the question is about, lit among the others
     values = raw.get("value")
     if isinstance(values, str):
         values = [values]
@@ -151,6 +154,10 @@ TOOLS = [
                                   "description": "The field that names each row: the date, the name, the status."},
                         "value": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_VALUE_FIELDS,
                                   "description": "The numeric field(s) to draw, e.g. [\"revenue\"]."},
+                        "highlight": {"type": "string",
+                                      "description": "For bars: the label of the one the question is about "
+                                                     "(a customer's name, a router's name). It is drawn lit among the "
+                                                     "others, with its rank, the average, the top and the lowest."},
                     },
                     "additionalProperties": False,
                 },
@@ -236,6 +243,7 @@ Bitwave support notes
 - A message starting with [Bitwave support note from …] was written by the Bitwave team into this chat. Follow it, and tell the person what support said when it matters.
 
 Answering
+- Numbers about one thing (a customer's usage, a router's CPU or uptime, a plan's sales) mean little alone: say the figure, then set it against the others. Read the list that ranks them all (top users, routers, plans) and draw it with show "bars" and fields.highlight set to the one asked about, so the page shows it lit with its rank, the average, the top and the lowest, and say in words where it stands ("4th of 38, about 3 times the average"). Figures over time are a trend; parts of one whole are a share. A card of every field is for details (phone, plan, dates), never for numbers.
 - Answer exactly what was asked, nothing around it. Lead with the answer itself (the count, the names, the figure) in one or two sentences, then at most one line on anything that needs attention.
 - Say the answer once, after your last lookup. Words you write next to a tool call are not shown, so do not narrate ("I'll look that up"): the page already shows that you are checking.
 - Never mention database ids ("id 1", "#34") unless the person asked for one; use names.
@@ -554,6 +562,11 @@ async def account_state(caller: Caller) -> tuple[Optional[str], list[str]]:
                 due = max(float(invoice.final_charge or 0) - float(await get_invoice_amount_paid(db, invoice.id) or 0), 0.0)
             credits = (await db.execute(
                 select(SmsCreditAccount.balance).where(SmsCreditAccount.user_id == user.id))).scalar()
+            from sqlalchemy import func as _func
+
+            from app.db.models import Router
+            routers = (await db.execute(
+                select(_func.count(Router.id)).where(Router.user_id == user.id))).scalar() or 0
     except Exception as e:  # the question still gets answered
         logger.warning("assistant account state unavailable: %s", e)
         return None, []
@@ -579,6 +592,8 @@ async def account_state(caller: Caller) -> tuple[Optional[str], list[str]]:
         notes.append(f"Bitwave subscription invoice open: {owed} to pay.")
     if credits is not None and credits <= 0:
         notes.append("SMS credits: 0, so no SMS can be sent until credits are bought.")
+    if not routers:
+        notes.append("No router yet: no customer can buy or connect until one is set up (the router setup command).")
     return tz, notes
 
 

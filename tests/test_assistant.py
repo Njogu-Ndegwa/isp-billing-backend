@@ -1392,7 +1392,14 @@ async def test_the_model_is_told_the_local_time_and_what_is_wrong_with_the_accou
     from tests.factories import make_sms_account
 
     reseller, token = owner
+    # no router yet: nobody can buy, so the model is told
+    model = use_model([text_reply("Set up a router first.")])
+    await client.post("/api/assistant/chat", json={"message": "hi"}, headers=auth(token))
+    assert "No router yet" in json.dumps(model.requests[0]["messages"][-1])
+
     # all well: the local clock, and nothing else
+    await make_router(db, reseller, name="Main Tower")
+    await db.commit()
     model = use_model([text_reply("Fine.")])
     await client.post("/api/assistant/chat", json={"message": "hi"}, headers=auth(token))
     said = json.dumps(model.requests[0]["messages"][-1])
@@ -1618,3 +1625,10 @@ async def test_a_customer_form_tells_the_page_each_plans_type(client, owner, db)
     form = {f["name"]: f for f in next(e for e in events if e["type"] == "action")["form"]}
     assert form["plan_id"]["option_attrs"]["connection_type"] == {ids[1]: "hotspot", ids[2]: "pppoe"}
     assert form["plan_id"]["value"] == ids[2]
+
+
+def test_a_bars_hint_keeps_the_one_asked_about():
+    from app.services.assistant.agent import clean_fields
+
+    assert clean_fields({"label": "name", "value": ["total_mb"], "highlight": " Guest 1766 "})["highlight"] == "Guest 1766"
+    assert "highlight" not in clean_fields({"label": "name", "highlight": "x" * 500})
