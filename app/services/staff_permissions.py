@@ -172,6 +172,7 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     ((R,), "/api/subscription", ANY_STAFF, None),
     ((R,), "/api/plans", ("plans.manage", "customers.view", "customers.manage", "vouchers.generate", "routers.view", "routers.manage", "portal.manage"), None),
     ((R,), "/api/plans/by-router/{router_id}", ("plans.manage", "customers.view", "customers.manage", "vouchers.generate", "routers.view", "routers.manage", "portal.manage"), None),
+    ((R,), "/api/routers/{router_id}/checkup", ("routers.view", "routers.manage"), None),
     ((R,), "/api/routers", ("routers.view", "routers.manage", "customers.view", "customers.manage", "plans.manage", "vouchers.generate", "messaging.send", "portal.manage", "dashboard.view"), None),
 
     # --- dashboard ----------------------------------------------------------
@@ -369,6 +370,8 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
      "Changed status alerts on router {router_id}"),
     (("POST",), "/api/routers/{router_id}/remediate-captive-portal", "routers.manage",
      "Repaired captive portal on router {router_id}"),
+    (("POST",), "/api/routers/{router_id}/anti-bypass", "routers.manage",
+     "Closed the hotspot proxy bypass on router {router_id}"),
     (("POST",), "/api/routers/anti-tethering/enable", "routers.manage",
      "Turned anti-tethering on"),
     (("POST",), "/api/routers/anti-tethering/disable", "routers.manage",

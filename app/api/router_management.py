@@ -2748,3 +2748,108 @@ async def _get_owned_router(db: AsyncSession, router_id: int, user_id: int) -> R
     if not router_obj:
         raise HTTPException(status_code=404, detail="Router not found or does not belong to you")
     return router_obj
+
+
+
+# ---- Router check-up: known faults, each with its tested fix ---------------
+
+def _checkup_sync(router_info: dict) -> dict:
+    from app.services import router_checkup
+    from app.services.mikrotik_api import MikroTikAPI
+
+    api = MikroTikAPI(router_info["ip"], router_info["username"], router_info["password"],
+                      router_info["port"] or 8728, timeout=20, connect_timeout=6)
+    if not api.connect():
+        return {"error": "connection_failed", "detail": api.last_connect_error or "connection failed"}
+    try:
+        return router_checkup.check(api, router_info["id"])
+    finally:
+        api.disconnect()
+
+
+@router.get("/api/routers/{router_id}/checkup")
+async def router_checkup(
+    router_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Check a router for the known faults behind "no internet", "the login page
+    doesn't show" and "people browse without paying": its internet line, clock,
+    hotspot and login page, the proxy bypass, devices let through, a second DHCP
+    server on the hotspot, CPU load. Read-only.
+
+    Each finding has a severity and either `fix` (the action that repairs it, to
+    offer for confirmation) or `advice` (what only someone at the site can do).
+    """
+    from app.services.router_helpers import get_router_by_id
+
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, getattr(user.role, "value", user.role))
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+    info = {"id": router_obj.id, "ip": router_obj.ip_address, "username": router_obj.username,
+            "password": router_obj.password, "port": router_obj.port, "name": router_obj.name}
+    await db.commit()   # nothing held open across the RouterOS calls
+    result = await asyncio.to_thread(_checkup_sync, info)
+    if result.get("error") == "connection_failed":
+        return {
+            "router_id": router_id, "reachable": False, "ok": False, "checked": ["connection"],
+            "findings": [{
+                "code": "unreachable", "severity": "bad", "title": f"Bitwave cannot reach {info['name']}",
+                "detail": "The management connection to the router is down, so nothing on it can be checked or fixed "
+                          "from here. Its customers may still be online if only this connection is down.",
+                "advice": "Check the router has power and internet (port 1). If it is on and online, restart it once; "
+                          "if it stays unreachable, it may need setting up again.",
+            }],
+        }
+    return result
+
+
+@router.post("/api/routers/{router_id}/anti-bypass")
+async def close_hotspot_proxy_bypass(
+    router_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Close the HTTP Injector bypass: the hotspot's web proxy may relay only to the
+    Bitwave portal and backend. The same rule new routers get at setup; safe to
+    run again."""
+    from app.services import router_checkup
+    from app.services.mikrotik_api import MikroTikAPI
+    from app.services.provisioning import portal_allow_entries
+    from app.services.router_helpers import get_router_by_id
+
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
+    router_obj = await get_router_by_id(db, router_id, user.id, getattr(user.role, "value", user.role))
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+    pt = (await db.execute(
+        select(ProvisioningToken).where(ProvisioningToken.router_id == router_id)
+        .order_by(ProvisioningToken.created_at.desc())
+    )).scalars().first()
+    if not pt:
+        raise HTTPException(status_code=409, detail=(
+            "This router has no setup record, so the addresses it must still reach are unknown. "
+            "Set it up again from the Routers page to get the protection."))
+    allow = portal_allow_entries(pt)
+    info = {"ip": router_obj.ip_address, "username": router_obj.username,
+            "password": router_obj.password, "port": router_obj.port}
+    await db.commit()
+
+    def _apply() -> dict:
+        api = MikroTikAPI(info["ip"], info["username"], info["password"], info["port"] or 8728,
+                          timeout=20, connect_timeout=6)
+        if not api.connect():
+            return {"error": api.last_connect_error or "connection failed"}
+        try:
+            return router_checkup.apply_anti_bypass(api, allow)
+        finally:
+            api.disconnect()
+
+    result = await asyncio.to_thread(_apply)
+    if result.get("error"):
+        raise HTTPException(status_code=503, detail=f"Could not reach the router: {result['error']}")
+    if not result.get("success"):
+        raise HTTPException(status_code=502, detail={"message": "The router refused part of the change", **result})
+    return {"success": True, "message": "The hotspot proxy can no longer be used to browse without paying.", **result}
