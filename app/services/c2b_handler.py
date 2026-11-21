@@ -53,6 +53,11 @@ from app.db.models import (
     User,
 )
 from app.services.account_numbers import is_valid_account_number
+from app.services.payer_names import (
+    apply_payer_name,
+    is_placeholder_name,
+    name_from_c2b_payload,
+)
 from app.services.pppoe_provisioning import (
     build_pppoe_payload,
     call_pppoe_provision,
@@ -89,12 +94,15 @@ class C2BPayloadFields:
         trans_amount: float,
         msisdn: Optional[str],
         business_shortcode: Optional[str],
+        payer_name: Optional[str] = None,
     ):
         self.trans_id = trans_id
         self.bill_ref_number = bill_ref_number
         self.trans_amount = trans_amount
         self.msisdn = msisdn
         self.business_shortcode = business_shortcode
+        # Cleaned FirstName/MiddleName/LastName, or None. Best-effort only.
+        self.payer_name = payer_name
 
 
 def parse_c2b_payload(payload: dict) -> Optional[C2BPayloadFields]:
@@ -118,7 +126,10 @@ def parse_c2b_payload(payload: dict) -> Optional[C2BPayloadFields]:
         shortcode = payload.get("BusinessShortCode")
         if shortcode is not None:
             shortcode = str(shortcode)
-        return C2BPayloadFields(trans_id, bill_ref, amount, msisdn, shortcode)
+        return C2BPayloadFields(
+            trans_id, bill_ref, amount, msisdn, shortcode,
+            payer_name=name_from_c2b_payload(payload),
+        )
     except (ValueError, TypeError):
         return None
 
@@ -291,10 +302,22 @@ async def mark_stk_echo_after_stk_payment(
                 session, receipt, customer_id=customer_id, reseller_id=reseller_id,
             )
             await session.commit()
-            return retired
+            payer_name = None
+            if customer_id:
+                payer_name = (
+                    await session.execute(
+                        select(C2BTransaction.payer_name)
+                        .where(C2BTransaction.trans_id == receipt)
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                await session.commit()
     except Exception:
         logger.exception("[C2B] Could not retire STK echo for receipt %s", receipt)
         return False
+    # The C2B copy carries the payer's name; the STK callback does not.
+    await apply_payer_name(customer_id, payer_name)
+    return retired
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +394,8 @@ async def handle_confirmation(
             "[C2B] STK echo for trans_id=%s (already recorded via %s, customer=%s) - archived only",
             fields.trans_id, owner.source, owner.customer_id,
         )
+        # The STK callback carries no name; this copy does. Own session, never raises.
+        await apply_payer_name(owner.customer_id, fields.payer_name)
         return SUCCESS_RESPONSE
 
     # 2. Resolve paybill -> reseller scope
@@ -528,6 +553,8 @@ async def handle_confirmation(
     )
 
     customer.pending_update_data = None
+    if fields.payer_name and is_placeholder_name(customer.name):
+        customer.name = fields.payer_name
 
     # Wallet replacement: effective_amount was made up of (paid + old_wallet).
     # We applied plan_price to grant the period; the remainder is the new wallet.
@@ -643,6 +670,7 @@ async def _archive(
         trans_amount=fields.trans_amount,
         msisdn=fields.msisdn,
         business_shortcode=fields.business_shortcode,
+        payer_name=fields.payer_name,
         payload_json=None,  # raw stored at the route level for full audit
         status=status,
         matched_customer_id=matched_customer.id if matched_customer else matched_customer_id,

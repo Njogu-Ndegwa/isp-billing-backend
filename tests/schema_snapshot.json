@@ -319,6 +319,7 @@
   "matched_customer_id",
   "matched_reseller_id",
   "msisdn",
+  "payer_name",
   "payload_json",
   "processed_at",
   "received_at",

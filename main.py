@@ -2341,6 +2341,11 @@ async def run_c2b_migrations():
             "ADD COLUMN IF NOT EXISTS wallet_after_kes INTEGER NULL"
         ))
 
+        # -- Payer name from the confirmation (FirstName/MiddleName/LastName)
+        await conn.execute(sa_text(
+            "ALTER TABLE c2b_transactions ADD COLUMN IF NOT EXISTS payer_name VARCHAR(120) NULL"
+        ))
+
     logger.info("C2B Paybill migrations complete")
 
 
