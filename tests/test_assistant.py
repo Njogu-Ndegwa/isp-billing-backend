@@ -1698,3 +1698,19 @@ async def test_the_rating_ask_is_quiet_and_rare(client, owner, db, monkeypatch):
     assert report["count"] == 1 and report["average"] == 5
     assert report["distribution"] == {"1": 0, "2": 0, "3": 0, "4": 0, "5": 1}
     assert report["reviews"][0]["account"] == "Kwetu WiFi" and report["reviews"][0]["questions"] == ratings_mod.MIN_QUESTIONS
+
+
+def test_the_portal_form_offers_hero_photos_with_the_hero_header():
+    """The hero header's photo can be one of the built-in ones or the person's own upload,
+    and it (with the logo) is asked for only when the header style is Hero, as on the classic page."""
+    import main
+    from app.api.portal_routes import HERO_PHOTO_PRESETS
+    from app.services.assistant.catalog import form_fields, get_catalog
+
+    catalog = get_catalog(main.app)
+    edit = next(a for a in catalog.actions if a.method == "PUT" and a.template == "/api/portal/settings")
+    fields = {f["name"]: f for f in form_fields(edit, {}, {"header_style": "hero"})}
+    photo = fields["header_bg_image_url"]
+    assert photo["upload"]["accept"] == "image/*"
+    assert [p["label"] for p in photo["presets"]] == [label for label, _ in HERO_PHOTO_PRESETS]
+    assert photo["when"] == {"header_style": ["hero"]} and fields["company_logo_url"]["when"] == {"header_style": ["hero"]}
