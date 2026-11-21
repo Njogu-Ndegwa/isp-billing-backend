@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, update, case, or_
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Optional
 from datetime import datetime, timedelta
 import asyncio
@@ -241,10 +241,10 @@ class PlanCreateRequest(BaseModel):
     connection_type: str
     router_profile: Optional[str] = None
     plan_type: Optional[str] = "regular"
-    is_hidden: Optional[bool] = False
+    is_hidden: Optional[bool] = Field(False, description='Hidden from the hotspot login page, so nobody new buys it; customers on it keep it.')
     badge_text: Optional[str] = None
-    original_price: Optional[int] = None
-    valid_until: Optional[str] = None
+    original_price: Optional[int] = Field(None, description="The 'was' price shown crossed out next to the price (special offers).")
+    valid_until: Optional[str] = Field(None, description='After this moment the plan is off sale for good. For a time-limited offer, create a separate special_offer plan rather than putting an end date on a regular plan.')
     data_cap_mb: Optional[int] = None
     fup_action: Optional[str] = None
     fup_throttle_profile: Optional[str] = None
@@ -253,7 +253,7 @@ class PlanCreateRequest(BaseModel):
     fup_period: Optional[str] = None
     max_shared_users: Optional[int] = 1
     # Omit or send null/[] to offer the plan on every router the reseller owns.
-    router_ids: Optional[List[int]] = None
+    router_ids: Optional[List[int]] = Field(None, description='Offer the plan only on these routers; leave out for every router.')
     # Free-trial plans only: True = each device may claim it once,
     # False = it may claim again once its previous trial has ended.
     trial_once_per_customer: Optional[bool] = True
@@ -270,10 +270,10 @@ class PlanUpdateRequest(BaseModel):
     connection_type: Optional[str] = None
     router_profile: Optional[str] = None
     plan_type: Optional[str] = None
-    is_hidden: Optional[bool] = None
+    is_hidden: Optional[bool] = Field(None, description='Hidden from the hotspot login page, so nobody new buys it; customers on it keep it.')
     badge_text: Optional[str] = None
-    original_price: Optional[int] = None
-    valid_until: Optional[str] = None
+    original_price: Optional[int] = Field(None, description="The 'was' price shown crossed out next to the price (special offers).")
+    valid_until: Optional[str] = Field(None, description='After this moment the plan is off sale for good. For a time-limited offer, create a separate special_offer plan rather than putting an end date on a regular plan.')
     data_cap_mb: Optional[int] = None
     fup_action: Optional[str] = None
     fup_throttle_profile: Optional[str] = None
@@ -281,7 +281,7 @@ class PlanUpdateRequest(BaseModel):
     max_shared_users: Optional[int] = None
     # Send null/[] to revert the plan to "all routers". Only applied when the
     # field is actually present in the request body.
-    router_ids: Optional[List[int]] = None
+    router_ids: Optional[List[int]] = Field(None, description='Offer the plan only on these routers; leave out for every router.')
     trial_once_per_customer: Optional[bool] = None
 
 
@@ -681,7 +681,9 @@ async def delete_plan(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
-    """Delete a plan (only if no active customers using it)"""
+    """Delete a plan. Refused while active customers are on it: hide it instead
+    (PUT /api/plans/{plan_id} with is_hidden true), so nobody new buys it and the
+    customers on it keep it; delete once they have moved or expired."""
     try:
         user = await get_current_user(token, db)
         enforce_active_subscription(user)

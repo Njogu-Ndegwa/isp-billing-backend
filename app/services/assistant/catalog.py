@@ -581,6 +581,8 @@ def form_fields(action: Action, body: Any, context: Optional[dict] = None) -> Op
             f["upload"] = {k: v for k, v in prop["x-upload"].items() if k in ("accept", "ticket")}
         if prop.get("x-admin-only"):
             f["admin_only"] = True
+        if isinstance(prop.get("x-pick-where"), dict):
+            f["pick_where"] = prop["x-pick-where"]  # only records that fit (vouchers: hotspot plans)
         if kind == "password":
             pass  # never sent back to the page, never pre-filled
         elif current.get(key) is not None:

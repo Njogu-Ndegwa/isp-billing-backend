@@ -307,7 +307,12 @@ async def add_customer_device(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Add a device (by MAC) to the customer's plan from the dashboard."""
+    """Add a device (by MAC) to the customer's plan from the dashboard.
+
+    Needs room under the customer's device limit (their plan's devices per purchase,
+    or a limit set with PUT /api/customers/{customer_id}/device-limit): when every slot
+    is used, raise the limit first, then add the device.
+    """
     user = await get_current_user(token, db)
     owner = await _load_owner_scoped(db, customer_id, user)
     _require_hotspot(owner)

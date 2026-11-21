@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from pydantic import BaseModel, ConfigDict, HttpUrl, field_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 from typing import Optional, Literal
 from datetime import datetime
 
@@ -110,14 +110,14 @@ class PortalSettingsUpdate(BaseModel):
     whatsapp_group_url: Optional[str] = None
     instagram_url: Optional[str] = None
     # Announcement
-    show_announcement: Optional[bool] = None
+    show_announcement: Optional[bool] = Field(None, description="A notice banner on the hotspot login page (maintenance, a price change); not an ad.")
     announcement_type: Optional[str] = None
     announcement_text: Optional[str] = None
     # Localisation
     portal_language: Optional[str] = None
     # Plans section
     plans_section_title: Optional[str] = None
-    featured_plan_ids: Optional[str] = None
+    featured_plan_ids: Optional[str] = Field(None, description="Plans highlighted at the top of the login page (comma-separated ids). To keep a plan off the page, hide the plan instead.")
     show_plan_speed: Optional[bool] = None
     plan_sort_order: Optional[str] = None
 

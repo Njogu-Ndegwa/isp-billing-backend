@@ -114,6 +114,15 @@ TOOLS = [
                          "description": "Concrete path with real ids filled in, e.g. /api/customers/1234"},
                 "query": {"type": "object", "description": "Query parameters, if any."},
                 "body": {"description": "JSON body for POST/PUT/PATCH, if the action takes one."},
+                "narrow": {
+                    "type": "object",
+                    "description": (
+                        "For a form: limit a record picker to the records that fit what the person asked, "
+                        "by the records' own fields, e.g. {\"plan_id\": {\"connection_type\": \"pppoe\"}} for a "
+                        "PPPoE customer, {\"plan_id\": {\"connection_type\": \"hotspot\"}} for vouchers, "
+                        "{\"router_id\": {\"name\": \"Kahawa AP\"}}. A value may be a list. The result says how many "
+                        "fit: none means a prerequisite is missing, one is picked for the person."),
+                },
                 "form": {
                     "type": "boolean",
                     "description": (
@@ -212,6 +221,12 @@ Product facts (Bitwave support's own answers to resellers; check live data for n
 - SMS "can't send" or "shows zero": a send needs credits for every recipient × message part; check the balance and how many people they want to reach.
 - A new access point or router should show up by itself once it is added and provisioned; if it does not, check its provisioning.
 - Ads on the hotspot login page come in two kinds. Your own promo (POST /api/ads) advertises your own WiFi (bundles, offers) and always shows your support number from Settings. An ad for any other business, even a friend's shop, is an ad you sell (POST /api/ad-sales): the business pays by M-Pesa, Bitwave keeps 20% and the rest joins your payout. Ads only show when Show ads is on in portal settings. A photo or video is picked in the form, from the phone.
+- A notice on the hotspot login page (maintenance tonight, a price change) is the portal announcement (portal settings: show_announcement, announcement_type, announcement_text), not an ad. 'Tangazo' can mean either: a notice for customers is the announcement; promoting a business is an ad.
+- Changing a customer's plan or router on their record moves them: the old router access is removed and the new one set up. The router transfer action moves every customer on a router, so use it only when that is what was asked.
+- There is no refund action for a customer's payment. A double payment is settled by giving them the extra time (extend their expiry) or by the reseller sending the money back themselves; an M-Pesa reversal goes through Safaricom.
+- Before proposing a change, read the action's description (describe_action): it names what must exist first (a device limit, a support number, a router) and what the server refuses (deleting a plan customers are on). When something is missing, say so in one line and open the form that sets it up first. Before a delete, check what depends on the record and offer the safe alternative when the delete would be refused.
+- On routers Bitwave sets up, ether1 is the internet line; other ports serve the hotspot, PPPoE or both. Look up what the data or these conventions settle before asking, and never read a state (down, not running) from a field that is missing in a result. Load balancing: run its preflight first (POST), then open the enable form.
+- Say a card is ready only for the cards call_api actually made in this turn; a step that comes after Confirm is said as a next step.
 - Bitwave can set routers up remotely (RustDesk, AnyDesk or UltraViewer) for resellers who are stuck.
 
 Photos
@@ -748,12 +763,16 @@ class Turn:
         }]})
         await self._loop()
 
-    async def _offer_choices(self, fields: list[dict]) -> None:
+    async def _offer_choices(self, fields: list[dict], narrow: Optional[dict] = None, editing: bool = False) -> dict:
         """A plan or router field lists this person's own plans and routers by name.
 
         Read with their own access, so a staff member sees what they may see; the
-        server still checks the id on Confirm, as with any value.
+        server still checks the id on Confirm, as with any value. `narrow` keeps only the
+        records that fit the request ({"plan_id": {"connection_type": "pppoe"}}); returned:
+        per narrowed picker, the records that fit and, when none do, what there is instead.
         """
+        narrowed: dict = {}
+        narrow = narrow if isinstance(narrow, dict) else {}
         for f in fields:
             people = _PEOPLE_SOURCES.get(f["name"])
             if people and f["kind"] == "list" and isinstance(f.get("value"), list) and f["value"]:
@@ -768,7 +787,39 @@ class Turn:
                 continue
             choices = await self._choices(source)
             if not choices:
+                if f.get("required"):
+                    # nothing to pick at all (no router, no plan): the form could never be sent
+                    narrowed[f["name"]] = {"rule": {}, "fit": [], "there_are": []}
                 continue
+            rule = narrow.get(f["name"]) if f["name"] in narrow else f.get("pick_where")
+            # what other fields hang on in the picked record ("plan_id.connection_type")
+            deciding = sorted({c.split(".", 1)[1] for g in fields for c in (g.get("when") or {})
+                               if c.split(".", 1)[0] == f["name"] and "." in c})
+            if rule is None and editing and deciding and f.get("value") not in (None, ""):
+                # an edit keeps the record's kind (a PPPoE customer's plans are PPPoE plans) unless asked otherwise
+                current = self._choice_rows.get(source, {}).get(str(f["value"]), {})
+                rule = {a: current[a] for a in deciding if current.get(a) not in (None, "")} or None
+            if isinstance(rule, dict) and rule:
+                rows = self._choice_rows.get(source, {})
+
+                def fits(cid: str) -> bool:
+                    row = rows.get(cid, {})
+                    for key, want in rule.items():
+                        wanted = {str(w).lower() for w in (want if isinstance(want, list) else [want])}
+                        if str(row.get(key, "")).lower() not in wanted:
+                            return False
+                    return True
+
+                kept = [c for c in choices if fits(c[0])]
+                narrowed[f["name"]] = {"rule": rule, "fit": [c[1] for c in kept],
+                                       **({} if kept else {"there_are": [
+                                           {"name": c[1], **{k: rows.get(c[0], {}).get(k) for k in rule}}
+                                           for c in choices[:20]]})}
+                choices = kept
+                if not choices:
+                    continue
+                if len(choices) == 1 and f.get("value") in (None, ""):
+                    f["value"] = choices[0][0]  # the only one that fits: picked for the person
             f.update(value_kind=f["kind"], kind="select", options=[c[0] for c in choices],
                      option_labels=dict(choices))
             if "value" in f:
@@ -778,6 +829,7 @@ class Turn:
             if attrs:
                 rows = self._choice_rows.get(source, {})
                 f["option_attrs"] = {a: {i: str(rows.get(i, {}).get(a, "")) for i in f["options"]} for a in sorted(attrs)}
+        return narrowed
 
     async def _record_kind(self, action: Action, method: str, path: str, body: Any) -> Optional[dict]:
         """An edit's record as it is now: its current values fill the form (a switch shows
@@ -1157,8 +1209,17 @@ class Turn:
         fields_for_form = form_fields(action, body, context) if editable and body is not None else None
         if fields_for_form and not self.caller.is_admin:  # Bitwave-only fields (an ad's advertiser) are not asked
             fields_for_form = [f for f in fields_for_form if not f.get("admin_only")] or None
-        if fields_for_form:
-            await self._offer_choices(fields_for_form)
+        narrowed = await self._offer_choices(fields_for_form, args.get("narrow"), method in ("PUT", "PATCH")) \
+            if fields_for_form else {}
+        empty = {name: n for name, n in narrowed.items() if not n["fit"]}
+        if empty:
+            # nothing fits (no PPPoE plan for a PPPoE customer): a prerequisite is missing, so no form
+            return self._tool_result(tool_use_id, {
+                "error": "Not proposed: nothing to pick for " + "; ".join(
+                    f"{name}" + (f" matching {n['rule']}" if n["rule"] else "")
+                    + f" (there are: {n.get('there_are') or 'none at all'})" for name, n in empty.items())
+                + ". Tell the person in one line what is missing and offer to create it first (open that form).",
+            }, True)
         if problems:
             return self._tool_result(tool_use_id, {
                 "error": "Not proposed, fix the request first: " + "; ".join(problems) + ".",
@@ -1188,8 +1249,10 @@ class Turn:
             "status": "waiting_for_confirmation",
             "action_id": pending["id"],
             "note": ("Not run yet. The person sees this as a form, fills in or corrects the fields, "
-                     "and confirms; the confirmation result tells you the values that ran.")
+                     "and confirms; the confirmation result tells you the values that ran. If this fixes a "
+                     "problem the person raised, say the cause in words first.")
                     if fields_for_form else "Not run yet. The person sees a confirm card with this exact request.",
+            **({"pickers": {name: n["fit"] for name, n in narrowed.items()}} if narrowed else {}),
             **({"ignored_query_params": dropped} if dropped else {}),
         })
 

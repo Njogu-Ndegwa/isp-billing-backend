@@ -24,7 +24,8 @@ router = APIRouter(prefix="/api/vouchers", tags=["vouchers"])
 
 
 class GenerateVouchersRequest(BaseModel):
-    plan_id: int
+    # a voucher is redeemed on the hotspot login page: a form offers hotspot plans only
+    plan_id: int = Field(..., json_schema_extra={"x-pick-where": {"connection_type": "hotspot"}})
     quantity: int = Field(ge=1, le=500, default=1)
     router_id: Optional[int] = None
     expires_at: Optional[datetime] = None
