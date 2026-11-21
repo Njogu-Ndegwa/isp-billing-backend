@@ -135,6 +135,24 @@ class StatusPatch(BaseModel):
     duplicate_of_id: Optional[int] = None
 
 
+class OrderIn(BaseModel):
+    post_ids: list[int]
+
+
+@router.put("/api/admin/feedback/order")
+async def set_order(payload: OrderIn, db: AsyncSession = Depends(get_db), token: str = Depends(verify_token)):
+    """Bitwave's own order of what to build next: the posts listed get ranks 1, 2, 3...; every
+    other open post goes back to being ranked by score."""
+    await _require_admin(token, db)
+    from sqlalchemy import update as sa_update
+
+    await db.execute(sa_update(FeedbackPost).where(FeedbackPost.admin_rank.isnot(None)).values(admin_rank=None))
+    for rank, post_id in enumerate(list(dict.fromkeys(payload.post_ids))[:200], start=1):
+        await db.execute(sa_update(FeedbackPost).where(FeedbackPost.id == post_id).values(admin_rank=rank))
+    await db.commit()
+    return {"ordered": len(dict.fromkeys(payload.post_ids))}
+
+
 @router.patch("/api/admin/feedback/posts/{post_id}")
 async def patch_post(post_id: int, payload: StatusPatch,
                      db: AsyncSession = Depends(get_db),

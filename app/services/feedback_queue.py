@@ -93,6 +93,8 @@ def queue_item_dict(post: FeedbackPost, author: Optional[User],
         "ai_error": post.ai_error,
         "dup_count": dup_count,
         "priority": compute_priority(post, dup_count, now),
+        "source": post.source,
+        "admin_rank": post.admin_rank,
     }
 
 
@@ -125,7 +127,8 @@ async def fetch_queue(db, *, status: Optional[FeedbackStatus] = None,
     rows = (await db.execute(query)).all()
     dup_counts = await _dup_counts(db, [p.id for p, _ in rows])
     items = [queue_item_dict(p, u, dup_counts.get(p.id, 0), now) for p, u in rows]
-    items.sort(key=lambda item: item["priority"], reverse=True)
+    # Bitwave's own order first (1 = build next), then the rest by score
+    items.sort(key=lambda item: (item["admin_rank"] is None, item["admin_rank"] or 0, -item["priority"]))
     return items
 
 

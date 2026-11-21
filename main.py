@@ -3334,6 +3334,10 @@ async def run_feedback_migrations():
         if to_create:
             await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=to_create))
 
+        # Feature requests recorded by the assistant, and Bitwave's own order of them.
+        await conn.execute(text("ALTER TABLE feedback_posts ADD COLUMN IF NOT EXISTS source VARCHAR(20)"))
+        await conn.execute(text("ALTER TABLE feedback_posts ADD COLUMN IF NOT EXISTS admin_rank INTEGER"))
+
         # Partial index for the admin queue's default "open statuses" scan.
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_feedback_posts_open_queue "

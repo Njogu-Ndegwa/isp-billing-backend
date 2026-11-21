@@ -24,6 +24,7 @@ METHODS = ("get", "post", "put", "patch", "delete")
 
 # POSTs that only read. Mirrors the View-as allowlist plus read-only diagnostics.
 READ_ONLY_POSTS = frozenset({
+    "/api/feedback/requests",       # only writes down a feature someone asked for
     "/api/customers/usage/bulk",
     "/api/messaging/customer-events/preview",
     "/api/compensation/outage/preview",

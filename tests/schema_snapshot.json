@@ -573,6 +573,7 @@
   "user_id"
  ],
  "feedback_posts": [
+  "admin_rank",
   "ai_affected_area",
   "ai_duplicate_of_id",
   "ai_error",
@@ -589,6 +590,7 @@
   "duplicate_of_id",
   "id",
   "kind",
+  "source",
   "status",
   "title",
   "updated_at",
