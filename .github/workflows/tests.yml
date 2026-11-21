@@ -68,6 +68,15 @@ jobs:
       # across RouterOS/httpx/payment-provider/sleep/to_thread I/O — the #1
       # cause of production DB-pool outages. False positives go in
       # scripts/session_discipline_allowlist.txt with a justification.
+      # A throwaway test database does not need to survive a power cut. Without
+      # these, every commit and TRUNCATE waits for the disk, which is most of
+      # what a database test costs. All three take effect on a reload.
+      - name: Tune Postgres for tests
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d isp_billing_test -v ON_ERROR_STOP=1             -c "ALTER SYSTEM SET fsync = off"             -c "ALTER SYSTEM SET synchronous_commit = off"             -c "ALTER SYSTEM SET full_page_writes = off"             -c "SELECT pg_reload_conf()"
+
       - name: Session discipline guard
         run: python scripts/check_session_discipline.py
 
@@ -77,7 +86,9 @@ jobs:
         # -n auto splits across the runner's cores. Each xdist worker gets its
         # own Postgres schema (see conftest), so workers cannot truncate each
         # other's tables mid-assertion.
-        run: pytest -q --tb=short -n auto --junitxml=pytest-report.xml
+        # Database tests mostly wait on Postgres, so more workers than cores keeps
+        # the CPU busy.
+        run: pytest -q --tb=short -n 8 --junitxml=pytest-report.xml
 
       # Renders the run as a pass/fail table on the Actions summary page, naming
       # any failing test, so the result is readable without opening the log.
