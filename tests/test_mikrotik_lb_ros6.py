@@ -16,6 +16,11 @@ MODEM_MAC = "EC:1A:02:A9:FC:8E"
 V6 = "6.49.21 (long-term)"
 
 
+# WAN1's own dynamic DHCP default (add-default-route=yes).
+WAN1_DHCP_DEFAULT_V6 = {".id": "*DD1", "dst-address": "0.0.0.0/0",
+                        "gateway": "192.168.100.1", "distance": "1", "active": "true"}
+
+
 def _router537(**overrides):
     kwargs = dict(
         ros_version=V6,
@@ -170,6 +175,7 @@ def test_apply_ros6_route_readback_is_not_truncated():
 def test_rollback_on_ros6_removes_everything():
     api = FakeLBAPI(ros_version=V6)
     mikrotik_lb.lb_apply(api, ["ether1", "ether2"])
+    api.routes.append(dict(WAN1_DHCP_DEFAULT_V6))
     report = mikrotik_lb.lb_rollback(api)
     assert report["success"] is True, report["steps"]
     assert not [m for m in api.mangle_rules
@@ -388,5 +394,6 @@ def test_rollback_removes_mgmt_pins():
     api = _router537()
     mikrotik_lb.lb_apply(api, ["ether1", "ether2"])
     assert PIN in _managed_routes(api)
+    api.routes.append(dict(WAN1_DHCP_DEFAULT_V6))
     mikrotik_lb.lb_rollback(api)
     assert not _managed_routes(api)

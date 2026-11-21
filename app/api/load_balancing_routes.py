@@ -147,6 +147,13 @@ async def _run_locked_router_thread(
         return {"error": "timeout"}
 
 
+def _pulled_wans(config: Optional[dict]) -> List[int]:
+    """WAN numbers the line health check has out of the balancing right now."""
+    wans = ((config or {}).get("health") or {}).get("wans") or {}
+    return sorted(int(n) for n, e in wans.items()
+                  if (e or {}).get("state") == "pulled" and str(n).isdigit())
+
+
 def _raise_for_router_error(result: dict, router_obj: Router) -> None:
     err = result.get("error")
     if not err:
@@ -312,12 +319,13 @@ def _lb_rollback_sync(router_info: dict) -> dict:
         api.disconnect()
 
 
-def _lb_verify_sync(router_info: dict, wan_ports: Optional[List[str]] = None) -> dict:
+def _lb_verify_sync(router_info: dict, wan_ports: Optional[List[str]] = None,
+                    pulled_wans: Optional[List[int]] = None) -> dict:
     api = _connect(router_info, timeout=30)
     if not api.connect():
         return {"error": "connect_failed", "detail": api.last_connect_error}
     try:
-        return mikrotik_lb.lb_verify(api, wan_ports)
+        return mikrotik_lb.lb_verify(api, wan_ports, pulled_wans)
     finally:
         api.disconnect()
 
@@ -570,15 +578,25 @@ async def disable_load_balancing(
 
     router_obj.lb_enabled = False
     router_obj.lb_applied_at = None  # KEEP lb_config for easy re-enable
+    if (router_obj.lb_config or {}).get("health"):
+        # The line health state belongs to the balancing that is now gone.
+        router_obj.lb_config = {k: v for k, v in router_obj.lb_config.items()
+                                if k != "health"}
     await db.commit()
 
+    kept = result.get("kept_failover_routes") or []
     return {
         "success": True,
         "router_id": router_id,
         "enabled": False,
         "config": router_obj.lb_config,
         "rollback": result,
-        "message": "Load balancing disabled; router back on plain WAN1",
+        "warnings": list(result.get("warnings") or []),
+        "message": (
+            "Load balancing disabled; the router stays on WAN1 with the other line as "
+            "backup (WAN1 adds no default route of its own, so the backup routes were kept)"
+            if kept else "Load balancing disabled; router back on plain WAN1"
+        ),
     }
 
 
@@ -604,8 +622,9 @@ async def verify_load_balancing(
     await db.commit()  # release the DB before router I/O
 
     wan_ports = list((config or {}).get("wan_ports") or []) if enabled else []
+    pulled_wans = _pulled_wans(config) if enabled else []
     result = await _run_locked_router_thread(
-        router_obj, _lb_verify_sync, router_info, wan_ports or None,
+        router_obj, _lb_verify_sync, router_info, wan_ports or None, pulled_wans or None,
         holder="a load-balancing check",
     )
     await _record_availability(router_id, result)
