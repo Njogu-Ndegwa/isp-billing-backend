@@ -120,6 +120,7 @@ from app.api.auth_routes import router as auth_router
 from app.api.public_routes import router as public_router
 from app.api.router_management import router as router_mgmt_router
 from app.api.router_operations import router as router_ops_router
+from app.api.router_inspect_routes import router as router_inspect_router
 from app.api.admin_routes import router as admin_router
 from app.api.plan_routes import router as plan_router
 from app.api.customer_routes import router as customer_router
@@ -183,6 +184,7 @@ app.include_router(auth_router)
 app.include_router(public_router)
 app.include_router(router_mgmt_router)
 app.include_router(router_ops_router)
+app.include_router(router_inspect_router)
 app.include_router(admin_router)
 app.include_router(plan_router)
 app.include_router(customer_router)

@@ -326,6 +326,7 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     ((R,), "/api/routers/{router_id}/port-config-jobs/{job_id}", "routers.view", None),
     ((R,), "/api/routers/{router_id}/ports", "routers.view", None),
     ((R,), "/api/routers/{router_id}/users", "routers.view", None),
+    ((R,), "/api/routers/{router_id}/routeros", "routers.view", None),
     ((R,), "/api/router_stats/{router_id}", "routers.view", None),
     ((R,), "/api/routers/by-identity/{identity}", "routers.view", None),
     ((R,), "/api/routers/by-identity/{identity}/device-mode", "routers.view", None),
