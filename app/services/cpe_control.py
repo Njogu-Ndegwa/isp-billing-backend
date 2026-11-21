@@ -34,7 +34,8 @@ from __future__ import annotations
 
 import ipaddress
 import logging
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Union
 
 from app.services import ap_adapters
 from app.services.ap_adapters import (
@@ -98,6 +99,75 @@ _OFFLINE = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Static-IP customers: the device sits at a fixed address on the MikroTik LAN
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class StaticTarget:
+    """A static-IP customer's device: its fixed LAN address and pinned MAC.
+
+    Passed in place of a PPPoE username. The address comes from the customer
+    record (it IS the customer's identity on the router: binding, queue and pin
+    are all keyed by it), but the device is only contacted when the MikroTik's
+    ARP table shows something answering on that address right now -- and, when
+    a MAC is pinned, only if it is that MAC. A neighbour who typed in the same
+    IP is never logged in to.
+    """
+    ip: str
+    mac: Optional[str] = None
+
+
+CpeTarget = Union[str, StaticTarget]
+
+_ARP_DEAD_STATES = {"failed", "incomplete"}
+
+
+def _norm_mac(value: Any) -> str:
+    return str(value or "").strip().upper().replace("-", ":")
+
+
+def resolve_static_device(api, ip: str) -> Optional[Dict[str, Any]]:
+    """The live ARP entry for a static customer's address, or ``None``.
+
+    Reads ``/ip arp`` only; never writes. An entry without a MAC, or in a
+    failed/incomplete state, means nothing is answering on that address.
+    """
+    want = str(ip or "").strip()
+    if not want:
+        return None
+    for row in _rows(api.send_command("/ip/arp/print")):
+        if str(row.get("address", "")).strip() != want:
+            continue
+        mac = _norm_mac(row.get("mac-address"))
+        if not mac:
+            continue
+        if str(row.get("status", "")).strip().lower() in _ARP_DEAD_STATES:
+            continue
+        if str(row.get("invalid", "")).lower() == "true" or str(row.get("disabled", "")).lower() == "true":
+            continue
+        return {"address": want, "mac": mac, "interface": row.get("interface")}
+    return None
+
+
+_OFFLINE_STATIC = {
+    "error": "offline",
+    "offline": True,
+    "message": "The customer is offline: nothing is answering on their static IP on this router "
+               "right now, so the router (CPE) can't be reached. Ask them to check power and the "
+               "cable/radio link, then try again.",
+}
+
+
+def _static_mac_mismatch(ip: str) -> Dict[str, Any]:
+    return {
+        "error": "cpe_wrong_device",
+        "message": f"A different device (not the customer's pinned MAC) is on {ip} right now, so "
+                   f"nothing was sent to it. Check the customer's router is connected, or update "
+                   f"the pinned MAC if they replaced it.",
+    }
+
+
 _OFFLINE_LINE = {
     "error": "offline",
     "offline": True,
@@ -107,20 +177,33 @@ _OFFLINE_LINE = {
 }
 
 
-def _locate_cpe(api, cred: ApCredential, username: str):
-    """Resolve the device IP from the live session, or refuse as offline.
+def _locate_cpe(api, cred: ApCredential, target: CpeTarget):
+    """Resolve the device IP, or refuse as offline / wrong device.
 
-    Sets ``cred.ap_ip`` to the session address on success. Returns
-    ``(session, None)`` or ``(None, refusal)``.
+    ``target`` is a PPPoE username (address from the live session) or a
+    :class:`StaticTarget` (fixed address, confirmed live via ARP). Sets
+    ``cred.ap_ip`` on success. Returns ``(session, None)`` or
+    ``(None, refusal)``; for a static customer ``session`` describes the ARP
+    entry instead of a PPPoE session.
     """
-    session = resolve_pppoe_session(api, username)
+    if isinstance(target, StaticTarget):
+        seen = resolve_static_device(api, target.ip)
+        if not seen:
+            return None, dict(_OFFLINE_STATIC)
+        pinned = _norm_mac(target.mac)
+        if pinned and seen["mac"] != pinned:
+            return None, _static_mac_mismatch(target.ip)
+        cred.ap_ip = seen["address"]
+        return {"address": seen["address"], "uptime": None, "static": True,
+                "interface": seen.get("interface")}, None
+    session = resolve_pppoe_session(api, target)
     if not session:
         return None, dict(_OFFLINE)
     cred.ap_ip = session["address"]
     return session, None
 
 
-def _cpe_login_refusal(login: LoginResult, port: int) -> Dict[str, Any]:
+def _cpe_login_refusal(login: LoginResult, port: int, *, static: bool = False) -> Dict[str, Any]:
     """Turn a failed login into a CPE-specific, actionable error.
 
     Distinguishes "did not answer" (remote management off / wrong port / source
@@ -130,11 +213,13 @@ def _cpe_login_refusal(login: LoginResult, port: int) -> Dict[str, Any]:
         return {"error": "cpe_unsupported", "message": login.error}
     if login.unreachable:
         detail = f" ({login.error})" if login.error else ""
+        source = ("the MikroTik's LAN address (the customer's gateway)" if static
+                  else "the MikroTik's PPPoE address")
         return {
             "error": "cpe_unreachable",
             "message": f"The router (CPE) did not answer on port {port}. Likely causes: remote "
                        f"web management is off on the Tenda, the port is wrong, or its allowed "
-                       f"management source does not include the MikroTik's PPPoE address.{detail}",
+                       f"management source does not include {source}.{detail}",
         }
     if login.locked:
         return {
@@ -161,18 +246,18 @@ def _client(api, cred: ApCredential, port: int) -> RouterFetchHttpClient:
 # Public sync actions (run in a worker thread; no DB session held)
 # ---------------------------------------------------------------------------
 
-def read_cpe_status_sync(router_info: Dict[str, Any], cred: ApCredential, username: str,
+def read_cpe_status_sync(router_info: Dict[str, Any], cred: ApCredential, target: CpeTarget,
                          port: int, *, api_factory=None) -> Dict[str, Any]:
     adapter = get_adapter(cred.model, cred.vendor)
 
     def run(api):
-        session, refused = _locate_cpe(api, cred, username)
+        session, refused = _locate_cpe(api, cred, target)
         if refused:
             return refused
         client = _client(api, cred, port)
         login = _login(client, adapter, cred)
         if not login.ok:
-            return _cpe_login_refusal(login, port)
+            return _cpe_login_refusal(login, port, static=isinstance(target, StaticTarget))
         status = login.status
         if status is None:
             return {
@@ -195,18 +280,18 @@ def read_cpe_status_sync(router_info: Dict[str, Any], cred: ApCredential, userna
     return _with_api(router_info, api_factory, run)
 
 
-def reboot_cpe_sync(router_info: Dict[str, Any], cred: ApCredential, username: str,
+def reboot_cpe_sync(router_info: Dict[str, Any], cred: ApCredential, target: CpeTarget,
                     port: int, *, api_factory=None) -> Dict[str, Any]:
     adapter = get_adapter(cred.model, cred.vendor)
 
     def run(api):
-        session, refused = _locate_cpe(api, cred, username)
+        session, refused = _locate_cpe(api, cred, target)
         if refused:
             return refused
         client = _client(api, cred, port)
         login = _login(client, adapter, cred)
         if not login.ok:
-            return _cpe_login_refusal(login, port)
+            return _cpe_login_refusal(login, port, static=isinstance(target, StaticTarget))
         active_adapter = login.adapter or adapter
         resp = client.request(active_adapter.reboot_request())
         if not resp.ok or resp.redirected or not active_adapter.reboot_response_ok(resp.body, parse_json_body):
@@ -214,8 +299,10 @@ def reboot_cpe_sync(router_info: Dict[str, Any], cred: ApCredential, username: s
                     "message": resp.error or "The router (CPE) did not accept the reboot."}
         return {"success": True, "login_ok": True, "login_method": login.method,
                 "action": ACTION_REBOOT, "session": session,
-                "message": "Reboot sent. The router drops for about a minute and the PPPoE line "
-                           "reconnects once it is back up."}
+                "message": ("Reboot sent. The router drops for about a minute and comes back "
+                            "on its static IP." if isinstance(target, StaticTarget) else
+                            "Reboot sent. The router drops for about a minute and the PPPoE line "
+                            "reconnects once it is back up.")}
 
     return _with_api(router_info, api_factory, run)
 

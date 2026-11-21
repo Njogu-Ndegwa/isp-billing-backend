@@ -97,8 +97,9 @@ def _ppp_active(user=PPPOE_USER, address=SESSION_IP):
 
 
 class FakeMikroTik:
-    def __init__(self, cpe, *, ppp_rows=None, connect_ok=True):
+    def __init__(self, cpe, *, ppp_rows=None, arp_rows=None, connect_ok=True):
         self.cpe = cpe
+        self.arp_rows = copy.deepcopy(arp_rows or [])
         self.ppp_rows = copy.deepcopy(ppp_rows if ppp_rows is not None else _ppp_active())
         self.connect_ok = connect_ok
         self.connected = False
@@ -124,6 +125,8 @@ class FakeMikroTik:
             return self._fetch(arguments or {})
         if command == "/ppp/active/print":
             return {"success": True, "data": copy.deepcopy(self.ppp_rows)}
+        if command == "/ip/arp/print":
+            return {"success": True, "data": copy.deepcopy(self.arp_rows)}
         if command == "/ppp/active/remove":
             self.removed_sessions.append((arguments or {}).get("numbers"))
             return {"success": True, "data": []}
@@ -604,3 +607,151 @@ async def test_password_never_reaches_logs_or_responses(client, db, patch_router
         assert secret not in caplog.text
     for entry in (await db.execute(select(StaffActivityLog))).scalars().all():
         assert CPE_PASSWORD not in (entry.summary or "")
+
+
+# ---------------------------------------------------------------------------
+# Static-IP customers: device at a fixed LAN address, confirmed live via ARP
+# ---------------------------------------------------------------------------
+
+STATIC_IP = "192.168.2.24"
+OTHER_MAC = "AA:BB:CC:DD:EE:01"
+
+
+def _arp(ip=STATIC_IP, mac=DEVICE_MAC, status="reachable"):
+    return [{".id": "*A", "address": ip, "mac-address": mac, "interface": "bridge",
+             "status": status, "dynamic": "true"},
+            {".id": "*B", "address": "192.168.2.50", "mac-address": OTHER_MAC,
+             "interface": "bridge", "status": "stale"}]
+
+
+def _static(mac=DEVICE_MAC):
+    return cpe_control.StaticTarget(ip=STATIC_IP, mac=mac)
+
+
+def test_static_status_reaches_the_fixed_ip_without_pppoe():
+    fake = FakeMikroTik(FakeTendaCpe(ip=STATIC_IP, mode="router"), arp_rows=_arp())
+    res = cpe_control.read_cpe_status_sync(ROUTER_INFO, _cred(), _static(), WAN_PORT,
+                                           api_factory=fake.factory)
+    assert res["success"] and res["status"]["mode"] == "router"
+    assert res["session"]["static"] is True and res["session"]["address"] == STATIC_IP
+    assert "/ppp/active/print" not in fake.commands
+    assert all(f"//{STATIC_IP}:{WAN_PORT}/" in f["url"] for f in fake.fetches)
+
+
+def test_static_reboot():
+    cpe = FakeTendaCpe(ip=STATIC_IP)
+    fake = FakeMikroTik(cpe, arp_rows=_arp())
+    res = cpe_control.reboot_cpe_sync(ROUTER_INFO, _cred(), _static(), WAN_PORT,
+                                      api_factory=fake.factory)
+    assert res["success"] and cpe.rebooted
+    assert "static IP" in res["message"]
+    assert fake.mutating_router_calls == []
+
+
+@pytest.mark.parametrize("arp_rows", [[], _arp(status="failed"), _arp(status="incomplete"), _arp(mac="")])
+def test_static_offline_when_nothing_answers_on_the_ip(arp_rows):
+    fake = FakeMikroTik(FakeTendaCpe(ip=STATIC_IP), arp_rows=arp_rows)
+    res = cpe_control.reboot_cpe_sync(ROUTER_INFO, _cred(), _static(), WAN_PORT,
+                                      api_factory=fake.factory)
+    assert res["error"] == "offline" and "static IP" in res["message"]
+    assert fake.fetches == []
+
+
+def test_static_never_contacts_a_different_device_on_the_pinned_ip():
+    cpe = FakeTendaCpe(ip=STATIC_IP)
+    fake = FakeMikroTik(cpe, arp_rows=_arp(mac=OTHER_MAC))
+    res = cpe_control.reboot_cpe_sync(ROUTER_INFO, _cred(), _static(), WAN_PORT,
+                                      api_factory=fake.factory)
+    assert res["error"] == "cpe_wrong_device"
+    assert fake.fetches == [] and not cpe.rebooted
+
+
+def test_static_pinned_mac_match_ignores_case_and_dashes():
+    fake = FakeMikroTik(FakeTendaCpe(ip=STATIC_IP), arp_rows=_arp())
+    res = cpe_control.read_cpe_status_sync(ROUTER_INFO, _cred(), _static(mac=DEVICE_MAC.lower().replace(":", "-")),
+                                           WAN_PORT, api_factory=fake.factory)
+    assert res["success"]
+
+
+def test_static_without_pinned_mac_uses_whatever_answers():
+    fake = FakeMikroTik(FakeTendaCpe(ip=STATIC_IP), arp_rows=_arp(mac=OTHER_MAC))
+    res = cpe_control.read_cpe_status_sync(ROUTER_INFO, _cred(), _static(mac=None), WAN_PORT,
+                                           api_factory=fake.factory)
+    assert res["success"]
+
+
+def test_static_unreachable_names_the_lan_source():
+    fake = FakeMikroTik(FakeTendaCpe(ip=STATIC_IP, answers=False), arp_rows=_arp())
+    res = cpe_control.read_cpe_status_sync(ROUTER_INFO, _cred(), _static(), WAN_PORT,
+                                           api_factory=fake.factory)
+    assert res["error"] == "cpe_unreachable" and "LAN address" in res["message"]
+
+
+async def _static_customer(db, owner, router, **over):
+    plan = await make_plan(db, owner, connection_type=ConnectionType.STATIC_IP)
+    return await make_customer(db, owner, plan, router, static_ip=STATIC_IP,
+                               static_mac=DEVICE_MAC, **over)
+
+
+@pytest.mark.asyncio
+async def test_static_customer_is_controllable(client, db):
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_IP)
+    customer = await _static_customer(db, owner, router)
+    resp = await client.get(f"/api/customers/{customer.id}/cpe", headers=headers(_owner_token(owner)))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["controllable"] is True and body["is_static"] is True
+    assert body["is_pppoe"] is False and body["static_ip"] == STATIC_IP
+    save = await client.put(f"/api/customers/{customer.id}/cpe/credential",
+                            headers=headers(_owner_token(owner)), json={"password": "pw", "port": WAN_PORT})
+    assert save.status_code == 200, save.text
+
+
+@pytest.mark.asyncio
+async def test_pppoe_customer_reports_controllable(client, db):
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_IP)
+    customer = await _pppoe_customer(db, owner, router)
+    body = (await client.get(f"/api/customers/{customer.id}/cpe", headers=headers(_owner_token(owner)))).json()
+    assert body["controllable"] is True and body["is_pppoe"] is True and body["is_static"] is False
+
+
+@pytest.mark.asyncio
+async def test_static_status_and_reboot_endpoints(client, db, patch_router):
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_IP)
+    customer = await _static_customer(db, owner, router)
+    await _saved_cred(db, customer.id)
+    cpe = FakeTendaCpe(ip=STATIC_IP, mode="router")
+    patch_router(cpe, arp_rows=_arp())
+    status = await client.get(f"/api/customers/{customer.id}/cpe/status", headers=headers(_owner_token(owner)))
+    assert status.status_code == 200, status.text
+    reboot = await client.post(f"/api/customers/{customer.id}/cpe/reboot",
+                               headers=headers(_owner_token(owner)), json={"confirm": True})
+    assert reboot.status_code == 200, reboot.text
+    assert cpe.rebooted
+
+
+@pytest.mark.asyncio
+async def test_static_wrong_device_is_409(client, db, patch_router):
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_IP)
+    customer = await _static_customer(db, owner, router)
+    await _saved_cred(db, customer.id)
+    patch_router(FakeTendaCpe(ip=STATIC_IP), arp_rows=_arp(mac=OTHER_MAC))
+    resp = await client.post(f"/api/customers/{customer.id}/cpe/reboot",
+                             headers=headers(_owner_token(owner)), json={"confirm": True})
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_static_disconnect_line_is_rejected(client, db, patch_router):
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address=ROUTER_IP)
+    customer = await _static_customer(db, owner, router)
+    fake = patch_router(FakeTendaCpe(ip=STATIC_IP), arp_rows=_arp())
+    resp = await client.post(f"/api/customers/{customer.id}/cpe/disconnect",
+                             headers=headers(_owner_token(owner)), json={"confirm": True})
+    assert resp.status_code == 400 and "Restart" in resp.json()["detail"]
+    assert fake.commands == []

@@ -1,11 +1,14 @@
-"""Remote control of a PPPoE customer's own router / CPE (a Tenda) from the
-customer page: save the device's admin password once, then check status, reboot,
+"""Remote control of a PPPoE or static-IP customer's own router / CPE (a Tenda)
+from the customer page: save the device's admin password once, then check status, reboot,
 or disconnect the line so it redials.
 
 See ``app/services/cpe_control.py`` for the behaviour and safety rules. The
 device is reached by resolving the customer's **live** PPPoE session on the
 MikroTik (``/ppp active`` -> ``address``) and ``/tool fetch`` to that IP on the
-device's web-management port; the IP is never stored as the identity.
+device's web-management port; the IP is never stored as the identity. A
+static-IP customer's device is reached on its fixed address, but only after the
+MikroTik's ARP table shows it live (and, when pinned, with the pinned MAC).
+"Disconnect line" is PPPoE-only: a static customer has no session to drop.
 
 The admin password is stored Fernet-encrypted and is never returned by any
 endpoint here. Agents never see or type it.
@@ -42,6 +45,7 @@ from app.services.customer_router_logs import router_info_of
 from app.services.payment_gateway import decrypt_credential, encrypt_credential
 from app.services.router_availability import record_router_availability
 from app.services.router_concurrency import run_with_guard
+from app.services.static_ip import normalize_static_ip
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["customer-cpe"])
@@ -124,10 +128,41 @@ async def _load_customer(db: AsyncSession, customer_id: int, token: str):
     return customer, user
 
 
+def _static_ip_of(customer: Customer) -> Optional[str]:
+    """The customer's fixed address when this is a static-IP customer."""
+    if customer.pppoe_username:
+        return None
+    try:
+        return normalize_static_ip(customer.static_ip)
+    except Exception:
+        return None
+
+
+def _cpe_target(customer: Customer):
+    """``(router, target)`` for a controllable customer, else 400.
+
+    ``target`` is the PPPoE username or a ``StaticTarget`` with the fixed IP
+    and pinned MAC.
+    """
+    if customer.pppoe_username:
+        target = customer.pppoe_username
+    else:
+        ip = _static_ip_of(customer)
+        if not ip:
+            raise HTTPException(status_code=400,
+                                detail="Router (CPE) control is only for PPPoE and static-IP customers.")
+        target = cpe_control.StaticTarget(ip=ip, mac=customer.static_mac)
+    router_obj = customer.router
+    if router_obj is None:
+        raise HTTPException(status_code=400, detail="Customer has no router assigned.")
+    return router_obj, target
+
+
 def _require_pppoe(customer: Customer) -> Router:
     if not customer.pppoe_username:
         raise HTTPException(status_code=400,
-                            detail="Router (CPE) control is only for PPPoE customers.")
+                            detail="Disconnect line is only for PPPoE customers. For a static-IP "
+                                   "customer use Restart instead.")
     router_obj = customer.router
     if router_obj is None:
         raise HTTPException(status_code=400, detail="Customer has no router assigned.")
@@ -198,7 +233,7 @@ def _raise_for_result(result: Dict[str, Any], router_name: str) -> None:
     if error == "connect_failed":
         raise HTTPException(status_code=503,
                             detail=result.get("message") or f"Failed to connect to router: {router_name}")
-    if error == "offline":
+    if error in ("offline", "cpe_wrong_device"):
         raise HTTPException(status_code=409, detail=result.get("message"))
     if error == "login_locked":
         raise HTTPException(status_code=423,
@@ -225,12 +260,19 @@ async def get_cpe(
     PPPoE customer. DB-only; does not touch the router."""
     customer, _user = await _load_customer(db, customer_id, token)
     cred = await _get_cred_row(db, customer_id)
-    is_pppoe = bool(customer.pppoe_username) and customer.router is not None
+    has_router = customer.router is not None
+    is_pppoe = bool(customer.pppoe_username) and has_router
+    static_ip = _static_ip_of(customer) if has_router else None
     public = _public_credential(cred)
     await db.commit()
     return {
         "customer_id": customer_id,
         "is_pppoe": is_pppoe,
+        "is_static": bool(static_ip),
+        "static_ip": static_ip,
+        # One flag for the UI: status/reboot are available. "Disconnect line"
+        # stays PPPoE-only (is_pppoe).
+        "controllable": is_pppoe or bool(static_ip),
         "pppoe_username": customer.pppoe_username,
         "suggested_wan_port": cpe_control.DEFAULT_WAN_PORT,
         "credential": public,
@@ -252,7 +294,7 @@ async def save_cpe_credential(
     if not body.password or len(body.password) > 128:
         raise HTTPException(status_code=400, detail="Provide the router (CPE) admin password (max 128 chars)")
     customer, _user = await _load_customer(db, customer_id, token)
-    _require_pppoe(customer)
+    _cpe_target(customer)
 
     cred = await _get_cred_row(db, customer_id)
     encrypted = encrypt_credential(body.password)
@@ -318,7 +360,7 @@ async def _prepare_line(db: AsyncSession, customer_id: int, token: str):
 
 async def _prepare_action(db: AsyncSession, customer_id: int, token: str):
     customer, user = await _load_customer(db, customer_id, token)
-    router_obj = _require_pppoe(customer)
+    router_obj, target = _cpe_target(customer)
     cred_row = await _get_cred_row(db, customer_id)
     if cred_row is None or not cred_row.password_encrypted:
         raise HTTPException(status_code=404, detail="No saved password for this router (CPE)")
@@ -335,7 +377,7 @@ async def _prepare_action(db: AsyncSession, customer_id: int, token: str):
         "router_id": router_obj.id,
         "router_name": router_obj.name,
         "router_info": router_info_of(router_obj),
-        "username": customer.pppoe_username,
+        "username": target,
         "port": cred_row.port or cpe_control.DEFAULT_LAN_PORT,
         "cred": cred,
     }
