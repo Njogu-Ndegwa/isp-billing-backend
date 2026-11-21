@@ -322,13 +322,13 @@ class CustomerRegisterRequest(BaseModel):
     installation_date: Optional[str] = None
     notes: Optional[str] = None
     # Install location: both or neither (app/services/customer_profile.py).
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
+    latitude: Optional[float] = Field(None, description="Where the customer is (install location): pick it on the map.", json_schema_extra={"x-geo": "lat"})
+    longitude: Optional[float] = Field(None, json_schema_extra={"x-geo": "lng"})
 
 
 class UpdateLocationRequest(BaseModel):
-    latitude: float
-    longitude: float
+    latitude: float = Field(..., json_schema_extra={"x-geo": "lat"})
+    longitude: float = Field(..., json_schema_extra={"x-geo": "lng"})
 
 
 @router.post("/api/customers/register")
@@ -495,8 +495,8 @@ class CustomerEditRequest(BaseModel):
     notes: Optional[str] = None
     # Install location: send both to set it, neither to keep it, or
     # clear_location=true to remove it.
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
+    latitude: Optional[float] = Field(None, description="Where the customer is (install location): pick it on the map.", json_schema_extra={"x-geo": "lat"})
+    longitude: Optional[float] = Field(None, json_schema_extra={"x-geo": "lng"})
     clear_location: bool = False
 
 

@@ -1890,3 +1890,14 @@ async def test_feature_requests_are_recorded_once_and_ranked(client, owner, db, 
     assert [i["id"] for i in queue][0] == excel_id and queue[0]["admin_rank"] == 1
     assert {i["source"] for i in queue} == {"assistant"}
     assert frs.similarity("Export invoices to Excel", "Pick a customer's location on a map") < frs.MATCH_AT
+
+
+def test_a_customer_form_marks_the_location_for_a_map():
+    """The install location is one place picked on a map, not two numbers to type."""
+    import main
+    from app.services.assistant.catalog import form_fields, get_catalog
+
+    catalog = get_catalog(main.app)
+    register = next(a for a in catalog.actions if a.method == "POST" and a.template == "/api/customers/register")
+    fields = {f["name"]: f for f in form_fields(register, {})}
+    assert fields["latitude"]["geo"] == "lat" and fields["longitude"]["geo"] == "lng"
