@@ -2385,6 +2385,10 @@ class C2BTransaction(Base):
     msisdn = Column(String(128), nullable=True)
     business_shortcode = Column(String(20), nullable=True, index=True)
     payload_json = Column(JSON, nullable=True)  # raw Safaricom payload for audit
+    # Payer's name from FirstName/MiddleName/LastName, cleaned by
+    # app/services/payer_names.py. NULL when Safaricom sent none (or only a
+    # masked one) and on rows from before November 2026.
+    payer_name = Column(String(120), nullable=True)
     status = Column(
         Enum(C2BTransactionStatus, name="c2btransactionstatus",
              values_callable=lambda e: [x.value for x in e]),
