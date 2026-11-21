@@ -3,7 +3,7 @@ from fastapi.responses import PlainTextResponse, HTMLResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Literal
 import logging
 
 from app.db.database import get_db
@@ -29,8 +29,18 @@ router = APIRouter(tags=["provisioning"])
 
 
 class ProvisionCreateRequest(BaseModel):
-    payment_methods: Optional[List[str]] = None
-    vpn_type: Optional[str] = "wireguard"
+    model_config = {"json_schema_extra": {
+        # the classic setup page asks only this much; the rest has a default
+        "x-fields-for": {"vpn_type": {"l2tp": ["is_routerboard"]}},
+    }}
+
+    payment_methods: Optional[List[str]] = Field(
+        None, description="Leave out: the router uses the account's payment methods",
+        json_schema_extra={"x-admin-only": True})
+    vpn_type: Optional[Literal["wireguard", "l2tp"]] = Field(
+        "wireguard", description="The router's RouterOS version (on the router: System > Resources)",
+        json_schema_extra={"x-enum-labels": {"wireguard": "RouterOS 7 (most routers bought since 2022)",
+                                             "l2tp": "RouterOS 6 (older routers)"}})
     # Opt-in for the v6 hEX/RouterBOARD split-filesystem workaround. Only
     # honoured when vpn_type == "l2tp" (RouterOS v6); ignored on wireguard/v7
     # because v7 has a unified persistent filesystem on every supported
@@ -41,11 +51,13 @@ class ProvisionCreateRequest(BaseModel):
     # whose firmware uses a unified persistent filesystem -- those just use
     # plain `hotspot` as the html-directory and the captive-portal redirect
     # works correctly.
-    is_routerboard: Optional[bool] = False
+    is_routerboard: Optional[bool] = Field(
+        False, description="A hEX, hAP or other RouterBOARD on RouterOS 6 (keeps the login page after a restart)")
     # Hotspot Wi-Fi name the setup script gives wlan1 on a fresh router.
     # Omitted/blank -> the reseller's business name (then organisation name,
     # then "Bitwave WiFi"). Sanitised for RouterOS: printable ASCII, max 32.
-    ssid: Optional[str] = Field(default=None, max_length=64)
+    ssid: Optional[str] = Field(default=None, max_length=64,
+                                description="Wi-Fi name customers see; leave empty for your business name")
 
 
 # ── Authenticated endpoints ──────────────────────────────────────────────
