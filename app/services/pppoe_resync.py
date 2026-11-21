@@ -349,7 +349,10 @@ async def _run_recovery_sweep(router_id: int) -> None:
                 )
                 return
             summary = await sweep_router_pppoe(router_id)
-            if summary.get("provisioned") or summary.get("removed") or summary.get("failed"):
+            if (
+                summary.get("provisioned") or summary.get("removed")
+                or summary.get("failed") or summary.get("dns_healed")
+            ):
                 logger.warning("[PPPOE-RECOVERY] router %s: %s", router_id, summary)
             else:
                 logger.info("[PPPOE-RECOVERY] router %s: %s", router_id, summary)
@@ -383,7 +386,15 @@ def _list_pppoe_secrets_sync(router_info: dict) -> dict:
         result = api.get_pppoe_secrets_minimal()
         if not result.get("success"):
             return {"error": result.get("error") or "Failed to list PPPoE secrets"}
-        return {"success": True, "secrets": result.get("data") or []}
+        # Self-heal: a PPPoE profile with a blank dns-server leaves CPEs
+        # "connected, 0 MB". Idempotent, never drops a session, never fatal.
+        dns_healed: list[str] = []
+        try:
+            heal = api.heal_empty_pppoe_profile_dns()
+            dns_healed = list(heal.get("healed") or [])
+        except Exception as exc:
+            logger.warning("[PPPOE-RECOVERY] DNS heal on %s failed: %s", router_info.get("ip"), exc)
+        return {"success": True, "secrets": result.get("data") or [], "dns_healed": dns_healed}
     except Exception as exc:
         return {"error": str(exc)}
     finally:
@@ -483,6 +494,8 @@ async def sweep_router_pppoe(router_id: int, *, now: Optional[datetime] = None) 
     if listing.get("error"):
         return {**summary, "status": "router_unreachable", "error": listing["error"]}
     secrets = listing["secrets"]
+    if listing.get("dns_healed"):
+        summary["dns_healed"] = listing["dns_healed"]
     from app.services.pppoe_expired_redirect import EXPIRED_PROFILE
 
     # A secret still on the walled expired profile gives no internet: for a

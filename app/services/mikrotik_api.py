@@ -48,6 +48,13 @@ PPPOE_SUBNET_CANDIDATES = ("192.168.89", "192.168.189", "192.168.199", "172.16.8
 DEFAULT_PPPOE_KEEPALIVE_TIMEOUT = "10"
 DEFAULT_PPPOE_ONE_SESSION_PER_HOST = "yes"
 DEFAULT_PPPOE_PROFILE_ONLY_ONE = "yes"
+# DNS handed to PPPoE clients when a profile has none. Same public resolvers the
+# hotspot and plain-LAN DHCP networks hand out. A blank dns-server leaves CPEs
+# connected but unable to resolve anything, and the router's own resolver is
+# usually not reachable from the PPPoE pool (input chain only trusts the LAN).
+DEFAULT_PPPOE_DNS_SERVERS = "8.8.8.8,8.8.4.4"
+# Built-in RouterOS profiles also used by tunnels/VPN clients: never touched.
+BUILTIN_PPP_PROFILES = frozenset({"default", "default-encryption"})
 
 # Profiles for customers allowed several devices on one PPPoE login end in
 # "_d<N>" (pppoe_10M_10M_d3, fup-2M_2M_d3): only-one=no plus an on-up script
@@ -2901,13 +2908,20 @@ class MikroTikAPI:
             profiles = self.send_command("/ppp/profile/print")
             profile_exists = False
             profile_id = None
+            existing_dns = ""
 
             if profiles.get("success") and profiles.get("data"):
                 for profile in profiles["data"]:
                     if profile.get("name") == profile_name:
                         profile_exists = True
                         profile_id = profile.get(".id")
+                        existing_dns = str(profile.get("dns-server") or "").strip()
                         break
+
+            # No DNS from the caller (blank base profile): fill a sane default,
+            # but never overwrite a DNS someone already set on this profile.
+            if not dns_server and not existing_dns:
+                dns_server = DEFAULT_PPPOE_DNS_SERVERS
 
             profile_args = {
                 "name": profile_name,
@@ -5210,6 +5224,72 @@ class MikroTikAPI:
             logger.error("Error ensuring hotspot captive portal on %s: %s", interface, exc)
             return {"error": str(exc), **report}
 
+    def heal_empty_pppoe_profile_dns(
+        self,
+        dns_server: str = DEFAULT_PPPOE_DNS_SERVERS,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Give every PPPoE profile with a blank dns-server a working DNS.
+
+        Covers the profiles PPPoE clients can land on: those named
+        ``default-pppoe`` / ``pppoe*``, plus any profile a PPPoE server or a
+        PPPoE secret points at. Built-in ``default``/``default-encryption``
+        are skipped. Profiles that already have a DNS are left alone, so this
+        is idempotent. Live sessions keep their DNS until they redial; nothing
+        is disconnected.
+        """
+        if not self.connected:
+            return {"error": "Not connected"}
+        warnings: List[str] = []
+        try:
+            profiles = self.send_command("/ppp/profile/print")
+            if not profiles.get("success"):
+                return {"error": profiles.get("error", "Could not read PPP profiles")}
+
+            used: set[str] = set()
+            servers = self.send_command_optimized(
+                "/interface/pppoe-server/server/print", proplist=["default-profile"],
+            )
+            for server in servers.get("data") or [] if servers.get("success") else []:
+                if server.get("default-profile"):
+                    used.add(server["default-profile"])
+            secrets = self.send_command_optimized(
+                "/ppp/secret/print", proplist=["service", "profile"],
+            )
+            for secret in secrets.get("data") or [] if secrets.get("success") else []:
+                if (secret.get("service") or "").lower() in {"pppoe", "any", ""} and secret.get("profile"):
+                    used.add(secret["profile"])
+
+            healed: List[str] = []
+            for profile in profiles.get("data") or []:
+                name = str(profile.get("name") or "")
+                if not name or name in BUILTIN_PPP_PROFILES:
+                    continue
+                ours = name == "default-pppoe" or name.lower().startswith("pppoe")
+                if not ours and name not in used:
+                    continue
+                if str(profile.get("dns-server") or "").strip():
+                    continue
+                if dry_run:
+                    healed.append(name)
+                    continue
+                result = self.send_command(
+                    "/ppp/profile/set", {"numbers": profile.get(".id") or name, "dns-server": dns_server},
+                )
+                if result.get("error"):
+                    warnings.append(f"PPP profile {name}: {result['error']}")
+                else:
+                    healed.append(name)
+            if healed and not dry_run:
+                logger.warning(
+                    "[PPPoE] %s: set dns-server=%s on profile(s) that had none: %s",
+                    self.host, dns_server, healed,
+                )
+            return {"success": True, "healed": healed, "dry_run": dry_run, "warnings": warnings}
+        except Exception as e:
+            logger.error("Error healing PPPoE profile DNS: %s", e)
+            return {"error": str(e), "warnings": warnings}
+
     def apply_pppoe_reconnect_defaults(
         self,
         keepalive_timeout: str = DEFAULT_PPPOE_KEEPALIVE_TIMEOUT,
@@ -5331,10 +5411,16 @@ class MikroTikAPI:
                         "only_one": only_one,
                     })
 
+            dns_heal = self.heal_empty_pppoe_profile_dns()
+            if dns_heal.get("error"):
+                warnings.append(f"PPP profile DNS: {dns_heal['error']}")
+            warnings.extend(dns_heal.get("warnings") or [])
+
             return {
                 "success": True,
                 "servers_updated": len(updated_servers),
                 "profiles_updated": len(updated_profiles),
+                "dns_healed": dns_heal.get("healed") or [],
                 "servers": updated_servers,
                 "profiles": updated_profiles,
                 "warnings": warnings,

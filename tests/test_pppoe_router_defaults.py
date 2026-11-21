@@ -67,6 +67,7 @@ def test_ensure_pppoe_profile_sets_only_one_on_create():
             "rate-limit": "10000000/10000000",
             "local-address": "192.168.89.1",
             "remote-address": "pppoe-pool",
+            "dns-server": "8.8.8.8,8.8.4.4",
             "only-one": "yes",
         },
     )
