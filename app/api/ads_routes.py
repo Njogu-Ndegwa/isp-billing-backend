@@ -27,7 +27,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -52,6 +52,8 @@ router = APIRouter(tags=["ads"])
 _BADGES = {"hot": AdBadgeType.HOT, "new": AdBadgeType.NEW, "sale": AdBadgeType.SALE}
 _COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 _MEDIA_FIELDS = ("image_url", "video_url", "poster_url")
+_MEDIA_EDIT = {"x-fields-for": {"media_type": {"image": ["image_url"], "video": ["video_url", "poster_url"]}}}
+_MEDIA_ADD = {**_MEDIA_EDIT, "x-required-for": {"media_type": {"image": ["image_url"], "video": ["video_url"]}}}
 _PHONE_RE = re.compile(r"^\+?[0-9 ]{9,16}$")
 # Content edits: what the automatic checks run again for.
 _REVIEWED_FIELDS = {
@@ -96,6 +98,9 @@ class AdvertiserCreateRequest(BaseModel):
 
 
 class AdCreateRequest(BaseModel):
+    # a photo ad has a photo, a video ad a video and its poster: a form shows one set
+    model_config = ConfigDict(json_schema_extra=_MEDIA_ADD)
+
     title: str
     seller_name: str
     phone_number: str
@@ -113,7 +118,7 @@ class AdCreateRequest(BaseModel):
     starts_at: Optional[str] = None
     expires_at: Optional[str] = None
     placement: str = "local"
-    media_type: str = "image"
+    media_type: str = Field("image", json_schema_extra={"enum": ["image", "video"]})
     video_url: Optional[str] = None
     poster_url: Optional[str] = None
     image_fit: str = "cover"
@@ -123,6 +128,9 @@ class AdCreateRequest(BaseModel):
 
 
 class AdUpdateRequest(BaseModel):
+    # a photo ad has a photo, a video ad a video and its poster: a form shows one set
+    model_config = ConfigDict(json_schema_extra=_MEDIA_EDIT)
+
     advertiser_id: Optional[int] = None     # admin only; Bitwave ads
     title: Optional[str] = None
     description: Optional[str] = None
@@ -141,7 +149,7 @@ class AdUpdateRequest(BaseModel):
     expires_at: Optional[str] = None
     is_active: Optional[bool] = None
     placement: Optional[str] = None
-    media_type: Optional[str] = None
+    media_type: Optional[str] = Field(None, json_schema_extra={"enum": ["image", "video"]})
     video_url: Optional[str] = None
     poster_url: Optional[str] = None
     image_fit: Optional[str] = None

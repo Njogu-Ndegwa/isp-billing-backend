@@ -9,7 +9,7 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,9 +37,33 @@ router = APIRouter(tags=["payment-methods"])
 # Pydantic schemas
 # ---------------------------------------------------------------------------
 
+# Which fields belong to which kind of method, and which of them that kind needs
+# (_validate_fields enforces the same). Published in the API schema (x-fields-for,
+# x-required-for), so any form built from it, the assistant's included, shows only
+# the chosen kind's fields instead of every provider's.
+FIELDS_BY_TYPE = {
+    "bank_account": ["bank_paybill_number", "bank_account_number"],
+    "mpesa_paybill": ["mpesa_paybill_number"],
+    "mpesa_till": ["mpesa_till_number"],
+    "mpesa_paybill_with_keys": ["mpesa_shortcode", "mpesa_passkey", "mpesa_consumer_key", "mpesa_consumer_secret"],
+    "zenopay": ["zenopay_api_key"],
+    "mtn_momo": ["mtn_api_user", "mtn_api_key", "mtn_subscription_key", "mtn_target_environment",
+                 "mtn_base_url", "mtn_currency"],
+    "fapshi": ["fapshi_api_user", "fapshi_api_key", "fapshi_environment"],
+}
+_OPTIONAL_FOR_TYPE = {"mtn_base_url", "fapshi_environment"}
+REQUIRED_BY_TYPE = {t: [f for f in fs if f not in _OPTIONAL_FOR_TYPE] for t, fs in FIELDS_BY_TYPE.items()}
+# required only when adding one: an edit changes just the fields it names
+_BY_TYPE_EDIT = {"x-fields-for": {"method_type": FIELDS_BY_TYPE}}
+_BY_TYPE_ADD = {**_BY_TYPE_EDIT, "x-required-for": {"method_type": REQUIRED_BY_TYPE}}
+
+
 class PaymentMethodCreate(BaseModel):
+    model_config = ConfigDict(json_schema_extra=_BY_TYPE_ADD)
+
     method_type: str = Field(
         ...,
+        json_schema_extra={"enum": [t.value for t in ResellerPaymentMethodType]},
         description=(
             "bank_account | mpesa_paybill | mpesa_till | mpesa_paybill_with_keys "
             "| zenopay | mtn_momo | fapshi"
@@ -81,6 +105,9 @@ class PaymentMethodCreate(BaseModel):
 
 
 class PaymentMethodUpdate(BaseModel):
+    # the kind is the record's own (it cannot be changed): its fields only
+    model_config = ConfigDict(json_schema_extra=_BY_TYPE_EDIT)
+
     label: Optional[str] = None
     is_active: Optional[bool] = None
 
