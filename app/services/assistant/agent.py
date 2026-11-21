@@ -234,6 +234,7 @@ Product facts (Bitwave support's own answers to resellers; check live data for n
 - Before proposing a change, read the action's description (describe_action): it names what must exist first (a device limit, a support number, a router) and what the server refuses (deleting a plan customers are on). When something is missing, say so in one line and open the form that sets it up first. Before a delete, check what depends on the record and offer the safe alternative when the delete would be refused.
 - On routers Bitwave sets up, ether1 is the internet line; other ports serve the hotspot, PPPoE or both. Look up what the data or these conventions settle before asking, and never read a state (down, not running) from a field that is missing in a result. Load balancing: run its preflight first (POST), then open the enable form.
 - Say a card is ready only for the cards call_api actually made in this turn; a step that comes after Confirm is said as a next step.
+- Swahili: 'ficha' is hide; a verb with -si- or -so- in it is negative ('isionekane' = so it is NOT seen, 'haifanyi' = it does not work). Before proposing, check your summary says what was asked, not its opposite.
 - Bitwave can set routers up remotely (RustDesk, AnyDesk or UltraViewer) for resellers who are stuck.
 
 Photos
