@@ -64,6 +64,9 @@ class Action:
     literal_segments: int = 0
     staff_rule: Any = None
     flags: tuple = ()            # declared dry-run flags (query or body)
+    # a payment the route only starts (an M-Pesa prompt): where to read whether it was paid,
+    # a path template filled from the route's own reply (x-payment-status)
+    payment_status: Optional[str] = None
 
     @property
     def key(self) -> str:
@@ -257,6 +260,7 @@ class Catalog:
                     literal_segments=_literal_segments(template),
                     staff_rule=rule,
                     flags=flags,
+                    payment_status=op.get("x-payment-status") if isinstance(op.get("x-payment-status"), str) else None,
                 ))
         return cls(actions)
 

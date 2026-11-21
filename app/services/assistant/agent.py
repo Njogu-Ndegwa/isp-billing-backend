@@ -203,6 +203,7 @@ How to work
 - Never say a form or a change is ready unless call_api answered "waiting_for_confirmation". If it returned an error, fix the request and send it again, or say plainly what went wrong.
 - A ✎ call does not run when you make it. It becomes a confirmation card and the person taps Confirm or Cancel. After proposing, end your turn with one or two sentences saying what is ready and that it runs when they tap Confirm, e.g. "Ready to create the plan — tap Confirm." Never say you created, changed, set up or sent anything until you have its result.
 - Confirmed and cancelled actions come back in a message that starts with [Confirmation results]. Report what happened plainly, failures included, then continue the task if more steps remain.
+- An M-Pesa payment (buying SMS credits, paying the subscription) only sends a PIN prompt to a phone: after Confirm it is waiting, not bought, and the card shows when it is paid. The phone number is the payer's own M-Pesa line: leave it for them to type unless they gave it in this chat; never fill it with the support phone or a customer's number.
 - For a change to many records, use a bulk action if the index has one; otherwise propose one call per record, at most {max_proposals} per turn, and say how many remain.
 - Never ask for, repeat or send a password, API key or other secret. Results show them hidden. If an action needs one, tell the person which dashboard page to use instead.
 - If nothing in the index does what was asked, say so; do not improvise with an unrelated action.
@@ -939,6 +940,22 @@ class Turn:
             self._form_secrets[action_id] = typed_secrets  # this request only, then forgotten
         return True
 
+    def _payment_wait(self, action: dict, data: Any) -> Optional[dict]:
+        """For a route that only starts a payment: where the page checks whether it was paid."""
+        spec, _ = self.catalog.match(action["method"], action["path"])
+        template = getattr(spec, "payment_status", None)
+        if not template or not isinstance(data, dict):
+            return None
+        names = re.findall(r"\{(\w+)\}", template)
+        if any(data.get(n) in (None, "") for n in names):
+            return None
+        path = template
+        for n in names:
+            path = path.replace("{" + n + "}", str(data[n]))
+        phone = data.get("phone_number")
+        return {"kind": "mpesa", "poll": path,
+                "message": f"Check {'the phone ' + str(phone) if phone else 'your phone'}: enter your M-Pesa PIN to pay."}
+
     async def _run_confirmed(self, action_id: str) -> dict:
         action = await store.claim_action(self.caller, self.conversation["id"], action_id, "running")
         if action is None:
@@ -953,17 +970,21 @@ class Turn:
                                          action.get("query"), body)
         status = "done" if result.ok else "failed"
         detail = "" if result.ok else result.detail()
+        awaiting = self._payment_wait(action, result.data) if result.ok else None
         await store.finish_action(action_id, status=status, result_status=result.status,
-                                  result_summary=detail or "ok")
+                                  result_summary=detail or ("payment prompt sent" if awaiting else "ok"))
         logger.info("[assistant] user=%s staff=%s ran %s %s -> %s", self.caller.user_id,
                     self.caller.staff_id, action["method"], action["path"], result.status)
         await self.emit("action_result", {
             "action_id": action_id, "status": status, "ok": result.ok, "http_status": result.status,
-            "detail": detail, "payload": shaping.for_screen(result.data) if result.ok else None,
+            "detail": detail, "payload": shaping.for_screen(result.data) if result.ok and not awaiting else None,
+            **({"awaiting": awaiting} if awaiting else {}),
         })
         out = {"action_id": action_id, "title": action["title"], "method": action["method"],
                "path": action["path"], "http_status": result.status,
-               "outcome": "done" if result.ok else "failed"}
+               "outcome": ("payment prompt sent, NOT paid yet: M-Pesa is asking for the PIN on the phone. Say "
+                           "so (check the phone, enter the PIN); the card shows when it is paid. Never say it is "
+                           "bought, paid or done.") if awaiting else "done" if result.ok else "failed"}
         if isinstance(action.get("body"), dict) and action["body"]:
             out["sent"] = shaping.mask(action["body"])  # what really ran, form edits included
         if result.ok:

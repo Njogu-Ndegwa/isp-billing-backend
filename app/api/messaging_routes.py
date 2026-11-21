@@ -312,11 +312,14 @@ async def preview_customer_event_message(body: TemplatePreviewIn,
 
 
 class PurchaseRequest(BaseModel):
-    quantity: int = Field(..., ge=1)
-    phone_number: str
+    quantity: int = Field(..., ge=1, description="How many SMS to buy.")
+    phone_number: str = Field(..., description="Your M-Pesa number: the payment prompt is sent to this phone, e.g. 0712345678.")
 
 
-@router.post("/api/messaging/credits/purchase")
+# Paying is not done when this returns: M-Pesa asks for the PIN on the phone, and the
+# order is settled by the callback. The status read below says when it is.
+@router.post("/api/messaging/credits/purchase",
+             openapi_extra={"x-payment-status": "/api/messaging/credits/orders/{order_id}"})
 async def purchase_credits(req: PurchaseRequest,
                            db: AsyncSession = Depends(get_db),
                            token: str = Depends(verify_token)):
@@ -332,11 +335,11 @@ async def purchase_credits(req: PurchaseRequest,
     if amount < 1:
         raise HTTPException(status_code=400, detail="Computed amount too small")
 
-    phone = req.phone_number.strip()
-    if phone.startswith("0"):
-        phone = "254" + phone[1:]
-    elif phone.startswith("+"):
-        phone = phone[1:]
+    from app.api.subscription_routes import normalize_kenyan_msisdn
+
+    phone = normalize_kenyan_msisdn(req.phone_number)
+    if phone is None:
+        raise HTTPException(status_code=400, detail="Use your Safaricom M-Pesa number, e.g. 0712345678.")
 
     order = SmsCreditOrder(user_id=user.id, quantity=req.quantity,
                            unit_price=s.price_per_sms_kes, amount=amount,
@@ -376,8 +379,28 @@ async def purchase_credits(req: PurchaseRequest,
         "order_id": order.id,
         "quantity": order.quantity,
         "amount": amount,
+        "phone_number": phone,
         "checkout_request_id": stk.checkout_request_id,
     }
+
+
+@router.get("/api/messaging/credits/orders/{order_id}")
+async def credit_order_status(order_id: int,
+                              db: AsyncSession = Depends(get_db),
+                              token: str = Depends(verify_token)):
+    """Whether an SMS credit purchase is paid: pending (waiting for the M-Pesa PIN), completed or failed."""
+    user = await _require_reseller(token, db)
+    order = (await db.execute(
+        select(SmsCreditOrder).where(SmsCreditOrder.id == order_id, SmsCreditOrder.user_id == user.id)
+    )).scalar_one_or_none()
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+    status = getattr(order.status, "value", order.status)
+    return {"order_id": order.id, "status": status, "quantity": order.quantity, "amount": order.amount,
+            "paid": status == "completed",
+            "summary": (f"Paid: {order.quantity} SMS added." if status == "completed"
+                        else "Not paid: the M-Pesa request was cancelled, timed out or failed." if status == "failed"
+                        else "Waiting for the M-Pesa PIN on the phone.")}
 
 
 @router.post("/api/messaging/credits/mpesa/callback")
