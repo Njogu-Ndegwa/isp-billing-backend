@@ -445,3 +445,25 @@ async def test_preview_shows_no_platform_paybill_for_direct_settlement(db, clien
     assert "Paybill 4699342" in body["text"]
     assert body["paybill"] == "4699342"
     assert "not renewed automatically" in body["paybill_note"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_payment_keeps_mpesas_reason_in_plain_words(db, client, monkeypatch):
+    r = await make_reseller(db)
+    _auth_as(monkeypatch, r)
+
+    class _Stk:
+        checkout_request_id = "ws_CO_77"
+        merchant_request_id = "mr_77"
+
+    async def _fake_stk(**kwargs):
+        return _Stk()
+    monkeypatch.setattr(mr, "initiate_stk_push_direct", _fake_stk)
+
+    bought = await client.post("/api/messaging/credits/purchase", json={"quantity": 50, "phone_number": "0712345678"})
+    order_id = bought.json()["order_id"]
+    await client.post("/api/messaging/credits/mpesa/callback", json={"Body": {"stkCallback": {
+        "CheckoutRequestID": "ws_CO_77", "ResultCode": 1032, "ResultDesc": "Request cancelled by user"}}})
+    status = (await client.get(f"/api/messaging/credits/orders/{order_id}")).json()
+    assert status["status"] == "failed" and status["paid"] is False
+    assert "cancelled on the phone" in status["summary"] and "1032" in status["summary"]

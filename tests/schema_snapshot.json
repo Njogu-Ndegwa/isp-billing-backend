@@ -1297,6 +1297,7 @@
  "sms_credit_orders": [
   "amount",
   "created_at",
+  "failure_reason",
   "id",
   "mpesa_checkout_request_id",
   "mpesa_merchant_request_id",
@@ -1399,6 +1400,7 @@
   "checkout_url",
   "created_at",
   "currency",
+  "failure_reason",
   "id",
   "invoice_id",
   "mpesa_checkout_request_id",
