@@ -14,17 +14,18 @@ earlier message. No DB session is held across a model or API call.
 from __future__ import annotations
 
 import asyncio
+import re
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from app.config import settings
 from app.services.assistant import executor, shaping, store
 from app.services.assistant.usage import TurnUsage
 from app.services.assistant.caller import Caller
-from app.services.assistant.catalog import Action, Catalog, body_problems, build_path, get_catalog
+from app.services.assistant.catalog import Action, Catalog, apply_form_values, body_problems, build_path, form_fields, get_catalog
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +112,14 @@ TOOLS = [
                          "description": "Concrete path with real ids filled in, e.g. /api/customers/1234"},
                 "query": {"type": "object", "description": "Query parameters, if any."},
                 "body": {"description": "JSON body for POST/PUT/PATCH, if the action takes one."},
+                "form": {
+                    "type": "boolean",
+                    "description": (
+                        "For creating or editing a record: show the change as a form the person "
+                        "completes or corrects before Confirm. Put in body only what you know (for an "
+                        "edit, the record's current values for the fields being changed); required "
+                        "fields may be left out and the person fills them in."),
+                },
                 "show": {
                     "type": "string", "enum": list(SHOW_VALUES),
                     "description": (
@@ -155,6 +164,9 @@ How to work
 - The API index at the end lists every action available to this person, one per line: METHOD path ?query-params — what it does. Lines marked ✎ change data.
 - Look things up before acting. Resolve names, phone numbers, router names and plan names to ids with a read (show "none" when it is only a lookup). Never guess or invent an id.
 - Before any ✎ action, call describe_action for it, then call call_api with a complete, correct request and a clear summary.
+- To create or edit something (a plan, a customer, a router setting, a payment method...), never ask for the fields in text. Call describe_action, then call_api with form: true and a body holding what you already know: values the person gave, sensible defaults, and for an edit the record's current values (read it first). The person sees a form, fills in or corrects it and taps Confirm; leave out what you do not know. In your words, say only what the form is for, e.g. "Fill in the plan and tap Confirm." When the plan or router is not clear, leave plan_id or router_id out: the form lets the person pick from their own plans and routers. Ask in text only when it is unclear which record or which action is meant.
+- When what a change needs does not exist yet (no plan to put vouchers or a customer on), say so in one sentence and open the form for that first. A router is added with the setup command, not a form.
+- Never say a form or a change is ready unless call_api answered "waiting_for_confirmation". If it returned an error, fix the request and send it again, or say plainly what went wrong.
 - A ✎ call does not run when you make it. It becomes a confirmation card and the person taps Confirm or Cancel. After proposing, end your turn with one or two sentences saying what is ready and that it runs when they tap Confirm, e.g. "Ready to create the plan — tap Confirm." Never say you created, changed, set up or sent anything until you have its result.
 - Confirmed and cancelled actions come back in a message that starts with [Confirmation results]. Report what happened plainly, failures included, then continue the task if more steps remain.
 - For a change to many records, use a bulk action if the index has one; otherwise propose one call per record, at most {max_proposals} per turn, and say how many remain.
@@ -170,7 +182,7 @@ Getting started (onboarding)
 - Router not connecting, check in this order: internet cable in port 1 (`/ping 8.8.8.8 count=3` should get replies); the router's date and time are today (`/system clock print`, fix under System > Clock); the whole command was pasted (it must end with `/import provision.rsc;`); the code has not expired (codes last about 24 hours; make a new one if so).
 - "not allowed by device-mode" or "hotspot feature unavailable" on RouterOS 7: run `/system/device-mode/update fetch=yes scheduler=yes hotspot=yes`, then within 5 minutes tap the router's reset or mode button once (a quick tap; holding it can erase the router); wait for the restart, log in again and paste the setup command again. `/system/device-mode/print` should show hotspot: yes. "bad command name" means that version has no device-mode, so skip this. "too many unsuccessful attempts": unplug the power once and start again.
 - Hotspot package missing (hAP lite / hAP mini, `/ip hotspot` menus absent, or "hotspot feature unavailable" while device-mode shows hotspot: yes): check `/system package print` and `/system resource print` (version and architecture-name), download the matching package, e.g. `/tool fetch url="https://download.mikrotik.com/routeros/<version>/hotspot-<version>-<architecture>.npk"`, then `/system reboot`, then paste the setup command again.
-- Plans: ask for name, price, duration and speed if not given; describe the plan action to see the exact fields. Payments: M-Pesa Paybill (paybill number), M-Pesa Till (a 4–9 digit Buy Goods number, never a phone number: a phone number cannot receive payouts) or bank (bank paybill + account number). After creating the first payment method, link it to the router with the router payment-method action if the index has it.
+- Plans: open the plan form (form: true) with what the person said filled in; do not ask for name, price, duration and speed in text. Payments: M-Pesa Paybill (paybill number), M-Pesa Till (a 4–9 digit Buy Goods number, never a phone number: a phone number cannot receive payouts) or bank (bank paybill + account number). After creating the first payment method, link it to the router with the router payment-method action if the index has it.
 - If they stay stuck, the Bitwave team can take over: they can send their RustDesk ID on WhatsApp to +254795635364 and Bitwave sets the router up remotely. The Bitwave team can also read this chat and add notes to it.
 
 Product facts (Bitwave support's own answers to resellers; check live data for numbers)
@@ -193,8 +205,18 @@ Photos
 Bitwave support notes
 - A message starting with [Bitwave support note from …] was written by the Bitwave team into this chat. Follow it, and tell the person what support said when it matters.
 
+Answering
+- Answer exactly what was asked, nothing around it. Lead with the answer itself (the count, the names, the figure) in one or two sentences, then at most one line on anything that needs attention.
+- Say the answer once, after your last lookup. Words you write next to a tool call are not shown, so do not narrate ("I'll look that up"): the page already shows that you are checking.
+- Never mention database ids ("id 1", "#34") unless the person asked for one; use names.
+- Times: each moment in a result already comes with the person's own clock and how far from now ("... = Sat 21 Nov 05:12 EAT, in 5 h"). Say that local time as it is, with "in 5 hours" or "2 days ago" for anything near; never convert times yourself and never write "UTC" unless asked.
+- [Account now: ...] before a message lists facts about the account itself: a Bitwave subscription that is suspended, lapsed or about to end, and SMS credits that have run out. When the question touches it (customers who cannot buy or connect, sending SMS, renewals, money) or it is the first answer in the chat, add one short line about it and offer to fix it here: paying the subscription (the subscription invoice and pay actions) or buying SMS credits. Otherwise do not repeat it. Never refuse or hold back anything else because of it.
+- When something the account lacks stands in the way of what was asked (no SMS credits for a send, no plan for a customer, no router for a plan), say so in one line and open the form that fixes it, then carry on with what they asked once it is done.
+- Look things up quietly: a read is drawn only when you set "show". While you are working something out, leave show out. Draw only the one result that answers the question (two at most); if a quiet lookup turned out to be the answer, call it again with show set. Never draw the same list twice, and never draw a lookup that turned out not to help.
+- Prefer the action or filter that answers the question directly (the API index lists each action's query parameters) over fetching everything and sifting through it.
+
 Showing results
-- The page draws each read's result for the person, and you choose how with "show": tiles for a few totals, table for a list, card for one record, trend for figures per day, week or month, bars for a top-N or a comparison between names, share for a split of one whole (by status, plan or payment method), none for a lookup only you need. Pick the drawing that answers the question, and prefer an action that already returns the grouping you need (per day, per plan, per router) over a long raw list.
+- The page draws a read's result for the person when you choose how with "show": tiles for a few totals, table for a list, card for one record, trend for figures per day, week or month, bars for a top-N or a comparison between names, share for a split of one whole (by status, plan or payment method), none for a lookup only you need. Pick the drawing that answers the question, and prefer an action that already returns the grouping you need (per day, per plan, per router) over a long raw list.
 - For trend, bars and share you may add "fields" naming the fields of the result rows to draw (label and value). Leave it out when you are unsure of the names; the page then picks them itself.
 - The numbers on screen always come from the data, never from you. So say the answer in one or two sentences, the headline figure and what stands out, and never repeat rows, lists or tables in your text.
 - Every figure you state must come from a result in this conversation. If you do not have it, look it up or say you do not know.
@@ -394,8 +416,129 @@ def conversation_lock(conversation_id: str) -> asyncio.Lock:
     return lock
 
 
-def _now_label() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+def _now_label(tz_name: Optional[str] = None) -> str:
+    """The moment of a message: UTC (what the API uses), and the person's own clock."""
+    from app.services.subscription_reminders import to_local, zone_abbreviation
+
+    now = datetime.utcnow()
+    if not tz_name:
+        return now.strftime("%Y-%m-%d %H:%M UTC")
+    local = to_local(now, tz_name)
+    offset = round((local - now).total_seconds() / 3600, 1)
+    sign = "+" if offset >= 0 else "-"
+    return (f"{now:%Y-%m-%d %H:%M} UTC = {local:%a %d %b %H:%M} {zone_abbreviation(tz_name, now)} "
+            f"(UTC{sign}{abs(offset):g}) for this person")
+
+
+_ISO_TIME = re.compile(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$")
+
+
+def localize_times(data: Any, tz_name: Optional[str], now: Optional[datetime] = None) -> Any:
+    """Every moment in a result, on the person's own clock and how far from now.
+
+    "2026-11-21T02:12:00" (UTC, as the API stores it) becomes
+    "2026-11-21T02:12:00 = Sat 21 Nov 05:12 EAT, in 5 h". The model reads the time
+    as it is instead of converting it (which it gets wrong). Dates alone stay as
+    they are. Strings that are not a moment are left alone.
+    """
+    if not tz_name:
+        return data
+    from datetime import timezone as _tz
+
+    from app.services.subscription_reminders import to_local, zone_abbreviation
+
+    now = now or datetime.utcnow()
+
+    def one(value: str) -> str:
+        m = _ISO_TIME.match(value.strip())
+        if not m:
+            return value
+        try:
+            when = datetime.fromisoformat(value.strip().replace("Z", "+00:00").replace(" ", "T"))
+        except ValueError:
+            return value
+        if when.tzinfo is not None:
+            when = when.astimezone(_tz.utc).replace(tzinfo=None)
+        local = to_local(when, tz_name)
+        secs = (when - now).total_seconds()
+        span = abs(secs)
+        if span < 90:
+            rel = "now"
+        else:
+            amount = (f"{round(span / 60)} min" if span < 3600 else
+                      f"{round(span / 3600)} h" if span < 48 * 3600 else f"{round(span / 86400)} days")
+            rel = f"in {amount}" if secs > 0 else f"{amount} ago"
+        return f"{value} = {local:%a %d %b %Y %H:%M} {zone_abbreviation(tz_name, when)}, {rel}"
+
+    def walk(v: Any) -> Any:
+        if isinstance(v, str):
+            return one(v) if len(v) <= 40 else v
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        if isinstance(v, dict):
+            return {k: walk(x) for k, x in v.items()}
+        return v
+
+    return walk(data)
+
+
+async def account_state(caller: Caller) -> tuple[Optional[str], list[str]]:
+    """The account's time zone, and what about the account itself needs saying.
+
+    Facts, not instructions: a subscription that is suspended, inactive or about
+    to run out (and what is owed), and SMS credits that have run out. Nothing is
+    listed when all is well. One short read; never fails the question.
+    """
+    if caller.role == "admin" and caller.viewer_sid is None:
+        return None, []
+    try:
+        from sqlalchemy import select
+
+        from app.db.database import async_session
+        from app.db.models import SmsCreditAccount, User
+        from app.services.markets import reseller_market
+        from app.services.subscription import get_invoice_amount_paid, get_pending_invoice
+
+        async with async_session() as db:
+            user = (await db.execute(select(User).where(User.id == caller.user_id))).scalar_one_or_none()
+            if user is None:
+                return None, []
+            market = reseller_market(user)
+            status = getattr(user.subscription_status, "value", user.subscription_status) or ""
+            expires = user.subscription_expires_at
+            invoice = await get_pending_invoice(db, user.id)
+            due, invoice_currency = None, None
+            if invoice is not None:
+                invoice_currency = getattr(invoice, "currency", None)
+                due = max(float(invoice.final_charge or 0) - float(await get_invoice_amount_paid(db, invoice.id) or 0), 0.0)
+            credits = (await db.execute(
+                select(SmsCreditAccount.balance).where(SmsCreditAccount.user_id == user.id))).scalar()
+    except Exception as e:  # the question still gets answered
+        logger.warning("assistant account state unavailable: %s", e)
+        return None, []
+
+    from app.services.subscription_reminders import to_local, zone_abbreviation
+    tz = market.timezone
+    currency = invoice_currency or market.currency or ""
+    owed = f"{currency} {due:,.0f}".strip() if due else None
+    when = (f"{to_local(expires, tz):%a %d %b %H:%M} {zone_abbreviation(tz, expires)}" if expires else None)
+    notes: list[str] = []
+    now = datetime.utcnow()
+    if status in ("suspended", "inactive"):
+        notes.append(f"Bitwave subscription {status}" + (f" since {when}" if when else "")
+                     + (f", {owed} to pay" if owed else "")
+                     + ": until it is paid, hotspot customers cannot buy internet.")
+    elif expires and expires - now < timedelta(days=3):
+        left = expires - now
+        notes.append(f"Bitwave subscription ({status}) ends {when}"
+                     + (f" (in {max(int(left.total_seconds() // 3600), 0)} h)" if left.total_seconds() > 0 else " (already passed)")
+                     + (f", {owed} to pay" if owed else "")
+                     + ": once it lapses, hotspot customers cannot buy internet.")
+    elif owed:
+        notes.append(f"Bitwave subscription invoice open: {owed} to pay.")
+    if credits is not None and credits <= 0:
+        notes.append("SMS credits: 0, so no SMS can be sent until credits are bought.")
+    return tz, notes
 
 
 def _block_dicts(message) -> list[dict]:
@@ -427,6 +570,8 @@ class Turn:
     """One request's worth of work on one conversation, streaming events to a queue."""
 
     def __init__(self, app, caller: Caller, conversation: dict, queue: asyncio.Queue):
+        self._form_secrets: dict[str, dict] = {}  # passwords typed in a form, for one request
+        self._choice_cache: dict[str, list[tuple[str, str]]] = {}
         self.app = app
         self.caller = caller
         self.catalog: Catalog = get_catalog(app)
@@ -437,8 +582,13 @@ class Turn:
         self.input_tokens = 0
         self.output_tokens = 0
         self.proposals = 0
+        self.drawn: dict[str, str] = {}  # action key -> call_id of what is on screen for this answer
         self._text_parts: list[str] = []
         self._spoke = False
+        self._streamed = ""     # what this model call has put on screen so far
+        self._aside = ""        # the last working note taken back, in case no answer follows
+        self._tz: Optional[str] = None
+        self._tz_known = False
         self.usage = TurnUsage()
         self.is_question = False
 
@@ -499,7 +649,10 @@ class Turn:
         for image in images:
             content.append(await self._image_block(image))
         label = text or ("(photo)" if len(images) == 1 else "(photos)")
-        content.append({"type": "text", "text": f"[{_now_label()}] {label}"})
+        tz_name, notes = await account_state(self.caller)
+        self._tz, self._tz_known = tz_name, True
+        account = f"\n[Account now: {' '.join(notes)}]" if notes else ""
+        content.append({"type": "text", "text": f"[{_now_label(tz_name)}]{account} {label}"})
         self.transcript.append({
             "type": "user", "at": datetime.utcnow().isoformat() + "Z", "text": text,
             **({"images": [i.get("thumbnail") for i in images if i.get("thumbnail")]} if images else {}),
@@ -543,6 +696,9 @@ class Turn:
         for decision in decisions[:MAX_PROPOSALS_PER_TURN * 2]:
             action_id = str(decision.get("action_id") or "")
             approve = bool(decision.get("approve"))
+            values = decision.get("values")
+            if approve and isinstance(values, dict) and not await self._take_form_values(action_id, values):
+                continue  # refused: the card stays open with what to fix, nothing ran
             if approve:
                 lines.append(await self._run_confirmed(action_id))
             else:
@@ -563,6 +719,77 @@ class Turn:
         }]})
         await self._loop()
 
+    async def _offer_choices(self, fields: list[dict]) -> None:
+        """A plan or router field lists this person's own plans and routers by name.
+
+        Read with their own access, so a staff member sees what they may see; the
+        server still checks the id on Confirm, as with any value.
+        """
+        for f in fields:
+            people = _PEOPLE_SOURCES.get(f["name"])
+            if people and f["kind"] == "list" and isinstance(f.get("value"), list) and f["value"]:
+                # the customers already chosen, by name, to untick; adding more is asked in the chat
+                names = dict(await self._choices(people))
+                picked = [str(v) for v in f["value"]][:100]
+                f.update(options=picked, option_labels={v: names.get(v, f"Customer {v}") for v in picked},
+                         value=picked)
+                continue
+            source = _CHOICE_SOURCES.get(f["name"])
+            if source is None or f["kind"] not in ("integer", "text"):
+                continue
+            choices = await self._choices(source)
+            if not choices:
+                continue
+            f.update(value_kind=f["kind"], kind="select", options=[c[0] for c in choices],
+                     option_labels=dict(choices))
+            if "value" in f:
+                f["value"] = str(f["value"])
+
+    async def _choices(self, path: str) -> list[tuple[str, str]]:
+        if path not in self._choice_cache:
+            out: list[tuple[str, str]] = []
+            try:
+                result = await executor.call_api(self.app, self.caller, "GET", path, None, None)
+                data = result.data if result.ok else None
+                if isinstance(data, dict):  # a page: the first list in it
+                    data = next((v for v in data.values() if isinstance(v, list)), None)
+                for row in (data or [])[:200]:
+                    if isinstance(row, dict) and row.get("id") is not None:
+                        out.append((str(row["id"]), str(row.get("name") or row.get("identity") or f"#{row['id']}")[:80]))
+            except Exception:  # a convenience: without it the field is a plain input
+                logger.warning("[assistant] could not list %s for a form", path, exc_info=True)
+            self._choice_cache[path] = out
+        return self._choice_cache[path]
+
+    async def _take_form_values(self, action_id: str, values: dict) -> bool:
+        """Merge a form's values into its pending action. False (and the card told why) if they do not pass."""
+        action = await store.pending_action(self.caller, self.conversation["id"], action_id)
+        if action is None:
+            return True  # expired or decided: _run_confirmed says so
+        spec, _ = self.catalog.match(action["method"], action["path"])
+        if spec is None:
+            return True
+        body, typed_secrets, problems = apply_form_values(spec, action.get("body"), values)
+        problems += body_problems(spec, {**body, **typed_secrets})
+        before = action.get("body") if isinstance(action.get("body"), dict) else {}
+        for name in ("customer_ids",):
+            # unticking everyone must not turn "these people" into "everyone"
+            if before.get(name) and not body.get(name):
+                problems.append("pick at least one customer (to message a whole group, ask for that group instead)")
+        stray = shaping.secret_fields(body)  # a secret the model put in: never
+        if stray:
+            problems.append("secrets cannot go through the chat (" + ", ".join(stray[:3]) + ")")
+        if problems:
+            await self.emit("action_result", {
+                "action_id": action_id, "status": "pending", "ok": False,
+                "detail": "Not run yet. Please fix: " + "; ".join(dict.fromkeys(problems)) + ".",
+            })
+            return False
+        await store.set_action_body(action_id, body)  # stored without the passwords
+        if typed_secrets:
+            self._form_secrets[action_id] = typed_secrets  # this request only, then forgotten
+        return True
+
     async def _run_confirmed(self, action_id: str) -> dict:
         action = await store.claim_action(self.caller, self.conversation["id"], action_id, "running")
         if action is None:
@@ -571,8 +798,10 @@ class Turn:
             return {"action_id": action_id, "outcome": "not run: already decided or expired"}
         await self.emit("step", {"call_id": action_id, "label": action["title"], "phase": "start",
                                  "method": action["method"], "path": action["path"]}, keep=False)
+        typed_secrets = self._form_secrets.pop(action_id, None)
+        body = {**(action.get("body") or {}), **typed_secrets} if typed_secrets else action.get("body")
         result = await executor.call_api(self.app, self.caller, action["method"], action["path"],
-                                         action.get("query"), action.get("body"))
+                                         action.get("query"), body)
         status = "done" if result.ok else "failed"
         detail = "" if result.ok else result.detail()
         await store.finish_action(action_id, status=status, result_status=result.status,
@@ -586,8 +815,10 @@ class Turn:
         out = {"action_id": action_id, "title": action["title"], "method": action["method"],
                "path": action["path"], "http_status": result.status,
                "outcome": "done" if result.ok else "failed"}
+        if isinstance(action.get("body"), dict) and action["body"]:
+            out["sent"] = shaping.mask(action["body"])  # what really ran, form edits included
         if result.ok:
-            out["result"] = shaping.for_model(result.data, limit_chars=6000)
+            out["result"] = localize_times(shaping.for_model(result.data, limit_chars=6000), await self._zone())
         else:
             out["error"] = detail
         return out
@@ -596,7 +827,9 @@ class Turn:
 
     async def _loop(self) -> None:
         system = self.system_blocks()
+        checked_claim = False
         for step in range(max(1, settings.ASSISTANT_MAX_STEPS)):
+            spoke_before, self._streamed = self._spoke, ""
             try:
                 message = await self._model_call(system)
             except Exception as exc:
@@ -605,8 +838,18 @@ class Turn:
                 await self.emit("notice", {"level": "error",
                                            "message": "The assistant could not answer just now. Try again."})
                 return
-            await self._flush_text()
             content = _block_dicts(message)
+            if self._streamed and any(b.get("type") == "tool_use" for b in content):
+                # Words written next to a lookup are the model thinking aloud ("I'll check
+                # the plans"), not the answer, which comes after the last lookup. Take them
+                # back off the screen; keep them only if no answer follows.
+                await self.queue.put({"type": "retract", "chars": len(self._streamed)})
+                self._aside = "".join(self._text_parts).strip() or self._aside
+                self._text_parts, self._spoke = [], spoke_before
+            elif not self._spoke and self._aside and not any(b.get("type") == "tool_use" for b in content):
+                await self._emit_text(self._aside, {})  # nothing else was said: the note is the answer
+                self._aside = ""
+            await self._flush_text()
             self.messages.append({"role": "assistant", "content": content})
             usage = getattr(message, "usage", None)
             if usage is not None:
@@ -624,6 +867,19 @@ class Turn:
             if not tool_uses:
                 if stop == "max_tokens":
                     await self.emit("notice", {"level": "info", "message": "The answer was cut short."})
+                    return
+                # The model said a form or change is ready without proposing one, so the
+                # person would be told to tap Confirm on nothing. Once per turn, send it
+                # back to put the card there (or to take the words back).
+                said = " ".join(b.get("text", "") for b in content if b.get("type") == "text")
+                if not checked_claim and self.proposals == 0 and _CLAIMS_A_CARD.search(said):
+                    checked_claim = True
+                    self.messages.append({"role": "user", "content": [{"type": "text", "text": (
+                        "[Check] You told the person a form or change is ready, but you did not call "
+                        "call_api for it in this answer, so nothing is on their screen. Call "
+                        "describe_action and call_api now (form: true) to put it there, or say "
+                        "plainly that it is not ready yet.")}]})
+                    continue
                 return
             results = []
             for block in tool_uses:
@@ -642,8 +898,10 @@ class Turn:
             state["started"] = True
             if self._spoke:
                 await self.queue.put({"type": "text", "delta": PARAGRAPH_BREAK})
+                self._streamed += PARAGRAPH_BREAK
         self._spoke = True
         self._text_parts.append(delta)
+        self._streamed += delta
         await self.queue.put({"type": "text", "delta": delta})
 
     def _history_for_model(self) -> list:
@@ -651,6 +909,12 @@ class Turn:
         if provider() == "anthropic":
             return merged  # editing Claude's history would break its thinking blocks
         return fit_context(merged, max(8000, settings.ASSISTANT_CONTEXT_TOKENS))
+
+    async def _zone(self) -> Optional[str]:
+        if not self._tz_known:
+            self._tz, _ = await account_state(self.caller)
+            self._tz_known = True
+        return self._tz
 
     async def _model_call(self, system: list[dict]):
         message = await self._model_call_inner(system)
@@ -748,7 +1012,10 @@ class Turn:
         raw_path = str(args.get("path") or "")
         query = args.get("query")
         body = args.get("body")
-        show = args.get("show") if args.get("show") in SHOW_VALUES else "auto"
+        # A lookup is drawn only when the model asks for it; one it makes to work things
+        # out is not. A drawing it names that the page does not know falls back to "auto".
+        requested = args.get("show")
+        show = requested if requested in SHOW_VALUES else ("auto" if requested else "none")
         fields = clean_fields(args.get("fields"))
 
         if query is not None and not isinstance(query, dict):
@@ -794,7 +1061,19 @@ class Turn:
                          f"{action.template} to get its exact fields and allowed values, then send "
                          "this call again.",
             }, True)
+        # Every add or edit is shown as a form the person can correct before Confirm,
+        # whatever the model chose; with form: true it may also leave required fields
+        # for the person to fill in.
+        editable = method in ("POST", "PUT", "PATCH")
+        form = bool(args.get("form")) and editable
+        if form and body is None and action.body_schema is not None:
+            body = {}
         problems = body_problems(action, body)
+        if form:  # the person fills in what is missing
+            problems = [p for p in problems if not p.endswith("is required") and p != "this action needs a JSON body"]
+        fields_for_form = form_fields(action, body) if editable and body is not None else None
+        if fields_for_form:
+            await self._offer_choices(fields_for_form)
         if problems:
             return self._tool_result(tool_use_id, {
                 "error": "Not proposed, fix the request first: " + "; ".join(problems) + ".",
@@ -818,11 +1097,14 @@ class Turn:
             "body": shaping.mask(body), "permission": permission,
             "sensitive": bool(permission and permission in _sensitive()),
             "expires_at": pending["expires_at"], "status": "pending",
+            **({"form": fields_for_form} if fields_for_form else {}),
         })
         return self._tool_result(tool_use_id, {
             "status": "waiting_for_confirmation",
             "action_id": pending["id"],
-            "note": "Not run yet. The person sees a confirm card with this exact request.",
+            "note": ("Not run yet. The person sees this as a form, fills in or corrects the fields, "
+                     "and confirms; the confirmation result tells you the values that ran.")
+                    if fields_for_form else "Not run yet. The person sees a confirm card with this exact request.",
             **({"ignored_query_params": dropped} if dropped else {}),
         })
 
@@ -836,16 +1118,56 @@ class Turn:
                                  "ok": result.ok, "status": result.status}, keep=False)
         if not result.ok:
             return self._tool_result(tool_use_id, {"status": result.status, "error": result.detail()}, True)
+        note = None
         if show != "none":
-            await self.emit("data", {
-                "call_id": call_id, "title": action.title, "method": method, "path": path,
-                "query": query or None, "show": show, **({"fields": fields} if fields else {}),
-                "payload": shaping.for_screen(result.data),
-            })
-        out: dict = {"status": result.status, "data": shaping.for_model(result.data)}
+            # What reaches the screen is the answer, not the search for it: an empty
+            # result is said in words, the same lookup again replaces the first one,
+            # and an answer shows at most MAX_DRAWN results.
+            replaces = self.drawn.get(action.key)
+            if _is_empty(result.data):
+                show, note = "none", "Empty, so not drawn: say so in words."
+            elif replaces is None and len(self.drawn) >= MAX_DRAWN:
+                show, note = "none", (f"Not drawn: {MAX_DRAWN} results are already on screen for this answer. "
+                                      "Draw only what answers the question.")
+            else:
+                self.drawn[action.key] = call_id
+                await self.emit("data", {
+                    "call_id": call_id, "title": action.title, "method": method, "path": path,
+                    "query": query or None, "show": show, **({"fields": fields} if fields else {}),
+                    **({"replaces": replaces} if replaces else {}),
+                    "payload": shaping.for_screen(result.data),
+                })
+        out: dict = {"status": result.status, "data": localize_times(shaping.for_model(result.data), await self._zone())}
+        if note:
+            out["display"] = note
         if dropped:
             out["ignored_query_params"] = dropped
         return self._tool_result(tool_use_id, out)
+
+
+# At most this many results are drawn for one answer.
+MAX_DRAWN = 2
+
+
+def _is_empty(data) -> bool:
+    """A list with nothing in it, bare or as a page ({"data": [], "total": 0})."""
+    if isinstance(data, list):
+        return not data
+    if isinstance(data, dict):
+        lists = [v for v in data.values() if isinstance(v, list)]
+        return bool(lists) and all(not v for v in lists) and not data.get("total")
+    return data is None
+
+
+# Words that tell the person a card is waiting for them ("tap Confirm", "fill it in").
+_CLAIMS_A_CARD = re.compile(
+    r"(tap confirm|bonyeza confirm|fill (it|them|this|the form|in the form)? ?in|form is ready|"
+    r"fomu iko tayari|jaza fomu)", re.I)
+
+# Form fields that pick one of the person's own records, and where to list them from.
+_CHOICE_SOURCES = {"plan_id": "/api/plans", "router_id": "/api/routers"}
+# lists of customers in a form (who gets an SMS): shown by name
+_PEOPLE_SOURCES = {"customer_ids": "/api/customers", "exclude_customer_ids": "/api/customers"}
 
 
 def _sensitive() -> frozenset:

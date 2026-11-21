@@ -1637,6 +1637,7 @@ async def get_customers_api(
 async def get_active_customers(
     router_id: Optional[int] = None,
     tier: Optional[str] = None,
+    expires_within_hours: Annotated[Optional[int], Query(ge=1, le=24 * 366)] = None,
     page: Annotated[Optional[int], Query(ge=1)] = None,
     per_page: Annotated[Optional[int], Query(ge=1, le=CUSTOMER_LIST_MAX_PER_PAGE)] = None,
     db: AsyncSession = Depends(get_db),
@@ -1646,6 +1647,9 @@ async def get_active_customers(
 
     `tier` (optional, default "all") filters by payment history exactly like
     `/api/customers`; each item carries computed `has_paid` and `tier`.
+
+    `expires_within_hours` (optional) keeps only those whose paid time ends within
+    that many hours from now, e.g. 72 for "who runs out in the next 3 days".
 
     With both `page` and `per_page`, returns one page (soonest expiry first)
     as `{data, page, per_page, total, total_pages}`; otherwise the full array.
@@ -1663,6 +1667,8 @@ async def get_active_customers(
         ]
         if router_id is not None:
             conditions.append(Customer.router_id == router_id)
+        if expires_within_hours is not None:
+            conditions.append(Customer.expiry <= now + timedelta(hours=expires_within_hours))
         if tier_filter == "customer":
             conditions.append(has_paid)
         elif tier_filter == "visitor":
