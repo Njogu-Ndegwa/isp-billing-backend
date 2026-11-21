@@ -19,7 +19,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from app.config import settings
-from app.services.assistant import briefing, home, store, usage
+from app.services.assistant import briefing, home, ratings, store, usage
 from app.services.assistant.agent import Turn, assistant_ready, conversation_lock, model_name, provider
 from app.services.assistant.caller import Caller, caller_from_request
 from app.services.assistant.catalog import get_catalog
@@ -101,6 +101,12 @@ class DecideRequest(BaseModel):
 
 class HomeRequest(BaseModel):
     choice: Literal["assistant", "classic", "default"]
+
+
+class RatingRequest(BaseModel):
+    rating: int = Field(..., ge=1, le=5)
+    review: str = Field("", max_length=2000)
+    source: str = Field("", max_length=20)
 
 
 class RolloutRequest(BaseModel):
@@ -194,6 +200,11 @@ async def assistant_status(request: Request):
     except Exception:  # the start-page setting must never break the chat
         logger.exception("[assistant] start-page lookup failed")
         is_home, choice = False, None
+    try:
+        ask_rating = ready and await ratings.should_ask(caller)
+    except Exception:  # nor may the rating ask
+        logger.exception("[assistant] rating ask lookup failed")
+        ask_rating = False
     return {
         "enabled": ready,
         "reason": reason or None,
@@ -204,7 +215,40 @@ async def assistant_status(request: Request):
         "retention_days": settings.ASSISTANT_RETENTION_DAYS,
         "home": is_home,
         "home_choice": choice,
+        "ask_rating": ask_rating,
     }
+
+
+@router.get("/rating")
+async def get_rating(request: Request):
+    """This person's own rating of the assistant, if they gave one."""
+    caller = await _caller(request)
+    return {"rating": await ratings.mine(caller)}
+
+
+@router.post("/rating")
+async def post_rating(payload: RatingRequest, request: Request):
+    """Rate the assistant 1-5 with an optional review; rating again replaces it. Ideas go to /api/feedback/posts."""
+    caller = await _caller(request)
+    if caller.read_only:
+        raise HTTPException(status_code=403, detail="View-as is read-only: changes are disabled.")
+    return {"rating": await ratings.submit(caller, payload.rating, payload.review, payload.source)}
+
+
+@router.post("/rating/shown")
+async def rating_shown(request: Request):
+    """The quiet ask was drawn: it stays away for a few days after this."""
+    await ratings.mark_shown(await _caller(request))
+    return {"ok": True}
+
+
+@router.post("/rating/dismiss")
+async def rating_dismiss(request: Request):
+    """Not now."""
+    caller = await _caller(request)
+    if not caller.read_only:
+        await ratings.dismiss(caller)
+    return {"ok": True}
 
 
 @router.put("/home")
@@ -330,6 +374,13 @@ async def admin_usage(request: Request, days: int = 30):
     """Questions, active accounts and estimated cost: per day, and the busiest accounts."""
     await _admin(request)
     return await usage.report(days=days)
+
+
+@admin_router.get("/ratings")
+async def admin_ratings(request: Request, limit: int = 50):
+    """How the assistant is rated: the average, the spread of stars, and the latest reviews."""
+    await _admin(request)
+    return await ratings.report(limit=limit)
 
 
 @admin_router.get("/rollout")

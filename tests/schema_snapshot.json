@@ -257,6 +257,20 @@
   "updated_at",
   "user_id"
  ],
+ "assistant_ratings": [
+  "created_at",
+  "dismissed_at",
+  "dismissed_count",
+  "id",
+  "rating",
+  "review",
+  "shown_at",
+  "shown_count",
+  "source",
+  "staff_id",
+  "updated_at",
+  "user_id"
+ ],
  "assistant_usage_daily": [
   "cache_read_tokens",
   "cost_usd_micros",

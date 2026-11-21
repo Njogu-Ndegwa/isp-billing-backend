@@ -3549,3 +3549,32 @@ class AssistantHomeChoice(Base):
     staff_id = Column(Integer, nullable=False, default=0, server_default="0")
     choice = Column(String(12), nullable=False)  # "assistant" | "classic"
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class AssistantRating(Base):
+    """What a person thinks of the assistant: 1-5 stars and a review, and when we asked.
+
+    One row per (user_id, staff_id); staff_id 0 means the account owner, as in
+    assistant_usage_daily. ``rating`` is NULL until they rate; the row may exist
+    before that to pace the ask (shown_count / shown_at / dismissed_*), see
+    app/services/assistant/ratings.py. Ideas go to feedback_posts instead.
+
+    Startup migration: run_assistant_migrations() in main.py.
+    """
+    __tablename__ = "assistant_ratings"
+    __table_args__ = (
+        UniqueConstraint("user_id", "staff_id", name="uq_assistant_ratings_owner"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    staff_id = Column(Integer, nullable=False, default=0, server_default="0")
+    rating = Column(Integer, nullable=True)
+    review = Column(String(2000), nullable=True)
+    source = Column(String(20), nullable=True)  # "prompt" | "menu"
+    shown_count = Column(Integer, nullable=False, default=0, server_default="0")
+    shown_at = Column(DateTime, nullable=True)
+    dismissed_count = Column(Integer, nullable=False, default=0, server_default="0")
+    dismissed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)

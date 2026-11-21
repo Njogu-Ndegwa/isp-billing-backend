@@ -1007,7 +1007,13 @@ def test_rollout_buckets_are_fixed_per_account():
 async def test_who_starts_on_the_assistant(client, owner, db, monkeypatch):
     from app.db.models import AppSetting, AssistantHomeChoice
 
+    from app.db.models import SubscriptionStatus
+
     reseller, token = owner
+    reseller.subscription_status = SubscriptionStatus.ACTIVE     # the rollout moves paying accounts only
+    await db.commit()
+    trial = await make_reseller(db, email="trial@example.com")   # a trial account is never moved
+    trial_token = create_access_token(login_token_claims(trial), timedelta(hours=1))
     admin = await make_admin(db, email="rollout-admin@example.com")
     admin_token = create_access_token(login_token_claims(admin), timedelta(hours=1))
     _, staff_token = await _staff_token(db, reseller, ["customers.view"])
@@ -1019,7 +1025,7 @@ async def test_who_starts_on_the_assistant(client, owner, db, monkeypatch):
     # Nobody is moved until an admin says so.
     assert (await status(token))["home"] is False and (await status(token))["home_choice"] is None
     assert (await client.get("/api/admin/assistant/rollout", headers=auth(admin_token))).json() == {
-        "percent": 0, "chose_assistant": 0, "chose_classic": 0}
+        "percent": 0, "chose_assistant": 0, "chose_classic": 0, "paying_accounts": 1, "paying_inside": 0}
     assert (await client.put("/api/admin/assistant/rollout", json={"percent": 50},
                              headers=auth(token))).status_code == 403
     assert (await client.put("/api/admin/assistant/rollout", json={"percent": 101},
@@ -1032,6 +1038,7 @@ async def test_who_starts_on_the_assistant(client, owner, db, monkeypatch):
     assert (await status(token))["home"] is True              # the account...
     assert (await status(staff_token))["home"] is True        # ...and its staff, together
     assert (await status(admin_token))["home"] is False       # a platform admin is never moved
+    assert (await status(trial_token))["home"] is False       # nor an account that does not pay
 
     # A person's own choice wins, and is theirs alone.
     r = await client.put("/api/assistant/home", json={"choice": "classic"}, headers=auth(token))
@@ -1052,7 +1059,7 @@ async def test_who_starts_on_the_assistant(client, owner, db, monkeypatch):
     assert (await client.put("/api/assistant/home", json={"choice": "nope"},
                              headers=auth(token))).status_code == 422
     report = (await client.get("/api/admin/assistant/rollout", headers=auth(admin_token))).json()
-    assert report == {"percent": 0, "chose_assistant": 2, "chose_classic": 0}
+    assert report == {"percent": 0, "chose_assistant": 2, "chose_classic": 0, "paying_accounts": 1, "paying_inside": 0}
     # The staff member's choice is not an activity-log entry.
     logs = (await db.execute(select(StaffActivityLog))).scalars().all()
     assert not any("/api/assistant/home" in (entry.path or "") for entry in logs)
@@ -1632,3 +1639,62 @@ def test_a_bars_hint_keeps_the_one_asked_about():
 
     assert clean_fields({"label": "name", "value": ["total_mb"], "highlight": " Guest 1766 "})["highlight"] == "Guest 1766"
     assert "highlight" not in clean_fields({"label": "name", "highlight": "x" * 500})
+
+
+@pytest.mark.asyncio
+async def test_the_rating_ask_is_quiet_and_rare(client, owner, db, monkeypatch):
+    from datetime import date, datetime
+    from app.db.models import AssistantRating, AssistantUsageDaily
+    from app.services.assistant import ratings as ratings_mod
+
+    reseller, token = owner
+    reseller_id = reseller.id
+    admin = await make_admin(db, email="ratings-admin@example.com")
+    admin_token = create_access_token(login_token_claims(admin), timedelta(hours=1))
+
+    async def asks(tok=token):
+        return (await client.get("/api/assistant/status", headers=auth(tok))).json()["ask_rating"]
+
+    # Not before they have really used it.
+    assert await asks() is False
+    db.add(AssistantUsageDaily(day=date.today(), user_id=reseller_id, staff_id=0, questions=ratings_mod.MIN_QUESTIONS))
+    await db.commit()
+    assert await asks() is True
+    assert await asks(admin_token) is False                     # never platform admins
+
+    # Once it has been on screen it stays away for the gap, however often the page loads.
+    assert (await client.post("/api/assistant/rating/shown", headers=auth(token))).status_code == 200
+    await client.post("/api/assistant/rating/shown", headers=auth(token))
+    assert await asks() is False
+    db.expire_all()
+    row = (await db.execute(select(AssistantRating).where(AssistantRating.user_id == reseller_id))).scalar_one()
+    assert row.shown_count == 1 and row.rating is None
+
+    # After the gap it may come back, and after MAX_SHOWS it never does.
+    row.shown_at = datetime.utcnow() - timedelta(days=ratings_mod.GAP_DAYS + 1)
+    await db.commit()
+    assert await asks() is True
+    await client.post("/api/assistant/rating/dismiss", headers=auth(token))   # not now: also a gap
+    assert await asks() is False
+    db.expire_all()
+    row = (await db.execute(select(AssistantRating).where(AssistantRating.user_id == reseller_id))).scalar_one()
+    row.shown_count, row.shown_at, row.dismissed_at = ratings_mod.MAX_SHOWS, None, None
+    await db.commit()
+    assert await asks() is False
+
+    # Rating is always possible (from the menu), replaces the earlier one, and ends the asking.
+    r = await client.post("/api/assistant/rating", json={"rating": 4, "review": "  Fast, but the charts need work  ", "source": "menu"}, headers=auth(token))
+    assert r.status_code == 200 and r.json()["rating"]["rating"] == 4
+    assert r.json()["rating"]["review"] == "Fast, but the charts need work"
+    r = await client.post("/api/assistant/rating", json={"rating": 5}, headers=auth(token))
+    assert r.json()["rating"] == {"rating": 5, "review": "", "updated_at": r.json()["rating"]["updated_at"]}
+    assert (await client.get("/api/assistant/rating", headers=auth(token))).json()["rating"]["rating"] == 5
+    assert (await client.post("/api/assistant/rating", json={"rating": 6}, headers=auth(token))).status_code == 422
+    assert await asks() is False
+
+    # Bitwave sees the average, the spread and the reviews, with whose they are; resellers cannot.
+    assert (await client.get("/api/admin/assistant/ratings", headers=auth(token))).status_code == 403
+    report = (await client.get("/api/admin/assistant/ratings", headers=auth(admin_token))).json()
+    assert report["count"] == 1 and report["average"] == 5
+    assert report["distribution"] == {"1": 0, "2": 0, "3": 0, "4": 0, "5": 1}
+    assert report["reviews"][0]["account"] == "Kwetu WiFi" and report["reviews"][0]["questions"] == ratings_mod.MIN_QUESTIONS
