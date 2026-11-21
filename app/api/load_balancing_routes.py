@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,7 +53,13 @@ class LBPreflightRequest(BaseModel):
 
 
 class LBEnableRequest(BaseModel):
-    wan_ports: List[str]
+    # In the assistant's form: the router's own ethernet ports, picked in order (WAN 1 first);
+    # ports that serve customers are not offered. Confirm runs the preflight first (x-preview).
+    wan_ports: List[str] = Field(..., description="ether1 first (WAN 1), then each extra internet line in order",
+                                 json_schema_extra={"x-options-from": {
+                                     "path": "/api/routers/{router_id}/interfaces", "list": "interfaces",
+                                     "value": "name", "where": {"type": "ether"}, "off": "running",
+                                     "exclude_in": ["pppoe_ports", "plain_ports", "dual_ports"], "ordered": True}})
     confirm: bool = False
 
 
@@ -384,7 +390,8 @@ async def preflight_load_balancing(
     }
 
 
-@router.post("/api/routers/{router_id}/load-balancing/enable")
+@router.post("/api/routers/{router_id}/load-balancing/enable",
+             openapi_extra={"x-preview": "/api/routers/{router_id}/load-balancing/preflight"})
 async def enable_load_balancing(
     router_id: int,
     request: LBEnableRequest,

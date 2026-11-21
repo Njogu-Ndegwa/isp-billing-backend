@@ -74,7 +74,7 @@ async def preview_outage(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/outage")
+@router.post("/outage", openapi_extra={"x-preview": "/api/compensation/outage/preview"})
 async def apply_outage(
     request: OutageApplyRequest,
     db: AsyncSession = Depends(get_db),

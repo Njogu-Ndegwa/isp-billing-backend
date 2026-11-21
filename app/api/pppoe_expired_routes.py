@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import ConfigDict, BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -63,6 +63,9 @@ PAY_DUP_GUARD_SECONDS = 180
 
 
 class ExpiredRedirectToggle(BaseModel):
+    # the assistant's form shows the switch as it is now, read from the router's own record
+    model_config = ConfigDict(json_schema_extra={"x-current": {"fields": {"enabled": "pppoe_expired_redirect"}}})
+
     enabled: bool
 
 

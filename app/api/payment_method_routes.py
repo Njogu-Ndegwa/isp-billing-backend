@@ -58,6 +58,15 @@ _BY_TYPE_EDIT = {"x-fields-for": {"method_type": FIELDS_BY_TYPE}}
 _BY_TYPE_ADD = {**_BY_TYPE_EDIT, "x-required-for": {"method_type": REQUIRED_BY_TYPE}}
 
 
+# The MTN MoMo target environments and Fapshi environments, as the classic payment-method page offers them.
+_MTN_ENVIRONMENT = {"x-enum-labels": {
+    "sandbox": "Sandbox (testing)", "mtnuganda": "MTN Uganda", "mtnghana": "MTN Ghana", "mtncongo": "MTN Congo",
+    "mtnivorycoast": "MTN Ivory Coast", "mtncameroon": "MTN Cameroon", "mtnbenin": "MTN Benin",
+    "mtnswaziland": "MTN eSwatini", "mtnguineaconakry": "MTN Guinea", "mtnzambia": "MTN Zambia",
+    "mtnliberia": "MTN Liberia", "mtnsouthafrica": "MTN South Africa"}}
+_FAPSHI_ENVIRONMENT = {"x-enum-labels": {"sandbox": "Sandbox (testing)", "live": "Live"}}
+
+
 class PaymentMethodCreate(BaseModel):
     model_config = ConfigDict(json_schema_extra=_BY_TYPE_ADD)
 
@@ -94,14 +103,14 @@ class PaymentMethodCreate(BaseModel):
     mtn_api_user: Optional[str] = None
     mtn_api_key: Optional[str] = None
     mtn_subscription_key: Optional[str] = None
-    mtn_target_environment: Optional[str] = None  # sandbox | mtnuganda | mtnghana | ...
+    mtn_target_environment: Optional[str] = Field(None, json_schema_extra=_MTN_ENVIRONMENT)
     mtn_base_url: Optional[str] = None
     mtn_currency: Optional[str] = None  # EUR (sandbox) | UGX | GHS | ...
 
     # Fapshi (Cameroon)
     fapshi_api_user: Optional[str] = None
     fapshi_api_key: Optional[str] = None
-    fapshi_environment: Optional[str] = "sandbox"  # sandbox | live
+    fapshi_environment: Optional[str] = Field("sandbox", json_schema_extra=_FAPSHI_ENVIRONMENT)
 
 
 class PaymentMethodUpdate(BaseModel):
@@ -124,13 +133,13 @@ class PaymentMethodUpdate(BaseModel):
     mtn_api_user: Optional[str] = None
     mtn_api_key: Optional[str] = None
     mtn_subscription_key: Optional[str] = None
-    mtn_target_environment: Optional[str] = None
+    mtn_target_environment: Optional[str] = Field(None, json_schema_extra=_MTN_ENVIRONMENT)
     mtn_base_url: Optional[str] = None
     mtn_currency: Optional[str] = None
 
     fapshi_api_user: Optional[str] = None
     fapshi_api_key: Optional[str] = None
-    fapshi_environment: Optional[str] = None
+    fapshi_environment: Optional[str] = Field(None, json_schema_extra=_FAPSHI_ENVIRONMENT)
 
 
 class AssignPaymentMethodRequest(BaseModel):

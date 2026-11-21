@@ -515,7 +515,7 @@ class SendRequest(BaseModel):
     model_config = ConfigDict(json_schema_extra={"x-fields-for": {"filter": {"by_plan": ["plan_id"]}},
                                                  "x-required-for": {"filter": {"by_plan": ["plan_id"]}}})
 
-    body: str = Field(..., min_length=1, max_length=1000)
+    body: str = Field(..., min_length=1, max_length=1000, json_schema_extra={"x-sms": True})
     # who gets it when no customer is picked: everyone, active, time ending within 7 days, one plan
     filter: Literal["all", "active", "expiring", "by_plan"] = "all"
     plan_id: Optional[int] = None
@@ -594,7 +594,7 @@ async def send_messages(req: SendRequest, background: BackgroundTasks,
 
 class TemplateIn(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
-    body: str = Field(..., min_length=1, max_length=1000)
+    body: str = Field(..., min_length=1, max_length=1000, json_schema_extra={"x-sms": True})
 
 
 @router.get("/api/messaging/templates")

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -36,6 +37,12 @@ READ_ONLY_POSTS = frozenset({
 
 # Request flags that make a write a dry run, when the action declares them.
 DRY_RUN_FLAGS = ("dry_run", "preview", "preview_only")
+# The opposite: a flag that makes a preview the real thing (apply=false only shows what would happen).
+APPLY_FLAGS = ("apply",)
+# Flags that push past the API's own refusal ("record another payment anyway", "delete it with its
+# customers"). Never a form input and never set by the model: when the API refuses, the person
+# sees why and taps "Do it anyway", which sends the same request again with the flag.
+OVERRIDE_FLAGS = ("force", "allow_duplicate")
 
 EXCLUDED_PREFIXES = (
     "/api/assistant",          # no recursion
@@ -68,6 +75,9 @@ class Action:
     # a payment the route only starts (an M-Pesa prompt): where to read whether it was paid,
     # a path template filled from the route's own reply (x-payment-status)
     payment_status: Optional[str] = None
+    overrides: tuple = ()        # declared OVERRIDE_FLAGS (query or body)
+    apply_flag: Optional[str] = None  # a declared APPLY_FLAG: without it the request is a preview
+    preview: Optional[str] = None     # a separate read that previews this change (x-preview)
 
     @property
     def key(self) -> str:
@@ -85,7 +95,18 @@ class Action:
             for source in (query, body):
                 if isinstance(source, dict) and _truthy(source.get(flag)):
                     return True
+        if self.apply_flag and not any(isinstance(s, dict) and _truthy(s.get(self.apply_flag))
+                                       for s in (query, body)):
+            return True  # apply=false: only shows what would happen
         return False
+
+    @property
+    def previews(self) -> bool:
+        """Whether the person can see what this change would do before it is done."""
+        return bool(self.preview or self.flags or self.apply_flag)
+
+    def in_query(self, name: str) -> bool:
+        return any(q["name"] == name for q in self.query_params)
 
     @property
     def admin_only(self) -> bool:
@@ -241,11 +262,14 @@ class Catalog:
                         path_params.append(entry)
                     elif p.get("in") == "query":
                         query_params.append(entry)
-                flags = tuple(
-                    f for f in DRY_RUN_FLAGS
-                    if any(q["name"] == f for q in query_params)
-                    or (isinstance(body_schema, dict) and f in (body_schema.get("properties") or {}))
-                )
+                def declared(names):
+                    return tuple(
+                        f for f in names
+                        if any(q["name"] == f for q in query_params)
+                        or (isinstance(body_schema, dict) and f in (body_schema.get("properties") or {}))
+                    )
+                flags = declared(DRY_RUN_FLAGS)
+                apply_flags = declared(APPLY_FLAGS)
                 rule, _ = perms.match_rule(method.upper(), template)
                 actions.append(Action(
                     method=method.upper(),
@@ -262,6 +286,9 @@ class Catalog:
                     staff_rule=rule,
                     flags=flags,
                     payment_status=op.get("x-payment-status") if isinstance(op.get("x-payment-status"), str) else None,
+                    overrides=declared(OVERRIDE_FLAGS),
+                    apply_flag=apply_flags[0] if apply_flags and method != "get" else None,
+                    preview=op.get("x-preview") if isinstance(op.get("x-preview"), str) else None,
                 ))
         return cls(actions)
 
@@ -272,7 +299,7 @@ class Catalog:
 
         The guards (and the handlers) still decide every real call.
         """
-        if caller.read_only and not action.always_reads and not action.flags:
+        if caller.read_only and not action.always_reads and not action.flags and not action.apply_flag:
             return False
         if caller.role == "admin" and caller.viewer_sid is None:
             return True
@@ -346,6 +373,13 @@ class Catalog:
             out["body_required"] = action.body_required
         if action.flags:
             out["dry_run_flags"] = list(action.flags)
+        if action.apply_flag:
+            out["apply_flag"] = (f"{action.apply_flag}=false only previews (runs now); propose it with "
+                                 f"{action.apply_flag}=true: the person sees the preview before it is done")
+        if action.overrides:
+            out["set_only_by_the_person"] = (
+                f"{', '.join(action.overrides)}: leave out. If the API refuses (a duplicate, a conflict), "
+                "the person is shown why and can tap Do it anyway")
         return out
 
 
@@ -410,7 +444,8 @@ def body_problems(action: Action, body) -> list[str]:
         prop = props.get(key)
         if not isinstance(prop, dict) or value is None:
             continue
-        allowed = prop.get("enum") or (known.get(key) if isinstance(value, str) else None)
+        named = list(prop["x-enum-labels"]) if isinstance(prop.get("x-enum-labels"), dict) else None
+        allowed = prop.get("enum") or (known.get(key) or named if isinstance(value, str) else None)
         if allowed and isinstance(value, str) and value.lower() not in {str(a).lower() for a in allowed}:
             problems.append(f"'{key}' must be one of {', '.join(map(str, allowed))} (got '{value}')")
     if props and not schema.get("additionalProperties"):
@@ -430,11 +465,175 @@ def body_problems(action: Action, body) -> list[str]:
 # the chat. A list of simple values (ports, minutes, permissions) is one input;
 # nested objects are left as the assistant set them.
 
-FORM_FIELD_LIMIT = 20
-# An action's own safety switches ("confirm": true on a reboot) are not questions for the person.
-_FORM_HIDDEN = frozenset({"confirm", "confirmed", "dry_run", "dryrun", "preview"})
+FORM_FIELD_LIMIT = 20  # a schema may allow more with "x-form-limit" (an ad has many short fields)
+# An action's own safety switches ("confirm": true on a reboot) are not questions for the person,
+# nor are the flags only "Do it anyway" sets, apply (the preview comes first) or a request's
+# idempotency key (made by the server for each proposal).
+_FORM_HIDDEN = frozenset({"confirm", "confirmed", "dry_run", "dryrun", "preview", "apply",
+                          "force", "force_rotate", "allow_duplicate", "idempotency_key"})
 _FORM_KINDS = {"integer": "integer", "number": "number", "boolean": "boolean"}
 
+# -- picking one of the person's own records ------------------------------------
+#
+# An id field is a picker of the person's own records, listed by name. The API says
+# where they come from with "x-pick" on the property:
+#
+#     "x-pick": {"from": "/api/customers", "search": "search",
+#                "query": {"page": 1, "per_page": 50}, "label": "{name} · {phone}"}
+#
+# search: the list's own filter, so a phone can find one customer among thousands;
+# query: what the first page is read with; label: how a row reads, each " · " part shown
+# when its values are there. Fields named like these pick from the same lists unless the
+# schema says otherwise ("x-pick": false); an admin route works on another account's
+# records, so it picks only where its schema says.
+_CUSTOMERS = {"from": "/api/customers", "search": "search", "query": {"page": 1, "per_page": 50},
+              "label": "{name} · {phone}"}
+_ROUTERS = {"from": "/api/routers"}
+PICK_DEFAULTS: dict[str, dict] = {
+    "plan_id": {"from": "/api/plans"},
+    "router_id": _ROUTERS,
+    "target_router_id": _ROUTERS,
+    "router_ids": _ROUTERS,
+    "customer_id": _CUSTOMERS,
+    "customer_ids": _CUSTOMERS,
+    "exclude_customer_ids": _CUSTOMERS,
+    "payment_method_id": {"from": "/api/payment-methods", "label": "{label} · {method_type}"},
+    "invoice_id": {"from": "/api/subscription/invoices", "query": {"page": 1, "per_page": 24},
+                   "label": "{period_label} · {currency} {balance_remaining} · {status}"},
+    "template_id": {"from": "/api/messaging/templates"},
+    "advertiser_id": {"from": "/api/advertisers", "label": "{name} · {business_name}"},
+}
+_PICK_KEYS = ("from", "search", "query", "label")
+
+
+def pick_spec(action: "Action", key: str, prop: Any) -> Optional[dict]:
+    spec = prop.get("x-pick") if isinstance(prop, dict) else None
+    if spec is False:
+        return None
+    if isinstance(spec, dict) and isinstance(spec.get("from"), str):
+        return {k: spec[k] for k in _PICK_KEYS if k in spec}
+    if action.template.startswith("/api/admin/"):
+        return None
+    found = PICK_DEFAULTS.get(key)
+    return dict(found) if found else None
+
+
+_PLACEHOLDER = re.compile(r"\{(\w+)\}")
+
+
+def _plain(value: Any) -> str:
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{value:,}"
+    return str(value)
+
+
+def pick_label(row: dict, template: Optional[str] = None) -> str:
+    """How one record reads in a picker: "Amina · 0712 000 001", or its name."""
+    if template:
+        parts = []
+        for piece in template.split(" · "):
+            names = _PLACEHOLDER.findall(piece)
+            if names and all(row.get(n) not in (None, "") for n in names):
+                parts.append(_PLACEHOLDER.sub(lambda m: _plain(row[m.group(1)]), piece))
+        if parts:
+            return " · ".join(parts)[:80]
+    name = row.get("name") or row.get("identity") or row.get("label")
+    return str(name)[:80] if name not in (None, "") else f"#{row.get('id')}"
+
+
+# -- moments on the person's own clock ----------------------------------------
+#
+# The API speaks UTC; a phone's date-and-time input has no zone and the person types
+# their own clock. A form shows a moment as their local time (EAT for Kenya) and sends
+# what they typed back as UTC, so 14:00 typed in Nairobi is 11:00Z, not 14:00Z.
+
+def _moment(value: Any) -> Optional[datetime]:
+    """A moment as naive UTC (how the API stores it); a moment without a zone is UTC."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        when = datetime.fromisoformat(value.strip().replace("Z", "+00:00").replace(" ", "T"))
+    except ValueError:
+        return None
+    if when.tzinfo is not None:
+        when = when.astimezone(timezone.utc).replace(tzinfo=None)
+    return when
+
+
+def local_input(value: Any, tz: Optional[str]) -> Optional[str]:
+    """A moment for a date-and-time input on the person's clock: "2026-11-21T14:00"."""
+    from app.services.subscription_reminders import to_local
+
+    when = _moment(value)
+    return to_local(when, tz).strftime("%Y-%m-%dT%H:%M") if when is not None else None
+
+
+def utc_from_local(raw: Any, tz: Optional[str]) -> str:
+    """What the person typed (their own clock, or a time with its zone) as UTC; ValueError if not a time."""
+    from app.services.subscription_reminders import _zone as zone_info
+
+    when = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00").replace(" ", "T"))
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=zone_info(tz))
+    return when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def zone_label(tz: Optional[str]) -> str:
+    from app.services.subscription_reminders import zone_abbreviation
+
+    return zone_abbreviation(tz, datetime.utcnow())
+
+
+# -- inputs shaped for what they hold ------------------------------------------
+
+_MAC = re.compile(r"^[0-9A-Fa-f]{2}([-:.]?[0-9A-Fa-f]{2}){5}$")
+
+
+def _format_of(key: str, prop: dict) -> Optional[str]:
+    """A MAC, an IP or a phone number: the page shows the right keyboard and example."""
+    named = prop.get("x-format")
+    if isinstance(named, str):
+        return named
+    if key.endswith("mac") or key.endswith("mac_address"):
+        return "mac"
+    if key in ("ip", "ip_address", "static_ip", "backup_ip") or key.endswith("_ip"):
+        return "ip"
+    if key == "phone" or key.endswith(("_phone", "phone_number", "whatsapp", "whatsapp_number")) or key == "msisdn":
+        return "phone"
+    return None
+
+
+def normal_mac(raw: str) -> str:
+    """"aabbccddeeff", "AA-BB-CC-DD-EE-FF" -> "AA:BB:CC:DD:EE:FF"; ValueError if not a MAC."""
+    text = raw.strip()
+    if not _MAC.fullmatch(text):
+        raise ValueError
+    digits = re.sub(r"[^0-9A-Fa-f]", "", text).upper()
+    return ":".join(digits[i:i + 2] for i in range(0, 12, 2))
+
+
+# -- clearing a field on an edit -----------------------------------------------
+#
+# An emptied optional field on an edit means "clear it", not "keep the old value". How
+# an endpoint is told to clear differs: most take null; some take "" (the customer's
+# profile fields). A schema says so with "x-clear" on the property, or on the model as
+# {"field": value} with "*" for every field.
+_KEEP = object()
+
+
+def _cleared(schema: dict, key: str, prop: Any, f: dict) -> Any:
+    if f.get("required") or f["kind"] == "boolean" or f.get("default") or f.get("value") in (None, "", []):
+        return _KEEP  # nothing there to clear, or nothing to clear it with
+    if isinstance(prop, dict) and "x-clear" in prop:
+        return prop["x-clear"]
+    spec = schema.get("x-clear")
+    if isinstance(spec, dict) and (key in spec or "*" in spec):
+        return spec.get(key, spec.get("*"))
+    if isinstance(prop, dict) and prop.get("nullable"):
+        return None
+    return _KEEP
 
 def _field_label(key: str) -> str:
     words = key.replace("_", " ").strip()
@@ -533,10 +732,12 @@ def drop_unchosen(schema: Any, body: dict, context: Optional[dict] = None) -> di
     return out
 
 
-def form_fields(action: Action, body: Any, context: Optional[dict] = None) -> Optional[list[dict]]:
+def form_fields(action: Action, body: Any, context: Optional[dict] = None,
+                tz: Optional[str] = None) -> Optional[list[dict]]:
     """The editable fields of a change, in the order a person fills them: required first.
 
     context: the record being edited, when known, for fields that depend on its kind.
+    tz: the person's time zone; a moment is shown on their own clock.
     """
     from app.services.assistant.shaping import is_secret_key
 
@@ -548,12 +749,15 @@ def form_fields(action: Action, body: Any, context: Optional[dict] = None) -> Op
     known = enum_values()
     current = body if isinstance(body, dict) else {}
     out: list[dict] = []
-    hidden = _FORM_HIDDEN | set(action.flags)  # safety switches stay as set, never shown as inputs
+    # safety switches stay as set, never shown as inputs
+    hidden = _FORM_HIDDEN | set(action.flags) | set(action.overrides) | {action.apply_flag}
     for key, prop in props.items():
         if not isinstance(prop, dict) or prop.get("readOnly") or key in hidden:
             continue
         typ = prop.get("type")
-        options = prop.get("enum") or known.get(key)
+        named = prop.get("x-enum-labels") if isinstance(prop.get("x-enum-labels"), dict) else None
+        # a field typed as plain text whose values the schema names ("x-enum-labels") is a choice of those
+        options = prop.get("enum") or known.get(key) or (list(named) if named and typ in (None, "string") else None)
         item_kind = None
         if is_secret_key(key):
             if typ not in (None, "string"):
@@ -576,6 +780,12 @@ def form_fields(action: Action, body: Any, context: Optional[dict] = None) -> Op
             f["item_kind"] = item_kind
         if options:
             f["options"] = [str(o) for o in options]
+            if kind == "select" and (typ == "integer" or all(isinstance(o, int) and not isinstance(o, bool) for o in options)):
+                f["value_kind"] = "integer"  # 5, 10, 15 minutes: sent as a number, not "10"
+            labels = prop.get("x-enum-labels") or (prop.get("items") or {}).get("x-enum-labels")
+            if isinstance(labels, dict):
+                # people see words, the API gets its codes ("Shown everywhere" for "global")
+                f["option_labels"] = {str(k): str(v) for k, v in labels.items() if str(k) in f["options"]}
         if isinstance(prop.get("description"), str) and prop["description"].strip():
             f["hint"] = prop["description"].strip()[:160]
         for bound in ("minimum", "maximum", "maxLength"):
@@ -594,6 +804,29 @@ def form_fields(action: Action, body: Any, context: Optional[dict] = None) -> Op
             f["admin_only"] = True
         if isinstance(prop.get("x-pick-where"), dict):
             f["pick_where"] = prop["x-pick-where"]  # only records that fit (vouchers: hotspot plans)
+        if kind in ("integer", "text", "list") and not options:
+            pick = pick_spec(action, key, prop)
+            if pick:
+                f["pick"] = pick  # filled with the person's own records before the card is shown
+        live = prop.get("x-options-from") or (prop.get("items") or {}).get("x-options-from")
+        if isinstance(live, dict) and isinstance(live.get("path"), str):
+            # read from the live thing when the card is made (a router's own ports, each with its mode)
+            f["options_from"] = dict(live)
+            if live.get("ordered"):
+                f["ordered"] = True  # the order picked is the order sent (WAN 1, WAN 2...)
+            changes = live.get("changes")
+            if isinstance(changes, list) and len(changes) == 2:
+                f["changes"] = {"add": str(changes[0]), "remove": str(changes[1])}
+        if kind == "text":
+            shape = _format_of(key, prop)
+            if shape:
+                f["format"] = shape
+            if prop.get("x-sms"):
+                f["sms"] = True  # long text with its SMS count while it is typed
+            if prop.get("x-sms") or prop.get("x-multiline") or (prop.get("maxLength") or 0) >= 300:
+                f["multiline"] = True
+        if kind == "datetime":
+            f["zone"] = zone_label(tz)  # the person's own clock ("EAT")
         if kind == "password":
             pass  # never sent back to the page, never pre-filled
         elif current.get(key) is not None:
@@ -603,6 +836,10 @@ def form_fields(action: Action, body: Any, context: Optional[dict] = None) -> Op
         elif prop.get("default") is not None:
             f["value"] = prop["default"]
             f["default"] = True  # the API's own default, not something the person or assistant chose
+        if kind == "datetime" and f.get("value") is not None:
+            shown = local_input(f["value"], tz)
+            if shown:
+                f["value"] = shown
         out.append(f)
     out = _fit_to_choices(schema, out, current, context)
     out.sort(key=lambda f: not f["required"])  # stable: required first, schema order within
@@ -610,11 +847,12 @@ def form_fields(action: Action, body: Any, context: Optional[dict] = None) -> Op
     # a choice that other fields hang on (photo or video) is never the one left out
     deciding = {c.split(".", 1)[0] for c in choice_groups(schema)}
     out.sort(key=lambda f: (not f["required"], f["name"] not in deciding, bool(f.get("admin_only"))))
+    limit = schema.get("x-form-limit") if isinstance(schema.get("x-form-limit"), int) else FORM_FIELD_LIMIT
     shown, kept = 0, []
     for f in out:
         if "when" not in f:
             shown += 1
-            if shown > FORM_FIELD_LIMIT and f["name"] not in deciding:
+            if shown > limit and f["name"] not in deciding:
                 continue
         kept.append(f)
     return kept or None
@@ -639,15 +877,19 @@ def _one_value(kind: str, raw: Any, options: list) -> Any:
 
 
 def apply_form_values(action: Action, base: Any, values: dict,
-                      context: Optional[dict] = None) -> tuple[dict, dict, list[str]]:
+                      context: Optional[dict] = None, tz: Optional[str] = None) -> tuple[dict, dict, list[str]]:
     """Merge what the person typed into the proposed body, typed by the schema.
 
-    Only the form's own fields are taken (nothing the form did not offer); an emptied
-    optional field is left out. Passwords come back on their own, to be sent with the
+    Only the form's own fields are taken (nothing the form did not offer). An emptied
+    optional field is left out, or on an edit cleared (see x-clear). A moment typed on the
+    person's clock is sent as UTC. Passwords come back on their own, to be sent with the
     request and then forgotten. Returns (body, secrets, problems), e.g. a problem
     "'price' must be a number".
     """
-    fields = {f["name"]: f for f in (form_fields(action, base, context) or [])}
+    fields = {f["name"]: f for f in (form_fields(action, base, context, tz) or [])}
+    schema = action.body_schema if isinstance(action.body_schema, dict) else {}
+    props = schema.get("properties") or {}
+    editing = action.method in ("PUT", "PATCH")
     body = dict(base) if isinstance(base, dict) else {}
     secrets: dict = {}
     problems: list[str] = []
@@ -660,8 +902,25 @@ def apply_form_values(action: Action, base: Any, values: dict,
             if isinstance(raw, str) and raw:
                 secrets[key] = raw[:500]
             continue
-        if raw is None or (isinstance(raw, str) and not raw.strip()) or raw == []:
+        if f.get("changes") and isinstance(raw, dict):
+            # a set changed by what was ticked and unticked ("add ether3"), never re-sent whole:
+            # the router's other ports stay as they are
+            add, remove = f["changes"]["add"], f["changes"]["remove"]
+            try:
+                for name, items in ((add, raw.get("add")), (remove, raw.get("remove"))):
+                    items = [i for i in (items if isinstance(items, list) else []) if str(i).strip()]
+                    body[name] = [_one_value(f.get("item_kind", "text"), i, []) for i in items][:100]
+            except (TypeError, ValueError):
+                problems.append(f"'{key}' must be a list of values")
+                continue
             body.pop(key, None)
+            continue
+        if raw is None or (isinstance(raw, str) and not raw.strip()) or raw == []:
+            cleared = _cleared(schema, key, props.get(key), f) if editing else _KEEP
+            if cleared is _KEEP:
+                body.pop(key, None)
+            else:
+                body[key] = cleared  # emptied on an edit: cleared, not left as it was
             continue
         if kind == "list":
             items = raw if isinstance(raw, list) else [p for p in str(raw).replace("\n", ",").split(",")]
@@ -673,7 +932,7 @@ def apply_form_values(action: Action, base: Any, values: dict,
                 problems.append(f"'{key}' must be {what}, separated by commas")
             continue
         if kind == "select" and f.get("value_kind") == "integer":
-            kind = "integer"  # a picker of records: the id is a number
+            kind = "integer"  # a picker of records, or a choice of numbers: the value is a number
         try:
             if kind == "integer":
                 value: Any = int(float(str(raw).replace(",", "").strip()))
@@ -690,10 +949,19 @@ def apply_form_values(action: Action, base: Any, values: dict,
                 if match is None:
                     raise ValueError
                 value = match
+            elif kind == "datetime":
+                value = utc_from_local(raw, tz)
+            elif f.get("format") == "mac":
+                value = normal_mac(str(raw))
+            elif f.get("format") == "phone":
+                value = re.sub(r"[\s().-]", "", str(raw))[:20]  # "0712 345 678" -> "0712345678"; the API normalises the rest
             else:
                 value = str(raw).strip()[:2000]
         except (TypeError, ValueError):
-            what = {"integer": "a whole number", "number": "a number", "select": "one of " + ", ".join(f.get("options", []))}
+            what = {"integer": "a whole number", "number": "a number", "datetime": "a date and time",
+                    "select": "one of " + ", ".join(f.get("options", []))}
+            if f.get("format") == "mac":
+                what["text"] = "a MAC address like AA:BB:CC:DD:EE:FF"
             problems.append(f"'{key}' must be {what.get(kind, 'valid')}")
             continue
         if kind in ("integer", "number"):
@@ -707,7 +975,7 @@ def apply_form_values(action: Action, base: Any, values: dict,
     # a field of a kind that was not chosen (typed, then the kind switched) is not sent
     body = drop_unchosen(action.body_schema, body, context)
     secrets = {k: v for k, v in secrets.items() if k in drop_unchosen(action.body_schema, {**body, k: v}, context)}
-    for f in form_fields(action, body, context) or []:
+    for f in form_fields(action, body, context, tz) or []:
         # the chosen kind's own required fields, which the schema alone cannot require
         when = f.get("when") or {}
         if f.get("required") and when and f["kind"] != "password" and body.get(f["name"]) in (None, ""):

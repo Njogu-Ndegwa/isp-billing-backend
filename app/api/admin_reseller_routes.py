@@ -1513,7 +1513,9 @@ async def admin_dashboard(
 # ---------------------------------------------------------------------------
 class PayoutRequest(BaseModel):
     amount: float
-    payment_method: str
+    # what the payouts page records (not the customer-payment enum of the same name)
+    payment_method: str = Field(..., json_schema_extra={"enum": ["mpesa", "bank", "cash"], "x-enum-labels": {
+        "mpesa": "M-Pesa", "bank": "Bank transfer", "cash": "Cash"}})
     reference: Optional[str] = None
     notes: Optional[str] = None
     period_start: Optional[str] = None

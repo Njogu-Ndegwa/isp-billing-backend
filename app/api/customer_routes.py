@@ -293,9 +293,14 @@ router = APIRouter(tags=["customers"])
 # so a form shows only the fields of the plan chosen.
 _CUSTOMER_FIELDS_FOR = {"x-fields-for": {"plan_id.connection_type": {
     "hotspot": ["mac_address"],
-    "pppoe": ["pppoe_username", "pppoe_password", "activate_paid_until"],
+    # a PPPoE customer may have a fixed address too (its remote address), as on the classic page
+    "pppoe": ["pppoe_username", "pppoe_password", "activate_paid_until", "static_ip"],
     "static_ip": ["static_ip", "static_mac"],
 }}}
+# On an edit "" clears a profile field (None keeps it): what an emptied form field sends.
+_CUSTOMER_CLEAR = {"x-clear": {k: "" for k in (
+    "national_id", "email", "alt_phone", "address_line", "building", "installation_date", "notes", "static_mac")}}
+_INSTALL_DATE = {"format": "date"}  # "2026-11-11": a date picker in the assistant's form
 
 
 class CustomerRegisterRequest(BaseModel):
@@ -319,7 +324,7 @@ class CustomerRegisterRequest(BaseModel):
     alt_phone: Optional[str] = None
     address_line: Optional[str] = None
     building: Optional[str] = None
-    installation_date: Optional[str] = None
+    installation_date: Optional[str] = Field(None, json_schema_extra=_INSTALL_DATE)
     notes: Optional[str] = None
     # Install location: both or neither (app/services/customer_profile.py).
     latitude: Optional[float] = Field(None, description="Where the customer is (install location): pick it on the map.", json_schema_extra={"x-geo": "lat"})
@@ -467,7 +472,7 @@ async def register_customer_api(
 
 
 class CustomerEditRequest(BaseModel):
-    model_config = ConfigDict(json_schema_extra=_CUSTOMER_FIELDS_FOR)
+    model_config = ConfigDict(json_schema_extra={**_CUSTOMER_FIELDS_FOR, **_CUSTOMER_CLEAR})
 
     name: Optional[str] = None
     phone: Optional[str] = None
@@ -491,7 +496,7 @@ class CustomerEditRequest(BaseModel):
     alt_phone: Optional[str] = None
     address_line: Optional[str] = None
     building: Optional[str] = None
-    installation_date: Optional[str] = None
+    installation_date: Optional[str] = Field(None, json_schema_extra=_INSTALL_DATE)
     notes: Optional[str] = None
     # Install location: send both to set it, neither to keep it, or
     # clear_location=true to remove it.

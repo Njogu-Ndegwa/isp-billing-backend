@@ -30,7 +30,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -87,7 +87,8 @@ class RefundRequest(BaseModel):
 
 class ReviewRulesRequest(BaseModel):
     blocked_words: Optional[list[str]] = None
-    selling_mode: Optional[str] = None
+    selling_mode: Optional[str] = Field(None, json_schema_extra={"enum": ["off", "allowlist", "everyone"], "x-enum-labels": {
+        "off": "Nobody can sell ads", "allowlist": "Only the resellers on the list", "everyone": "Every Kenyan reseller"}})
     selling_allowlist: Optional[list[int]] = None
 
 

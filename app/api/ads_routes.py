@@ -54,6 +54,13 @@ _COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 _MEDIA_FIELDS = ("image_url", "video_url", "poster_url")
 _MEDIA_EDIT = {"x-fields-for": {"media_type": {"image": ["image_url"], "video": ["video_url", "poster_url"]}}}
 _MEDIA_ADD = {**_MEDIA_EDIT, "x-required-for": {"media_type": {"image": ["image_url"], "video": ["video_url"]}}}
+# An ad has many short fields: the assistant's form shows them all (the default limit is 20).
+_AD_FORM = {"x-form-limit": 32}
+# Choices as people say them; the API keeps its codes (ad_serving.PLACEMENTS, IMAGE_FITS, AdBadgeType).
+_PLACEMENT = {"enum": ["hero", "local"], "x-enum-labels": {"hero": "Big banner at the top", "local": "In the list of offers"}}
+_IMAGE_FIT = {"enum": ["cover", "contain"], "x-enum-labels": {"cover": "Fill the frame (edges may be cut)", "contain": "Show the whole photo"}}
+_BADGE = {"enum": ["hot", "new", "sale"], "x-enum-labels": {"hot": "Hot", "new": "New", "sale": "Sale"}}
+_MOMENT = {"format": "date-time"}
 _PHONE_RE = re.compile(r"^\+?[0-9 ]{9,16}$")
 # Content edits: what the automatic checks run again for.
 _REVIEWED_FIELDS = {
@@ -99,7 +106,7 @@ class AdvertiserCreateRequest(BaseModel):
 
 class AdCreateRequest(BaseModel):
     # a photo ad has a photo, a video ad a video and its poster: a form shows one set
-    model_config = ConfigDict(json_schema_extra=_MEDIA_ADD)
+    model_config = ConfigDict(json_schema_extra={**_MEDIA_ADD, **_AD_FORM})
 
     title: str
     # Your own promo always shows your network's name and support number (ad_review
@@ -113,17 +120,17 @@ class AdCreateRequest(BaseModel):
     whatsapp_number: Optional[str] = None
     price: Optional[str] = None
     price_value: Optional[float] = None
-    badge_type: Optional[str] = None
+    badge_type: Optional[str] = Field(None, json_schema_extra=_BADGE)
     badge_text: Optional[str] = None
     category: Optional[str] = None
     priority: int = 0
-    starts_at: Optional[str] = None
-    expires_at: Optional[str] = None
-    placement: str = "local"
+    starts_at: Optional[str] = Field(None, json_schema_extra=_MOMENT)
+    expires_at: Optional[str] = Field(None, json_schema_extra=_MOMENT)
+    placement: str = Field("local", json_schema_extra=_PLACEMENT)
     media_type: str = Field("image", json_schema_extra={"enum": ["image", "video"]})
     video_url: Optional[str] = Field(None, json_schema_extra={"x-upload": {"accept": "video/*", "ticket": "/api/ads/media/upload-url"}})
     poster_url: Optional[str] = Field(None, json_schema_extra={"x-upload": {"accept": "image/*", "ticket": "/api/ads/media/upload-url"}})
-    image_fit: str = "cover"
+    image_fit: str = Field("cover", json_schema_extra=_IMAGE_FIT)
     bg_color: Optional[str] = None
     slot: Optional[str] = Field(None, json_schema_extra={"x-admin-only": True})  # admin: "platform"; reseller: "house" (default); sold ads use /api/ad-sales
     router_ids: Optional[list[int]] = None
@@ -131,7 +138,7 @@ class AdCreateRequest(BaseModel):
 
 class AdUpdateRequest(BaseModel):
     # a photo ad has a photo, a video ad a video and its poster: a form shows one set
-    model_config = ConfigDict(json_schema_extra=_MEDIA_EDIT)
+    model_config = ConfigDict(json_schema_extra={**_MEDIA_EDIT, **_AD_FORM})
 
     advertiser_id: Optional[int] = Field(None, json_schema_extra={"x-admin-only": True})  # Bitwave ads
     title: Optional[str] = None
@@ -143,25 +150,26 @@ class AdUpdateRequest(BaseModel):
     whatsapp_number: Optional[str] = None
     price: Optional[str] = None
     price_value: Optional[float] = None
-    badge_type: Optional[str] = None
+    badge_type: Optional[str] = Field(None, json_schema_extra=_BADGE)
     badge_text: Optional[str] = None
     category: Optional[str] = None
     priority: Optional[int] = None
-    starts_at: Optional[str] = None
-    expires_at: Optional[str] = None
+    starts_at: Optional[str] = Field(None, json_schema_extra=_MOMENT)
+    expires_at: Optional[str] = Field(None, json_schema_extra=_MOMENT)
     is_active: Optional[bool] = None
-    placement: Optional[str] = None
+    placement: Optional[str] = Field(None, json_schema_extra=_PLACEMENT)
     media_type: Optional[str] = Field(None, json_schema_extra={"enum": ["image", "video"]})
     video_url: Optional[str] = Field(None, json_schema_extra={"x-upload": {"accept": "video/*", "ticket": "/api/ads/media/upload-url"}})
     poster_url: Optional[str] = Field(None, json_schema_extra={"x-upload": {"accept": "image/*", "ticket": "/api/ads/media/upload-url"}})
-    image_fit: Optional[str] = None
+    image_fit: Optional[str] = Field(None, json_schema_extra=_IMAGE_FIT)
     bg_color: Optional[str] = None
     slot: Optional[str] = Field(None, json_schema_extra={"x-admin-only": True})
     router_ids: Optional[list[int]] = None
 
 
 class AdReviewRequest(BaseModel):
-    action: str            # "approve" | "reject"
+    action: str = Field(..., json_schema_extra={"enum": ["approve", "reject"],
+                                                "x-enum-labels": {"approve": "Approve: it goes live", "reject": "Reject"}})
     note: Optional[str] = None
 
 
