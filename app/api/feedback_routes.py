@@ -136,6 +136,40 @@ async def create_post(payload: PostCreate, background_tasks: BackgroundTasks,
     return _post_dict(post, user, my_vote=None, viewer=user)
 
 
+class FeatureRequestIn(BaseModel):
+    title: str = Field(min_length=3, max_length=200, description="The feature in a few words, e.g. 'Pick a customer's location on a map'.")
+    asked: str = Field(min_length=3, max_length=2000, description="What the person asked for, in their words.")
+    same_as: Optional[int] = Field(None, description="An open idea that asks for the same thing, if you found one.")
+
+
+@router.post("/api/feedback/requests")
+async def record_feature_request(payload: FeatureRequestIn, background_tasks: BackgroundTasks,
+                                 db: AsyncSession = Depends(get_db),
+                                 token: str = Depends(verify_token)):
+    """Record a feature someone asked for that the app cannot do yet. If an open request for the
+    same thing exists it gets this account's vote and words instead of a second post, so Bitwave
+    sees how many want it. Runs without a Confirm: it only writes down what was asked."""
+    from app.services import feature_requests
+
+    user = await _require_member(token, db)
+    same = await feature_requests.find_same(db, payload.title, payload.asked, payload.same_as)
+    if same is not None:
+        await feature_requests.add_voice(db, same, user.id, payload.asked)
+        await db.commit()
+        return {"recorded": "added_to_existing", "request_id": same.id, "title": same.title,
+                "accounts_asking": same.upvotes or 0, "status": same.status.value}
+    post = FeedbackPost(user_id=user.id, kind=FeedbackKind.IDEA, title=payload.title.strip(),
+                        body=f"Asked in the assistant: {payload.asked.strip()}", status=FeedbackStatus.NEW,
+                        source="assistant")
+    db.add(post)
+    await db.flush()
+    db.add(FeedbackVote(post_id=post.id, user_id=user.id, value=1))
+    post.upvotes = 1
+    await db.commit()
+    background_tasks.add_task(run_feedback_triage, post.id)   # impact, area, duplicate candidates
+    return {"recorded": "new", "request_id": post.id, "title": post.title, "accounts_asking": 1, "status": "new"}
+
+
 # ---- Browse ---------------------------------------------------------------
 
 @router.get("/api/feedback/posts")

@@ -2813,6 +2813,10 @@ class FeedbackPost(Base):
                                 nullable=True)
     ai_raw = Column(JSON, nullable=True)
     ai_error = Column(String(255), nullable=True)
+    # "assistant" when the chat recorded it (a feature someone asked for), else the board
+    source = Column(String(20), nullable=True)
+    # Bitwave's own order of what to build next (1 = first); NULL = ranked by score
+    admin_rank = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

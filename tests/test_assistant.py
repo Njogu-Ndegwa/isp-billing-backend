@@ -1761,3 +1761,57 @@ async def test_an_mpesa_payment_waits_for_the_pin_instead_of_saying_done(client,
     await db.commit()
     status = (await client.get(result["awaiting"]["poll"], headers=auth(token))).json()
     assert status["paid"] is True and status["summary"] == "Paid: 100 SMS added."
+
+
+@pytest.mark.asyncio
+async def test_feature_requests_are_recorded_once_and_ranked(client, owner, db, monkeypatch):
+    """A feature nobody built yet: the assistant writes it down without a Confirm; a second
+    account asking for the same thing in other words adds a vote, not a second post; Bitwave's
+    own order comes first in the admin queue."""
+    import app.api.feedback_routes as fr
+    from app.db.models import FeedbackComment, FeedbackPost
+    from app.services import feature_requests as frs
+
+    async def _no_triage(_post_id):
+        return None
+    monkeypatch.setattr(fr, "run_feedback_triage", _no_triage)
+
+    reseller, token = owner
+    use_model([
+        tool_reply("call_api", {"method": "POST", "path": "/api/feedback/requests",
+                                "body": {"title": "Pick a customer's location on a map",
+                                         "asked": "I want to choose the customer's location from a map"}}),
+        text_reply("That is not there yet; I have passed it to Bitwave."),
+    ])
+    r = await client.post("/api/assistant/chat", json={"message": "Can I pick a customer on a map?"}, headers=auth(token))
+    events = sse_events(r.text)
+    assert not any(e["type"] == "action" for e in events)     # recorded at once, no card to confirm
+    [post] = (await db.execute(select(FeedbackPost))).scalars().all()
+    assert post.source == "assistant" and post.upvotes == 1
+
+    other = await make_reseller(db, email="other@example.com", organization_name="Other ISP")
+    other_token = create_access_token(login_token_claims(other), timedelta(hours=1))
+    r = await client.post("/api/feedback/requests", headers=auth(other_token), json={
+        "title": "Map for customer locations", "asked": "show customers locations on a map please"})
+    assert r.json()["recorded"] == "added_to_existing" and r.json()["accounts_asking"] == 2
+    db.expire_all()
+    assert len((await db.execute(select(FeedbackPost))).scalars().all()) == 1
+    assert len((await db.execute(select(FeedbackComment))).scalars().all()) == 1
+    # asking again from the same account is one vote still
+    r = await client.post("/api/feedback/requests", headers=auth(other_token), json={
+        "title": "Customer map", "asked": "map of customers", "same_as": post.id})
+    assert r.json()["accounts_asking"] == 2
+
+    r = await client.post("/api/feedback/requests", headers=auth(token), json={
+        "title": "Export invoices to Excel", "asked": "I need my invoices in excel"})
+    assert r.json()["recorded"] == "new"
+    excel_id = r.json()["request_id"]
+
+    admin = await make_admin(db, email="fr-admin@example.com")
+    admin_token = create_access_token(login_token_claims(admin), timedelta(hours=1))
+    assert (await client.put("/api/admin/feedback/order", json={"post_ids": [excel_id]}, headers=auth(token))).status_code == 403
+    assert (await client.put("/api/admin/feedback/order", json={"post_ids": [excel_id]}, headers=auth(admin_token))).status_code == 200
+    queue = (await client.get("/api/admin/feedback/queue?kind=idea", headers=auth(admin_token))).json()["items"]
+    assert [i["id"] for i in queue][0] == excel_id and queue[0]["admin_rank"] == 1
+    assert {i["source"] for i in queue} == {"assistant"}
+    assert frs.similarity("Export invoices to Excel", "Pick a customer's location on a map") < frs.MATCH_AT
