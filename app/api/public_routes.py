@@ -1188,6 +1188,11 @@ def _cleanup_old_mac_from_router_sync(router_info: dict, old_mac: str) -> dict:
     """Revoke the old device and prove that it no longer has hotspot access."""
     normalized = normalize_mac_address(old_mac)
     username = normalized.replace(":", "")
+
+    def _matches_old_mac_username(value: str | None) -> bool:
+        # RouterOS MAC login users can be named with or without separators.
+        return str(value or "").strip().upper().replace(":", "").replace("-", "") == username
+
     api = MikroTikAPI(
         router_info["ip"], router_info["username"],
         router_info["password"], router_info["port"],
@@ -1231,18 +1236,23 @@ def _cleanup_old_mac_from_router_sync(router_info: dict, old_mac: str) -> dict:
             and normalize_mac_address(row.get("mac-address", "")) == normalized
         }
 
-        # Authorization-bearing state goes first.  Host and lease removal then
-        # makes the old device pass through the captive portal again.
+        # Revoke authorization before removing the live session. Otherwise a
+        # connected device using MAC login can authenticate again immediately.
         _remove(
             "/ip/hotspot/ip-binding", _print("/ip/hotspot/ip-binding"),
             lambda row: normalize_mac_address(row.get("mac-address", "")) == normalized,
             "bindings",
         )
         _remove(
+            "/ip/hotspot/user", _print("/ip/hotspot/user"),
+            lambda row: _matches_old_mac_username(row.get("name")),
+            "users",
+        )
+        _remove(
             "/ip/hotspot/active", _print("/ip/hotspot/active"),
             lambda row: (
                 normalize_mac_address(row.get("mac-address", "")) == normalized
-                or str(row.get("user", "")).upper() == username.upper()
+                or _matches_old_mac_username(row.get("user"))
             ),
             "sessions",
         )
@@ -1250,11 +1260,6 @@ def _cleanup_old_mac_from_router_sync(router_info: dict, old_mac: str) -> dict:
             "/ip/hotspot/host", hosts,
             lambda row: normalize_mac_address(row.get("mac-address", "")) == normalized,
             "hosts",
-        )
-        _remove(
-            "/ip/hotspot/user", _print("/ip/hotspot/user"),
-            lambda row: str(row.get("name", "")).upper() == username.upper(),
-            "users",
         )
         _remove(
             "/queue/simple", _print("/queue/simple"),
@@ -1300,12 +1305,12 @@ def _cleanup_old_mac_from_router_sync(router_info: dict, old_mac: str) -> dict:
             "/ip/hotspot/active", "sessions",
             lambda row: (
                 normalize_mac_address(row.get("mac-address", "")) == normalized
-                or str(row.get("user", "")).upper() == username.upper()
+                or _matches_old_mac_username(row.get("user"))
             ),
         )
         _verify(
             "/ip/hotspot/user", "users",
-            lambda row: str(row.get("name", "")).upper() == username.upper(),
+            lambda row: _matches_old_mac_username(row.get("name")),
         )
         _verify(
             "/queue/simple", "queues",
