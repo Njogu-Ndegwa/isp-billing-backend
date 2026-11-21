@@ -584,6 +584,8 @@ def form_fields(action: Action, body: Any, context: Optional[dict] = None) -> Op
         if isinstance(prop.get("x-upload"), dict):
             # a photo or video the person picks on their phone: the page uploads it and fills in its address
             f["upload"] = {k: v for k, v in prop["x-upload"].items() if k in ("accept", "ticket")}
+        if prop.get("x-geo") in ("lat", "lng"):
+            f["geo"] = prop["x-geo"]  # one half of a place: the page picks both on a map
         if isinstance(prop.get("x-presets"), list):
             # ready-made values to pick (built-in photos), drawn as pictures next to the upload
             f["presets"] = [{"label": str(p.get("label") or p.get("value")), "value": str(p["value"])}
