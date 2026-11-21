@@ -16,17 +16,17 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # The suite is CPU-bound on one 4-core runner (about 10 min), so it runs as three
-  # jobs at once, each with its own Postgres, each taking a third of the tests
+  # The suite is CPU-bound on one 4-core runner (about 10 min), so it runs as five
+  # jobs at once, each with its own Postgres, each taking a fifth of the tests
   # (CI_SHARD, see conftest). The "pytest" job below is the one branch protection
   # requires: it passes only when every shard passed.
   pytest-shard:
-    name: pytest (shard ${{ matrix.shard }}/3)
+    name: pytest (shard ${{ matrix.shard }}/5)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4, 5]
     # Headroom, not a fix: the real cure for a slow suite is fewer round trips
     # (see the single catalog query in conftest). This only stops a legitimately
     # passing run from being killed while the suite grows.
@@ -57,7 +57,7 @@ jobs:
     env:
       # conftest reads this; app.config.Settings picks it up too.
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/isp_billing_test
-      CI_SHARD: ${{ matrix.shard }}/3
+      CI_SHARD: ${{ matrix.shard }}/5
 
     steps:
       - uses: actions/checkout@v4
