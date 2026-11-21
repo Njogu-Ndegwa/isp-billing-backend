@@ -224,6 +224,8 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
      "Deleted customer {customer_id}"),
     (("POST",), "/api/customers/{customer_id}/activate-pppoe", "customers.manage",
      "Activated PPPoE customer {customer_id}"),
+    (("POST",), "/api/customers/{customer_id}/activate-hotspot", "customers.manage",
+     "Activated hotspot customer {customer_id}"),
     (("POST",), "/api/customers/{customer_id}/deactivate-pppoe", "customers.manage",
      "Deactivated PPPoE customer {customer_id}"),
     (("POST",), "/api/customers/{customer_id}/activate-static", "customers.manage",

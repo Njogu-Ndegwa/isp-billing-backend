@@ -1940,7 +1940,11 @@ class ActivatePPPoERequest(BaseModel):
     # cash / other / bank_transfer / card record money taken outside the
     # system. "none" activates without recording any payment (a free month,
     # a comp, money already recorded elsewhere): see NO_PAYMENT below.
-    payment_method: str = "cash"
+    payment_method: str = Field(
+        "cash",
+        description="cash: cash received; other: paid outside the system; none: activate without payment (free, a comp, a test).",
+        json_schema_extra={"enum": ["cash", "other", "none"]},
+    )
     payment_reference: Optional[str] = None
     notes: Optional[str] = None
     # Record another payment even though the customer is already active or
@@ -2498,6 +2502,137 @@ def _static_result(result: dict) -> dict:
         "observed_mac": result.get("observed_mac"),
         "mac_mismatch": bool(result.get("mac_mismatch")),
     }
+
+
+@router.post("/api/customers/{customer_id}/activate-hotspot")
+async def activate_hotspot_customer(
+    customer_id: int,
+    request: ActivatePPPoERequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Give a hotspot customer their plan's time without an M-Pesa payment: cash or money
+    taken outside the system, or no payment at all (payment_method "none": a free
+    period, a comp, a test). Sets ACTIVE with the plan's expiry and lets the customer's
+    device (its MAC) onto the router, exactly as a paid hotspot purchase does. The
+    customer needs a device MAC and a router; register them first if they are new.
+    """
+    from app.services.hotspot_provisioning import log_provisioning_event, provision_hotspot_customer
+
+    try:
+        user = await get_current_user(token, db)
+        enforce_active_subscription(user)
+
+        stmt = (
+            select(Customer)
+            .options(selectinload(Customer.plan), selectinload(Customer.router))
+            .where(Customer.id == customer_id, Customer.user_id == user.id)
+        )
+        customer = (await db.execute(stmt)).scalar_one_or_none()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        if not customer.plan:
+            raise HTTPException(status_code=400, detail="Customer has no plan assigned")
+        if customer.plan.connection_type in (ConnectionType.PPPOE, ConnectionType.STATIC_IP):
+            raise HTTPException(status_code=400, detail="This customer is not on a hotspot plan: use activate-pppoe or activate-static")
+        if not customer.mac_address:
+            raise HTTPException(status_code=400, detail="Customer has no device MAC address: add the phone or device MAC first")
+        if not customer.router:
+            raise HTTPException(status_code=400, detail="Customer has no router assigned")
+
+        plan = customer.plan
+        no_payment = is_no_payment_activation(request.payment_method) or is_free_trial_plan(plan)
+        pm_enum = PaymentMethod.OTHER if no_payment else manual_activation_payment_method(request.payment_method)
+        now = datetime.utcnow()
+        forced = await refuse_duplicate_manual_activation(db, customer, request, now, no_payment=no_payment)
+
+        duration_unit = plan.duration_unit.value.upper()
+        duration_value = plan.duration_value
+        if duration_unit == "MINUTES":
+            expiry_delta = timedelta(minutes=duration_value)
+            days_paid_for = max(1, duration_value // (24 * 60))
+        elif duration_unit == "HOURS":
+            expiry_delta = timedelta(hours=duration_value)
+            days_paid_for = max(1, duration_value // 24)
+        else:
+            expiry_delta = timedelta(days=duration_value)
+            days_paid_for = duration_value
+
+        # An active customer (paid time or grace) keeps their billing date.
+        if customer.status == CustomerStatus.ACTIVE:
+            customer.expiry = renewal_expiry(customer, now, expiry_delta)
+        else:
+            customer.expiry = now + expiry_delta
+        customer.status = CustomerStatus.ACTIVE
+
+        payment = manual_activation_ledger_row(
+            customer, plan, user, request, no_payment=no_payment, pm_enum=pm_enum,
+            days_paid_for=days_paid_for, default_note="Hotspot activation via admin",
+        )
+        db.add(payment)
+        try:
+            from app.services.usage_tracking import on_renewal
+
+            await on_renewal(db, customer, plan=plan, now=now)
+        except Exception as renew_err:
+            logger.error(f"[USAGE] on_renewal failed in hotspot activation for customer {customer.id}: {renew_err}")
+
+        await db.commit()
+        await db.refresh(customer, attribute_names=["plan", "router"])
+
+        router_obj = customer.router
+        attempt = await get_or_create_provisioning_attempt(
+            db,
+            customer_id=customer.id,
+            router_id=router_obj.id,
+            mac_address=customer.mac_address,
+            source_table=ProvisioningAttemptSource.CUSTOMER_PAYMENT,
+            source_pk=payment.id,
+            external_reference=request.payment_reference,
+            entrypoint=ProvisioningAttemptEntrypoint.MANUAL_TRANSACTION_PROVISION,
+        )
+        await schedule_provisioning_attempt(db, attempt)
+        await db.commit()
+        await log_provisioning_event(
+            customer_id=customer.id, router_id=router_obj.id, mac_address=customer.mac_address,
+            action="hotspot_payment", status="scheduled",
+            details="Manual hotspot activation from the dashboard", attempt_id=attempt.id,
+        )
+
+        hotspot_payload = build_hotspot_payload(customer, plan, router_obj, comment=f"Activated for {customer.name}")
+        provision_result = await provision_hotspot_customer(
+            customer.id, router_obj.id, hotspot_payload, "hotspot_payment", attempt.id,
+        )
+        provision_succeeded = bool(provision_result and provision_result.get("success"))
+        await record_customer_event(
+            customer.id, "hotspot_activated",
+            f"Hotspot activated on {plan.name} until {customer.expiry:%Y-%m-%d %H:%M} UTC "
+            f"({manual_activation_event_text(user, pm_enum, no_payment=no_payment, forced=forced, free_trial=is_free_trial_plan(plan))}); router "
+            + ("updated" if provision_succeeded else
+               f"not updated yet: {(provision_result or {}).get('error') or 'will retry'}"),
+            severity="info" if provision_succeeded else "warning",
+            actor=user, user_id=user.id, router_id=customer.router_id,
+            details={"payment_id": payment.id, "reference": payment.payment_reference,
+                     "provision_result": "ok" if provision_succeeded else "retry_pending",
+                     "forced": forced, "no_payment": no_payment, "free_trial": is_free_trial_plan(plan)},
+        )
+        return {
+            "success": True,
+            "customer_id": customer.id,
+            "mac_address": customer.mac_address,
+            "status": customer.status.value,
+            "expiry": customer.expiry.isoformat() if customer.expiry else None,
+            "plan_name": plan.name,
+            "payment_recorded": not no_payment,
+            "provision_result": "ok" if provision_succeeded else "retry_pending",
+            "provision_error": provision_result.get("error") if provision_result else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Hotspot activation failed for customer {customer_id}: {e}")
+        raise HTTPException(status_code=500, detail="Hotspot activation failed")
 
 
 @router.post("/api/customers/{customer_id}/activate-static")
