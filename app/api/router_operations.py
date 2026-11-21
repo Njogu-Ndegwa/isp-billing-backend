@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func, case
 from sqlalchemy.orm import selectinload
@@ -4544,8 +4544,51 @@ async def get_port_config_job(
     return _public_port_config_job(job)
 
 
+def _ports_field(mode: str):
+    return Field(None, description=(
+        f"The complete list of {mode} ports. Any {mode} port left out goes back to hotspot. "
+        "To change one or two ports, use add/remove instead."))
+
+
+def _add_field(mode: str):
+    return Field(None, description=f"Ports to switch to {mode}, keeping the ones already on it")
+
+
+def _remove_field(mode: str):
+    return Field(None, description=f"Ports to take off {mode} (they go back to hotspot)")
+
+
+def resolve_port_set(ports: Optional[List[str]], add: Optional[List[str]], remove: Optional[List[str]],
+                     current: Optional[List[str]]) -> List[str]:
+    """The full set a request means. ``ports`` is the whole set (the classic page sends it);
+    ``add``/``remove`` change the current set, so asking for one port never drops the others."""
+    if ports is None and add is None and remove is None:
+        raise HTTPException(status_code=400, detail="Say which ports: ports (the whole set), or add/remove")
+    base = list(ports) if ports is not None else list(current or [])
+    for p in add or []:
+        if p not in base:
+            base.append(p)
+    gone = set(remove or [])
+    return [p for p in dict.fromkeys(base) if p not in gone]
+
+
+def refuse_wan_ports(router_obj, ports: List[str], mode: str) -> None:
+    """ether1 and the load-balancing WAN ports carry the internet in: never an access port."""
+    lb = router_obj.lb_config if isinstance(getattr(router_obj, "lb_config", None), dict) else {}
+    wan = set(lb.get("wan_ports") or []) if getattr(router_obj, "lb_enabled", False) else set()
+    for port in ports:
+        if port == "ether1":
+            raise HTTPException(status_code=400, detail=f"ether1 is the WAN port and cannot be used for {mode}")
+        if port in wan:
+            raise HTTPException(status_code=400, detail=(
+                f"{port} is an internet (WAN) port for load balancing and cannot be used for {mode}. "
+                "Take it out of load balancing first."))
+
+
 class SetPPPoEPortsRequest(BaseModel):
-    ports: List[str]
+    ports: Optional[List[str]] = _ports_field("PPPoE")
+    add: Optional[List[str]] = _add_field("PPPoE")
+    remove: Optional[List[str]] = _remove_field("PPPoE")
 
 
 def _apply_pppoe_ports_sync(
@@ -4778,10 +4821,8 @@ async def set_pppoe_ports(
     if not router_obj:
         raise HTTPException(status_code=404, detail="Router not found")
 
-    # Validate: ether1 cannot be assigned to PPPoE
-    for port in request.ports:
-        if port == "ether1":
-            raise HTTPException(status_code=400, detail="ether1 is the WAN port and cannot be used for PPPoE")
+    request.ports = resolve_port_set(request.ports, request.add, request.remove, router_obj.pppoe_ports)
+    refuse_wan_ports(router_obj, request.ports, "PPPoE")
 
     # Detect plain overlap so we can auto-migrate in a single connection
     current_plain = list(router_obj.plain_ports or [])
@@ -4881,7 +4922,9 @@ async def set_pppoe_ports(
 # =========================================================================
 
 class SetPlainPortsRequest(BaseModel):
-    ports: List[str]
+    ports: Optional[List[str]] = _ports_field("plain (no login)")
+    add: Optional[List[str]] = _add_field("plain (no login)")
+    remove: Optional[List[str]] = _remove_field("plain (no login)")
 
 
 def _apply_plain_ports_sync(
@@ -5036,9 +5079,8 @@ async def set_plain_ports(
     if not router_obj:
         raise HTTPException(status_code=404, detail="Router not found")
 
-    for port in request.ports:
-        if port == "ether1":
-            raise HTTPException(status_code=400, detail="ether1 is the WAN port and cannot be used for plain mode")
+    request.ports = resolve_port_set(request.ports, request.add, request.remove, router_obj.plain_ports)
+    refuse_wan_ports(router_obj, request.ports, "plain mode")
 
     # Detect PPPoE overlap so we can auto-migrate in a single connection
     current_pppoe = list(router_obj.pppoe_ports or [])
@@ -5136,7 +5178,9 @@ async def set_plain_ports(
 # =========================================================================
 
 class SetDualPortsRequest(BaseModel):
-    ports: List[str]
+    ports: Optional[List[str]] = _ports_field("dual (PPPoE + hotspot)")
+    add: Optional[List[str]] = _add_field("dual (PPPoE + hotspot)")
+    remove: Optional[List[str]] = _remove_field("dual (PPPoE + hotspot)")
     repair_hotspot: Optional[bool] = None
 
 
@@ -5282,12 +5326,8 @@ async def set_dual_ports(
     if not router_obj:
         raise HTTPException(status_code=404, detail="Router not found")
 
-    for port in request.ports:
-        if port == "ether1":
-            raise HTTPException(
-                status_code=400,
-                detail="ether1 is the WAN port and cannot be used for dual mode",
-            )
+    request.ports = resolve_port_set(request.ports, request.add, request.remove, router_obj.dual_ports)
+    refuse_wan_ports(router_obj, request.ports, "dual mode")
 
     # Detect PPPoE overlap so we can auto-migrate in a single connection
     current_pppoe = list(router_obj.pppoe_ports or [])

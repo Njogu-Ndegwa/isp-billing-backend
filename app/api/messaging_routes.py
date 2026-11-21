@@ -172,11 +172,17 @@ async def update_expiry_settings(body: ExpirySettingsIn,
 # ---- Customer event messages and message wording --------------------------
 
 class CustomerEventSettingsIn(BaseModel):
-    payment_receipt_enabled: bool
-    receipt_include_hotspot: bool
-    welcome_enabled: bool
-    # {event: text}; null or "" restores the built-in wording.
-    templates: dict[str, Optional[str]] = Field(default_factory=dict)
+    # A change, not a replacement: a switch left out keeps its saved value, and so
+    # does a message left out of ``templates``. Turning one switch on from the
+    # assistant must not wipe the reseller's own wording.
+    payment_receipt_enabled: Optional[bool] = Field(None, description="Send a receipt SMS after each payment; leave out to keep")
+    receipt_include_hotspot: Optional[bool] = Field(None, description="Also send receipts to hotspot customers; leave out to keep")
+    welcome_enabled: Optional[bool] = Field(None, description="Send a welcome SMS to new customers; leave out to keep")
+    # {event: text}; null or "" restores the built-in wording; an event left out keeps its saved text.
+    templates: dict[str, Optional[str]] = Field(
+        default_factory=dict,
+        description="Only the messages to change: {event: text}. null or empty restores the built-in wording.",
+    )
 
 
 class TemplatePreviewIn(BaseModel):
@@ -225,16 +231,17 @@ async def update_customer_event_settings(body: CustomerEventSettingsIn,
                                          db: AsyncSession = Depends(get_db),
                                          token: str = Depends(verify_token)):
     user = await _require_reseller(token, db)
-    cleaned: dict[str, str] = {}
+    changes: dict[str, Optional[str]] = {}
     for event, text in body.templates.items():
         if event not in sms_templates.EVENT_PLACEHOLDERS:
             raise HTTPException(status_code=400, detail=f"Unknown message type '{event}'")
         if text is None or not text.strip():
+            changes[event] = None   # back to the built-in wording
             continue
         error = sms_templates.validate_template(event, text)
         if error:
             raise HTTPException(status_code=400, detail=error)
-        cleaned[event] = text.strip()
+        changes[event] = text.strip()
 
     row = await db.get(CustomerExpirySmsSettings, user.id)
     if row is None:
@@ -245,10 +252,19 @@ async def update_customer_event_settings(body: CustomerEventSettingsIn,
             ),
         )
         db.add(row)
-    row.payment_receipt_enabled = body.payment_receipt_enabled
-    row.receipt_include_hotspot = body.receipt_include_hotspot
-    row.welcome_enabled = body.welcome_enabled
-    row.custom_templates = cleaned or None
+    for field in ("payment_receipt_enabled", "receipt_include_hotspot", "welcome_enabled"):
+        value = getattr(body, field)
+        if value is not None:
+            setattr(row, field, value)
+        elif getattr(row, field) is None:
+            setattr(row, field, False)
+    saved = dict(row.custom_templates) if isinstance(row.custom_templates, dict) else {}
+    for event, text in changes.items():
+        if text is None:
+            saved.pop(event, None)
+        else:
+            saved[event] = text
+    row.custom_templates = saved or None
     await db.commit()
     await db.refresh(row)
     return _customer_event_payload(row)
