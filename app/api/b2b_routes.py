@@ -476,7 +476,9 @@ async def update_reseller_payout_settings(
     }
 
 
-@router.post("/api/reseller/withdraw")
+@router.post("/api/reseller/withdraw",
+             openapi_extra={"x-payment-status": "/api/reseller/withdrawals/{withdrawal_ids}/status",
+                            "x-payment-kind": "payout"})
 async def reseller_withdraw(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
@@ -607,7 +609,59 @@ async def reseller_withdraw(
         ],
         "transfer_count": len(sent),
         "split_by_router": len(sent) > 1,
+        # where the chat (and any page) follows the transfer until M-Pesa says it arrived
+        "withdrawal_ids": ",".join(str(leg.transaction.id) for leg in sent),
     }
+
+
+def withdrawal_state(txns: list) -> dict:
+    """One withdrawal (one or more transfers) in words a reseller acts on: sent, not sent,
+    or still on its way. A failed transfer never left, so its money stays in the balance;
+    a timeout is not an answer yet (Bitwave keeps asking Safaricom)."""
+    def money(v):
+        return f"KES {v:,.0f}" if float(v).is_integer() else f"KES {v:,.2f}"
+    status = [t.status.value if hasattr(t.status, "value") else str(t.status) for t in txns]
+    net = sum(t.net_amount or 0 for t in txns)
+    refs = [t.transaction_id for t in txns if t.transaction_id]
+    if status and all(s == "completed" for s in status):
+        ref = f" (M-Pesa ref {', '.join(refs)})" if refs else ""
+        return {"status": "completed", "paid": True, "summary": f"Sent: {money(net)} reached your account{ref}."}
+    if any(s == "failed" for s in status) and not any(s in ("pending", "timeout") for s in status):
+        failed = [t for t in txns if (t.status.value if hasattr(t.status, "value") else str(t.status)) == "failed"]
+        reason = next((t.result_desc for t in failed if t.result_desc), None)
+        lost = sum(t.net_amount or 0 for t in failed)
+        part = "" if len(failed) == len(txns) else f" {money(net - lost)} was sent; {money(lost)} was not."
+        return {"status": "failed", "paid": False,
+                "summary": f"Not sent{': ' + reason if reason else ''}.{part} The money is still in your balance."}
+    if any(s == "timeout" for s in status):
+        return {"status": "pending", "paid": False,
+                "summary": "Safaricom has not confirmed yet; Bitwave is checking with them."}
+    return {"status": "pending", "paid": False, "summary": f"Sending {money(net)} now."}
+
+
+@router.get("/api/reseller/withdrawals/{withdrawal_ids}/status")
+async def withdrawal_status(
+    withdrawal_ids: str,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Whether a withdrawal reached the reseller: completed, failed (with Safaricom's
+    reason; the money stays in the balance) or still pending. ``withdrawal_ids`` is the
+    comma-separated list the withdraw call returned."""
+    user = await get_current_user(token, db)
+    try:
+        ids = [int(x) for x in withdrawal_ids.split(",") if x.strip()][:10]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="withdrawal_ids must be numbers")
+    if not ids:
+        raise HTTPException(status_code=400, detail="withdrawal_ids is empty")
+    # the same account the withdraw ran as (a staff member acts as their owner)
+    txns = (await db.execute(
+        select(B2BTransaction).where(B2BTransaction.id.in_(ids), B2BTransaction.reseller_id == user.id)
+    )).scalars().all()
+    if len(txns) != len(set(ids)):
+        raise HTTPException(status_code=404, detail="Withdrawal not found")
+    return {**withdrawal_state(txns), "transfers": [_serialize_withdrawal_txn(t) for t in txns]}
 
 
 # ---------------------------------------------------------------------------

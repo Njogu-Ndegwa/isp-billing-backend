@@ -1081,6 +1081,12 @@ class Turn:
         path = template
         for n in names:
             path = path.replace("{" + n + "}", str(data[n]))
+        if getattr(spec, "payment_kind", None) == "payout":
+            net = data.get("net_payout")
+            to = data.get("destination_label")
+            amount = f"KES {net:,.0f} " if isinstance(net, (int, float)) else ""
+            return {"kind": "payout", "poll": path,
+                    "message": f"Sending {amount}to {to or 'your account'}. This updates when M-Pesa confirms it arrived."}
         phone = data.get("phone_number")
         return {"kind": "mpesa", "poll": path,
                 "message": f"Check {'the phone ' + str(phone) if phone else 'your phone'}: enter your M-Pesa PIN to pay."}
