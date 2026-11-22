@@ -1615,14 +1615,18 @@ async def run_subscription_migrations():
         await _run_sql("Index subscription_payments.invoice_id",
             "CREATE INDEX IF NOT EXISTS idx_sub_payments_invoice ON subscription_payments(invoice_id)"
         )
-        await _run_sql("subscription_payments.failure_reason",
-            "ALTER TABLE subscription_payments ADD COLUMN IF NOT EXISTS failure_reason VARCHAR(255)"
-        )
         await _run_sql("Index subscription_payments.checkout_id",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_payments_checkout "
             "ON subscription_payments(mpesa_checkout_request_id) "
             "WHERE mpesa_checkout_request_id IS NOT NULL"
         )
+
+    # Columns added after the table was first created: run on every start, not only
+    # when the table is new (failure_reason sat inside the branch above and never
+    # reached production, 21 Nov 2026; every subscription payment read then failed).
+    await _run_sql("subscription_payments.failure_reason",
+        "ALTER TABLE subscription_payments ADD COLUMN IF NOT EXISTS failure_reason VARCHAR(255)"
+    )
 
     # Step 6: Set trial expiry for existing resellers (use text casts for safety)
     await _run_sql("Set trial expiry for resellers (NULL)",
