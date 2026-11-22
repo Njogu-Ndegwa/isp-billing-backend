@@ -2,7 +2,7 @@ import re
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import case, select, func
 from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime, timedelta
@@ -887,6 +887,14 @@ async def _subscription_owner_transfer_totals(db: AsyncSession) -> dict:
 # shortcode money look "available to send".
 _IN_MPESA_SHORTCODE = SubscriptionPayment.payment_method == "mpesa"
 
+# SMS credit sales before November 2026 were withdrawn from the paybill by hand
+# (Dennis, 2026-11-22), before SMS money was sendable from Collections. Only
+# orders from this instant on count as "available to send". The DB stores
+# naive UTC, so Kenya midnight on 1 Nov 2026 (EAT, UTC+3) is 21:00 UTC on
+# 31 Oct.
+SMS_MANUALLY_WITHDRAWN_BEFORE_DATE = "2026-11-01"
+SMS_MANUALLY_WITHDRAWN_BEFORE = datetime(2026, 10, 31, 21, 0, 0)
+
 
 def _paystack_settlement_from_gross(gross_kes: float, payment_count: int) -> dict:
     gross = round(float(gross_kes or 0), 2)
@@ -936,11 +944,15 @@ async def _subscription_collection_summary(db: AsyncSession) -> dict:
     # (messaging_routes.buy_credits), so that money sits in the paybill next to
     # subscription payments and is Bitwave's to send on. Every completed order
     # counts here, own reseller accounts included: the money is in the paybill
-    # whoever paid it.
+    # whoever paid it. Orders before SMS_MANUALLY_WITHDRAWN_BEFORE were taken
+    # out of the paybill by hand, so they are reported but not sendable.
+    is_manual = SmsCreditOrder.created_at < SMS_MANUALLY_WITHDRAWN_BEFORE
     sms_row = (await db.execute(
         select(
-            func.coalesce(func.sum(SmsCreditOrder.amount), 0),
-            func.count(SmsCreditOrder.id),
+            func.coalesce(func.sum(case((~is_manual, SmsCreditOrder.amount), else_=0)), 0),
+            func.count(case((~is_manual, SmsCreditOrder.id))),
+            func.coalesce(func.sum(case((is_manual, SmsCreditOrder.amount), else_=0)), 0),
+            func.count(case((is_manual, SmsCreditOrder.id))),
         ).where(SmsCreditOrder.status == SmsCreditOrderStatus.COMPLETED)
     )).one()
     sms_collected = float(sms_row[0] or 0)
@@ -960,6 +972,9 @@ async def _subscription_collection_summary(db: AsyncSession) -> dict:
         "subscription_collected": round(subscription_collected, 2),
         "sms_collected": round(sms_collected, 2),
         "sms_orders": int(sms_row[1] or 0),
+        "sms_withdrawn_manually": round(float(sms_row[2] or 0), 2),
+        "sms_withdrawn_manually_orders": int(sms_row[3] or 0),
+        "sms_withdrawn_manually_before": SMS_MANUALLY_WITHDRAWN_BEFORE_DATE,
         "completed_sent": transfers["completed_gross"],
         "pending_send": transfers["pending_gross"],
         "completed_bank_net": transfers["completed_net"],
