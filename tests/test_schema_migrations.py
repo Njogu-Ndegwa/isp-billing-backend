@@ -220,3 +220,36 @@ def test_mpesa_hot_path_index_is_concurrent_bounded_and_wired_to_startup():
         and node.func.id == "run_hot_path_index_migrations"
         for node in ast.walk(startup)
     ), "The concurrent index migration is not wired into normal startup"
+
+
+def _strings_in(nodes) -> list[str]:
+    out = []
+    for node in nodes:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                out.append(sub.value)
+    return out
+
+
+def test_no_new_column_is_added_only_when_its_table_is_created():
+    """An ALTER TABLE t ADD COLUMN inside the branch that CREATEs t runs only on a
+    fresh database, never on production's existing table. That is how
+    subscription_payments.failure_reason never reached production (21 Nov 2026) and
+    every subscription payment read failed; tests passed because they start empty."""
+    import re
+
+    tree = ast.parse(migration_source())
+    create = re.compile(r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)", re.I)
+    add = re.compile(r"ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)", re.I)
+    trapped = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        text = " ".join(_strings_in(node.body))
+        created = {m.group(1).lower() for m in create.finditer(text)}
+        for m in add.finditer(text):
+            if m.group(1).lower() in created:
+                trapped.append(f"{m.group(1)}.{m.group(2)} (main.py line {node.lineno})")
+    assert not trapped, (
+        "These columns are added only in the branch that creates their table, so an existing "
+        "database never gets them. Move each ALTER after that branch:\n  " + "\n  ".join(trapped))
