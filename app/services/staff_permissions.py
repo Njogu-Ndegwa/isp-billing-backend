@@ -469,6 +469,7 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     ((R,), "/api/reseller/account-statement", "account_statement.view", None),
     ((R,), "/api/reseller/payout-settings", "account_statement.view", None),
     (("POST",), "/api/reseller/withdraw", "money.withdraw", "Requested a withdrawal"),
+    ((R,), "/api/reseller/withdrawals/{withdrawal_ids}/status", ("money.withdraw", "account_statement.view"), None),
     (("PUT",), "/api/reseller/payout-settings", "payment_methods.manage",
      "Changed payout settings"),
     (("PUT",), "/api/reseller/settlement-mode", "settlement.manage",

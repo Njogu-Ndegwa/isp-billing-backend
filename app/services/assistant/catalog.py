@@ -76,6 +76,8 @@ class Action:
     # a payment the route only starts (an M-Pesa prompt): where to read whether it was paid,
     # a path template filled from the route's own reply (x-payment-status)
     payment_status: Optional[str] = None
+    # "payout" when the money goes out to the person (a withdrawal), else a payment they make
+    payment_kind: Optional[str] = None
     overrides: tuple = ()        # declared OVERRIDE_FLAGS (query or body)
     apply_flag: Optional[str] = None  # a declared APPLY_FLAG: without it the request is a preview
     preview: Optional[str] = None     # a separate read that previews this change (x-preview)
@@ -287,6 +289,7 @@ class Catalog:
                     staff_rule=rule,
                     flags=flags,
                     payment_status=op.get("x-payment-status") if isinstance(op.get("x-payment-status"), str) else None,
+                    payment_kind=op.get("x-payment-kind") if isinstance(op.get("x-payment-kind"), str) else None,
                     overrides=declared(OVERRIDE_FLAGS),
                     apply_flag=apply_flags[0] if apply_flags and method != "get" else None,
                     preview=op.get("x-preview") if isinstance(op.get("x-preview"), str) else None,
