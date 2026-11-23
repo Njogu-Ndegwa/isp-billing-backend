@@ -30,6 +30,9 @@ router = APIRouter(prefix="/api/assistant", tags=["assistant"])
 
 _TASKS: set = set()
 PING_SECONDS = 15
+# An M-Pesa prompt sent from the chat is watched this long; once paid, the chat carries on.
+PAYMENT_POLL_SECONDS = 5.0
+PAYMENT_FOLLOW_SECONDS = 600.0
 
 
 IMAGE_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif")
@@ -171,6 +174,8 @@ async def _run(turn: Turn, caller: Caller, conversation: dict, queue: asyncio.Qu
                     caller, conversation["id"], messages=turn.messages, transcript=turn.transcript,
                     input_tokens=turn.input_tokens, output_tokens=turn.output_tokens, title=title,
                 )
+                for wait in turn.payment_waits:
+                    _spawn(_follow_payment(turn.app, caller, conversation["id"], wait))
                 try:
                     owner_id, owner_staff = caller.usage_owner
                     await usage.record(owner_id, owner_staff, turn.usage, question=turn.is_question)
@@ -183,6 +188,47 @@ async def _run(turn: Turn, caller: Caller, conversation: dict, queue: asyncio.Qu
         await queue.put({"type": "done", "conversation_id": conversation["id"],
                          "usage": {"input_tokens": turn.input_tokens, "output_tokens": turn.output_tokens}})
         await queue.put(None)
+
+
+async def _follow_payment(app, caller: Caller, conversation_id: str, wait: dict) -> None:
+    """Watch an M-Pesa prompt the chat sent. When it is paid, run a turn that tells the model, so
+    what the payment was for (a reminder waiting on credits) is proposed again without the person
+    asking; the open page picks the new card up with its transcript refresh. Each check is its own
+    in-process request (a short DB read); nothing is held while waiting."""
+    from app.services.assistant import executor
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + PAYMENT_FOLLOW_SECONDS
+    paid = None
+    try:
+        while paid is None and loop.time() < deadline:
+            await asyncio.sleep(PAYMENT_POLL_SECONDS)
+            try:
+                result = await executor.call_api(app, caller, "GET", wait["poll"], None, None)
+            except Exception:
+                continue  # a missed check is retried
+            data = result.data if result.ok else None
+            if not isinstance(data, dict):
+                if result.status in (401, 403, 404):
+                    return
+                continue
+            if data.get("paid"):
+                paid = data
+            elif str(data.get("status") or "") in ("failed", "timed_out", "cancelled"):
+                return  # the card already says it was not paid
+        if paid is None:
+            return
+        lock = conversation_lock(conversation_id)
+        while lock.locked() and loop.time() < deadline + 120:
+            await asyncio.sleep(1)  # the person is mid-question: carry on after it
+        conversation = await store.load_conversation(caller, conversation_id)
+        if conversation is None:
+            return
+        queue: asyncio.Queue = asyncio.Queue()  # nobody streams it: the page reloads the transcript
+        turn = Turn(app, caller, conversation, queue)
+        await _run(turn, caller, conversation, queue, lambda: turn.payment_settled(wait, paid))
+    except Exception:
+        logger.exception("[assistant] following payment %s failed", wait.get("poll"))
 
 
 def _spawn(coro) -> None:
