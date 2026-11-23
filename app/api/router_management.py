@@ -43,6 +43,7 @@ from app.services.router_availability import (
     uptime_outages,
     time_based_uptime,
     uptime_timeline,
+    with_down_since,
     ROUTER_AVAILABILITY_RETENTION_DAYS,
 )
 from app.services.provisioning import provision_base_url_for_vpn
@@ -1721,7 +1722,12 @@ async def get_router_uptime(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Get availability and uptime statistics for a router."""
+    """Get availability and uptime statistics for a router.
+
+    Each outage has down_since (the last successful contact: when it went down) and
+    checks_failing_since (when Bitwave's checks began failing, later). down_now is the
+    current outage, or null when the router is up.
+    """
     user = await get_current_user(token, db)
     stmt = select(Router).where(Router.id == router_id, Router.user_id == user.id)
     result = await db.execute(stmt)
@@ -1788,7 +1794,11 @@ async def get_router_uptime(
             if (datetime.fromisoformat(o["ended_at"]) if o.get("ended_at") else now) > since
         ]
 
-    window_outages = in_window(outages)
+    # "When did it go down" is the last successful contact before each outage,
+    # not the first failed check (CR-1123-B4: 08:42, not 08:53).
+    contact_times = [c["checked_at"] for c in all_checks if c["is_online"]] + list(contacts)
+    window_outages = with_down_since(in_window(outages), contact_times)
+    ongoing = next((o for o in reversed(window_outages) if not o.get("ended_at")), None)
     flap_summary = summarize_router_flaps(window_checks, now=now)
 
     return {
@@ -1814,6 +1824,13 @@ async def get_router_uptime(
             "online_checks": sum(1 for c in window_checks if c["is_online"]),
             **window_stats,
         },
+        "down_now": None if ongoing is None else {
+            "down_since": ongoing["down_since"],
+            "checks_failing_since": ongoing["checks_failing_since"],
+        },
+        "outage_times_note": ("down_since is the router's last successful contact: the answer to "
+                              "'when did it go down'. checks_failing_since (= started_at) is only "
+                              "when Bitwave's checks began failing, a later second detail."),
         "outages": window_outages[-50:],
         "tunnel_outages": in_window(tunnel_outages)[-50:],
         "timeline": uptime_timeline(
