@@ -212,7 +212,7 @@ How to work
 - Typing "confirm", "yes", "ok do it", "sawa" or "ndio" in the chat runs nothing: only the tap on the card does. When the person types a go-ahead while a card is waiting, say in one line that it runs when they tap Confirm on that card; never propose the same change again. One card per change: proposing a change again closes its earlier card, so propose again only to change what it does.
 - Confirmed and cancelled actions come back in a message that starts with [Confirmation results]. Report what happened plainly, failures included, then continue the task if more steps remain.
 - A customer can be given internet without paying through M-Pesa: register them if new, then activate with the activate action for their connection (activate-hotspot, activate-pppoe or activate-static), payment_method cash (cash received), other (paid elsewhere) or none (free: a comp, a test). A hotspot customer needs their device MAC.
-- When someone asks for something no action can do (a feature the app does not have), say so plainly, offer the nearest thing it can do, and record the request with POST /api/feedback/requests (title: the feature in a few words; asked: their words). It runs without a Confirm. If the reply says it was added to an existing request, tell them others asked too and that Bitwave sees it. Do not record ordinary questions, things an action already does, or bugs (those go to support).
+- Whenever your answer is "no", "not yet", "I can't" or "Bitwave doesn't" about something the person wants the product to do (a feature the app does not have), however they put it, as a request or as a question ("Can we...?", "Is it possible...?", "Does Bitwave...?"): say so plainly, offer the nearest thing it can do, and in the same turn record the request with POST /api/feedback/requests (title: the feature in a few words; asked: their words). It runs without a Confirm. Then say in one short line that you noted it for Bitwave; if the reply says it was added to an existing request, say others asked too. When the exact ask is refused for policy (a password, another reseller's own data) but a feature would meet the need behind it, record that feature: "how affordable are my plans compared to other hotspots" is an anonymous price benchmark. Do not record: how-to questions you can answer, things an action already does, something that works once the person sets it up (a router password saved, a plan made: say what to set up), asks refused for policy with no feature behind them, or bugs (those go to support).
 - An M-Pesa payment (buying SMS credits, paying the subscription) only sends a PIN prompt to a phone: after Confirm it is waiting, not bought, and the card shows when it is paid. The phone number is the payer's own M-Pesa line: leave it for them to type unless they gave it in this chat; never fill it with the support phone or a customer's number.
 - For a change to many records, use a bulk action if the index has one; otherwise propose one call per record, at most {max_proposals} per turn, and say how many remain.
 - Never ask for, repeat or send a password, API key or other secret. Results show them hidden. If an action needs one, tell the person which dashboard page to use instead.
@@ -296,7 +296,7 @@ When something does not work
 - Then check the live data the entry names (the customer, the router's status, uptime and live figures, the diagnose actions, payments, and inside the router with the routeros reads) to see which cause it is. Lead with the likely cause and the one next step. Say what the data showed. Never present a cause as found when you did not see it in the data.
 - When the cause of a fault turns on something only the person can see or say (which access point, whether every AP has the same Wi-Fi name, what the phone shows), ask that one question first, in one line, the way support would, instead of building a diagnosis out of data that does not decide it. One question, then stop. This is for faults only: to add, send or change something, open the form and leave what you do not know (a message's text, a phone number) for the person to fill in.
 - When a form fixes the cause (paying a suspended subscription, buying SMS credits), say the cause in words first, then that the form fixes it: "Your Bitwave subscription is suspended, so customers cannot buy internet. Pay the KES 1,500 here to restore it."
-- A how-to question ("can I...", "how do I...", "what should I put") gets the plain answer first: yes or no and how, in a sentence or two. Look at the account only when the answer depends on it.
+- A how-to question ("can I...", "how do I...", "what should I put") gets the plain answer first: yes or no and how, in a sentence or two. Look at the account only when the answer depends on it. When the answer is no because the product cannot do it, it is a feature request too: record it (see above).
 - Never name other resellers, routers or customers from past cases; the entries are general on purpose.
 
 Known issues ({known_count})
@@ -751,7 +751,34 @@ class Turn:
             **({"images": [i.get("thumbnail") for i in images if i.get("thumbnail")]} if images else {}),
         })
         self.messages.append({"role": "user", "content": content})
+        since = len(self.messages)
         await self._loop()
+        self._flag_unrecorded_ask(since)
+
+    def _flag_unrecorded_ask(self, since: int) -> None:
+        """A "no" about what the product does, with no request recorded in this turn: a
+        transcript entry the daily chat review counts. The screen does not draw it, and
+        nothing is recorded on the person's behalf (it would be noise)."""
+        answer = None
+        for item in reversed(self.transcript):
+            if item.get("type") == "user":
+                break
+            if item.get("type") == "assistant" and answer is None:
+                answer = item.get("text") or ""
+        said = capability_no(answer or "")
+        if not said:
+            return
+        for m in self.messages[since:]:
+            if m.get("role") != "assistant" or not isinstance(m.get("content"), list):
+                continue
+            for b in m["content"]:
+                args = b.get("input") if isinstance(b.get("input"), dict) else {}
+                if (b.get("type") == "tool_use" and b.get("name") == "call_api"
+                        and str(args.get("method") or "").upper() == "POST"
+                        and str(args.get("path") or "").split("?", 1)[0].rstrip("/") == "/api/feedback/requests"):
+                    return
+        self.transcript.append({"type": "review_flag", "at": datetime.utcnow().isoformat() + "Z",
+                                "flag": "capability_no_unrecorded", "said": said[:80]})
 
     async def _image_block(self, image: dict) -> dict:
         """The photo as a content block.
@@ -1791,6 +1818,30 @@ def is_go_ahead(text: str) -> bool:
         if phrase.startswith(filler + " "):
             phrase = phrase[len(filler) + 1:]
     return phrase in _GO_AHEAD
+
+
+# An answer that says the product cannot do something ("No — Bitwave sends SMS, not
+# WhatsApp", "I can't ... yet", "Bitwave doesn't ..."), read from its first sentence.
+# "I can't find / reach / say" is a lookup or a fault, not a missing feature.
+_CAPABILITY_NO = re.compile(
+    r"^\W*not\s+yet\b"
+    r"|\bi\s+(?:can(?:'|’)?t|cannot|(?:am|'m|’m)\s+not\s+able\s+to)"
+    r"(?!\s+(?:find|reach|read|connect|load|open|tell|say|get\s+through)\b)"
+    r"|\bbitwave\s+(?:doesn(?:'|’)?t|does\s+not|has\s+no|can(?:'|’)?t|cannot)\b"
+    r"|\bnot\s+(?:possible|supported|available)\s+yet\b", re.I)
+_BARE_NO = re.compile(r"^\W*no\s*[—–,.:;!-]", re.I)   # "No — ..." only counts when it is about the product
+_ABOUT_PRODUCT = re.compile(r"\b(?:bitwave|the app|the dashboard|feature|yet)\b", re.I)
+
+
+def capability_no(answer: str) -> Optional[str]:
+    """The words in an answer's first sentence that say the product cannot do it, or None."""
+    first = re.split(r"(?<=[.!?])\s|\n", (answer or "").strip(), maxsplit=1)[0][:240]
+    m = _CAPABILITY_NO.search(first)
+    if m:
+        return m.group(0).strip()
+    if _BARE_NO.search(first) and _ABOUT_PRODUCT.search(first):
+        return first.split()[0].strip(" —–,.:;!-") or "No"
+    return None
 
 # A state read from a live thing, as people say it ("ether2 · PPPoE").
 _STATE_WORDS = {"pppoe": "PPPoE", "plain": "Plain (no login)", "dual": "PPPoE + hotspot", "hotspot": "Hotspot",
