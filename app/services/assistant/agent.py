@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 from app.config import settings
 from app.services.assistant import executor, known_issues, shaping, store, listing, router_names
+from app.services.assistant import chat_images
 from app.services.assistant.usage import TurnUsage
 from app.services.assistant.caller import Caller
 from urllib.parse import quote
@@ -254,7 +255,7 @@ Product facts (Bitwave support's own answers to resellers; check live data for n
 - SMS to customers picked by when their time ends ("expires today", "ran out this week"): the send's filter does it (expiring_today, expiring_tomorrow, expiring within 7 days, expired_recently); the customers list's expires filter shows who that is.
 - SMS "can't send" or "shows zero": a send needs credits for every recipient × message part; check the balance and how many people they want to reach.
 - A new access point or router should show up by itself once it is added and provisioned; if it does not, check its provisioning.
-- Ads on the hotspot login page come in two kinds. Your own promo (POST /api/ads) advertises your own WiFi (bundles, offers) and always shows your support number from Settings. An ad for any other business, even a friend's shop, is an ad you sell (POST /api/ad-sales): the business pays by M-Pesa, Bitwave keeps 20% and the rest joins your payout. Ads only show when Show ads is on in portal settings. A photo or video is picked in the form, from the phone.
+- Ads on the hotspot login page come in two kinds. Your own promo (POST /api/ads) advertises your own WiFi (bundles, offers) and always shows your support number from Settings. An ad for any other business, even a friend's shop, is an ad you sell (POST /api/ad-sales): the business pays by M-Pesa, Bitwave keeps 20% and the rest joins your payout. Ads only show when Show ads is on in portal settings. A photo or video is picked in the form, from the phone, or is a picture sent in this chat (see Photos).
 - A notice on the hotspot login page (maintenance tonight, a price change) is the portal announcement (portal settings: show_announcement, announcement_type, announcement_text), not an ad. 'Tangazo' can mean either: a notice for customers is the announcement; promoting a business is an ad.
 - Changing a customer's plan or router on their record moves them: the old router access is removed and the new one set up. The router transfer action moves every customer on a router, so use it only when that is what was asked.
 - There is no refund action for a customer's payment. A double payment is settled by giving them the extra time (extend their expiry) or by the reseller sending the money back themselves; an M-Pesa reversal goes through Safaricom.
@@ -268,6 +269,9 @@ Product facts (Bitwave support's own answers to resellers; check live data for n
 
 Photos
 - The person can send photos or screenshots (a Winbox terminal, an error, a router label, an M-Pesa message). Read them carefully: quote the exact error text you see, say what it means and give the next step. If a photo is unreadable, say so and ask for a closer or clearer one.
+- A picture sent in this chat can go into a form's photo field (the portal logo, the hero header photo, an ad's photo). Each photo comes with its reference (chat-image:…): when the person wants that picture used, put the reference as the field's value and the form shows it ready under "Use the picture you sent"; Confirm uploads it. Never say you cannot put the picture in the form or that the file must come from their device.
+- Asked to change the logo or header photo without sending one: open the portal settings form once and say they can send the picture here in the chat, or pick it in the form. The logo and header photo show only on the hero header, so if header_style is not hero, set it to hero in the same form and say so.
+- One card per change: while a form for the same change is still open, do not open another for it; say it is on screen. When the picture arrives after that form, open it once more with the picture in, and say to use that one.
 
 Bitwave support notes
 - A message starting with [Bitwave support note from …] was written by the Bitwave team into this chat. Follow it, and tell the person what support said when it matters.
@@ -785,6 +789,10 @@ class Turn:
         for image in images:
             content.append(await self._image_block(image))
         label = text or ("(photo)" if len(images) == 1 else "(photos)")
+        refs = [chat_images.remember(self.caller, self.conversation["id"], i) for i in images]
+        if refs:
+            label += (f" [Photo reference{'s' if len(refs) > 1 else ''} for a form's photo field "
+                      f"(kept {chat_images.KEEP_SECONDS // 60} min): {', '.join(refs)}]")
         tz_name, notes = await account_state(self.caller)
         self._tz, self._tz_known = tz_name, True
         account = f"\n[Account now: {' '.join(notes)}]" if notes else ""
@@ -875,6 +883,8 @@ class Turn:
                 if missed:
                     lines.append(missed)  # the card stays open; the assistant says what is missing
                     continue
+            if approve and not await self._use_chat_images(action_id):
+                continue  # a picture from the chat could not be used: the card says why
             if approve and await self._preview_first(action_id):
                 continue  # what it would do is on the card now; the next Confirm does it
             if approve:
@@ -1189,6 +1199,35 @@ class Turn:
         await store.set_action_body(action_id, body)  # stored without the passwords
         if typed_secrets:
             self._form_secrets[action_id] = typed_secrets  # this request only, then forgotten
+        return True
+
+    async def _use_chat_images(self, action_id: str) -> bool:
+        """A photo field set to a picture sent in this chat: upload it the classic page's way and
+        put its address in instead. False (and the card told why) when it cannot be used."""
+        action = await store.pending_action(self.caller, self.conversation["id"], action_id)
+        body = action.get("body") if action is not None else None
+        if not isinstance(body, dict) or not any(chat_images.is_ref(v) for v in body.values()):
+            return True
+        spec, _ = self.catalog.match(action["method"], action["path"])
+        props = ((spec.body_schema if spec is not None else None) or {}).get("properties") or {}
+        body, problems = dict(body), []
+        for name, value in list(body.items()):
+            if not chat_images.is_ref(value):
+                continue
+            if not chat_images.is_image_upload(props.get(name)):
+                problems.append(f"a picture from the chat can only go in a photo field, not {name}")
+                continue
+            try:
+                body[name] = await chat_images.upload(self.app, self.caller, self.conversation["id"], value)
+            except chat_images.Refused as exc:
+                problems.append(str(exc).rstrip("."))
+        if problems:
+            await self.emit("action_result", {
+                "action_id": action_id, "status": "pending", "ok": False,
+                "detail": "Not run yet. " + "; ".join(dict.fromkeys(problems)) + ".",
+            })
+            return False
+        await store.set_action_body(action_id, body)
         return True
 
     def _payment_wait(self, action: dict, data: Any) -> Optional[dict]:
@@ -1655,6 +1694,8 @@ class Turn:
                              + ". Send it again with one of those, or without purpose.",
                 }, True)
             fields_for_form = marked
+        if fields_for_form:  # a photo field offers the pictures sent in this chat
+            chat_images.offer(fields_for_form, self.caller, self.conversation["id"])
         narrowed = await self._offer_choices(fields_for_form, args.get("narrow"), method in ("PUT", "PATCH"),
                                              params, body) if fields_for_form else {}
         empty = {name: n for name, n in narrowed.items() if not n["fit"]}
