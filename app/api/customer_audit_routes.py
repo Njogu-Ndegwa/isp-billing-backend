@@ -29,20 +29,21 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.db.database import get_db
 from app.db.models import (
-    Customer, CustomerEvent, CustomerPayment, MpesaTransaction,
+    Customer, CustomerEvent, CustomerPayment, CustomerStatus, MpesaTransaction,
     MpesaTransactionStatus, Plan, ProvisioningAttempt, ProvisioningLog,
     ReconnectionAttempt, Router, RouterAvailabilityCheck, SmsMessage,
 )
 from app.services import realtime_state
 from app.services.auth import get_current_user, verify_token
 from app.services.subscription import enforce_active_subscription
-from app.services.customer_events import record_customer_event
+from app.services.customer_events import parse_uptime, record_customer_event
 from app.services.customer_router_logs import CustomerIndex, capture_router_logs, router_info_of
 from app.services.router_availability import public_contact_times, record_router_availability
 
@@ -703,8 +704,39 @@ async def pull_customer_router_logs(
 RESET_SESSION_COOLDOWN_SECONDS = 15
 _last_reset: dict[int, datetime] = {}
 
+# A session younger than this is one the customer's router just dialled by itself:
+# she is back online, and dropping it cuts a connection that works again. A reset is
+# for a session stuck for longer (connected, no internet).
+FRESH_SESSION_SECONDS = 600
 
-def _reset_pppoe_session_sync(router_info: dict, username: str) -> dict:
+
+class ResetSessionRequest(BaseModel):
+    force: bool = Field(False, description="Drop the session even if the customer just came back online")
+
+
+def _fresh_session(sessions: list, username: str) -> Optional[dict]:
+    """The customer's newest live session when it started under FRESH_SESSION_SECONDS ago."""
+    fresh = None
+    for s in sessions or []:
+        if s.get("name") != username:
+            continue
+        uptime = parse_uptime(s.get("uptime"))
+        if uptime is None or uptime >= FRESH_SESSION_SECONDS:
+            continue
+        if fresh is None or uptime < fresh["uptime_seconds"]:
+            fresh = {"uptime_seconds": uptime, "ip": s.get("address"), "caller_id": s.get("caller-id")}
+    return fresh
+
+
+def _ago(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds} second{'s' if seconds != 1 else ''} ago"
+    minutes = seconds // 60
+    return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+
+
+def _reset_pppoe_session_sync(router_info: dict, username: str, keep_fresh: bool) -> dict:
+    """Read the live session, then drop it unless it just started and ``keep_fresh``."""
     from app.services.mikrotik_api import MikroTikAPI
 
     api = MikroTikAPI(
@@ -715,7 +747,19 @@ def _reset_pppoe_session_sync(router_info: dict, username: str) -> dict:
     if not api.connect():
         return {"error": "connect_failed"}
     try:
-        return api.disconnect_pppoe_session(username)
+        live = api.send_command_optimized(
+            "/ppp/active/print", proplist=[".id", "name", "address", "caller-id", "uptime"],
+            query=f"?name={username}",
+        )
+        if not live.get("success"):
+            return {"error": live.get("error") or "could not list the live sessions", "stage": "read"}
+        sessions = [s for s in live.get("data") or [] if s.get("name") == username]
+        if not sessions:
+            return {"success": True, "disconnected": 0}
+        fresh = _fresh_session(sessions, username)
+        if fresh and keep_fresh:
+            return {"success": True, "disconnected": 0, "fresh": fresh}
+        return {**api.disconnect_pppoe_session(username), "fresh": fresh}
     finally:
         api.disconnect()
 
@@ -725,13 +769,20 @@ async def reset_customer_session(
     customer_id: int,
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
+    request: Optional[ResetSessionRequest] = None,
 ):
-    """Drop the customer's live PPPoE session so their router dials again.
+    """Drop the customer's live PPPoE session so their router dials again. Re-check their live state right before proposing it: they may be back online.
 
     The PPP secret is untouched: a paid customer is back online within
     seconds, with a fresh session (new IP, current plan speed). The usual
     first step when a customer says "connected but no internet".
+
+    The session is read first. An active customer whose router reconnected in
+    the last 10 minutes is already back online: 409 ``customer_already_online``
+    and nothing is dropped, unless ``force`` is true. No live session: nothing
+    to drop, answered as before.
     """
+    force = bool(request and request.force)
     customer, user = await _load_customer(db, customer_id, token)
     enforce_active_subscription(user)
     if not customer.pppoe_username:
@@ -749,13 +800,16 @@ async def reset_customer_session(
     info = router_info_of(router_obj)
     username = customer.pppoe_username
     owner_id = customer.user_id
+    # Only a paying customer's new session is a connection worth keeping: an expired
+    # one's can be the walled payment-page session.
+    keep_fresh = not force and customer.status == CustomerStatus.ACTIVE
     await db.commit()  # nothing held across the router call
 
     _trim(_last_reset, now)
     _last_reset[customer_id] = now
     from app.services.router_concurrency import run_with_guard
 
-    result = await run_with_guard(router_id, _reset_pppoe_session_sync, info, username,
+    result = await run_with_guard(router_id, _reset_pppoe_session_sync, info, username, keep_fresh,
                                   acquire_timeout_seconds=2.0)
     error = result.get("error")
     if error == "busy":
@@ -765,17 +819,50 @@ async def reset_customer_session(
         _last_reset.pop(customer_id, None)
         await record_router_availability(db, router_id, False, "customer_reset_session")
         raise HTTPException(status_code=503, detail="Could not reach the router")
+    if error and result.get("stage") == "read":
+        _last_reset.pop(customer_id, None)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not read the customer's live session, so nothing was dropped: {error}",
+        )
     if error:
         _last_reset.pop(customer_id, None)
         raise HTTPException(status_code=502, detail=f"Router refused the reset: {error}")
 
     disconnected = int(result.get("disconnected") or 0)
+    fresh = result.get("fresh")
     await record_router_availability(db, router_id, True, "customer_reset_session")
+    if fresh and not disconnected:
+        _last_reset.pop(customer_id, None)  # nothing happened: "Do it anyway" must not wait
+        uptime = int(fresh["uptime_seconds"])
+        since = datetime.now(timezone.utc) - timedelta(seconds=uptime)
+        raise HTTPException(status_code=409, detail={
+            "code": "customer_already_online",
+            "message": (
+                f"The customer is already back online: their router reconnected by itself "
+                f"{_ago(uptime)} (at {since:%H:%M} UTC)"
+                + (f" and has IP {fresh['ip']}" if fresh.get("ip") else "")
+                + ". Resetting now would drop that working connection."
+            ),
+            "customer_id": customer_id,
+            "router_id": router_id,
+            "uptime_seconds": uptime,
+            "connected_at": since.isoformat(),
+            "ip": fresh.get("ip"),
+        })
+
+    details = {"disconnected": disconnected, **({"forced": True} if force else {})}
     await record_customer_event(
         customer_id, "session_reset",
         "Session reset from the dashboard; the customer's router will reconnect"
         if disconnected else "Session reset requested, but the customer had no active session",
         actor=user, user_id=owner_id, router_id=router_id,
-        details={"disconnected": disconnected},
+        details=details,
     )
-    return {"customer_id": customer_id, "router_id": router_id, "disconnected": disconnected}
+    message = (
+        "Session dropped; the customer's router will dial again within seconds."
+        if disconnected else
+        "The customer had no live session on the router, so there was nothing to drop."
+    )
+    return {"customer_id": customer_id, "router_id": router_id, "disconnected": disconnected,
+            "message": message}
