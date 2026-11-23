@@ -2857,3 +2857,117 @@ async def close_hotspot_proxy_bypass(
     if not result.get("success"):
         raise HTTPException(status_code=502, detail={"message": "The router refused part of the change", **result})
     return {"success": True, "message": "The hotspot proxy can no longer be used to browse without paying.", **result}
+
+
+# ---- Fleet: routers missing the anti-bypass rule (admin only) ----------------
+
+ANTI_BYPASS_SCAN_MAX = 100
+ANTI_BYPASS_APPLY_MAX = 50
+
+
+@router.get("/api/admin/anti-bypass/scan")
+async def scan_fleet_anti_bypass(
+    limit: int = Query(40, ge=1, le=ANTI_BYPASS_SCAN_MAX),
+    offset: int = Query(0, ge=0),
+    concurrency: int = Query(3, ge=1, le=6),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Admin only. Read-only fleet scan for the HTTP Injector bypass: which online
+    routers (last_status true) have a hotspot whose proxy is open because Bitwave's
+    relay block is missing. Same check as GET /api/routers/{id}/checkup. Pages
+    through the online routers by id (`offset`, `limit`, `next_offset`), a few
+    routers at a time. Returns router id, account id and status per router
+    (open / protected / no_hotspot / unreachable / error); `open` lists the ids to
+    pass to POST /api/admin/anti-bypass/apply. Changes nothing."""
+    from app.services import anti_bypass_fleet
+
+    user = await get_current_user(token, db)
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin role required")
+
+    online = Router.last_status.is_(True)
+    total = (await db.execute(select(func.count()).select_from(Router).where(online))).scalar() or 0
+    routers = (await db.execute(
+        select(Router).where(online).order_by(Router.id).offset(offset).limit(limit)
+    )).scalars().all()
+    infos = [anti_bypass_fleet.router_info(r) for r in routers]
+    ids = [i["id"] for i in infos]
+    with_setup = set((await db.execute(
+        select(ProvisioningToken.router_id).where(ProvisioningToken.router_id.in_(ids)).distinct()
+    )).scalars().all()) if ids else set()
+    await db.commit()   # nothing held open across the RouterOS calls
+
+    results = await anti_bypass_fleet.scan(infos, concurrency)
+    for r in results:
+        r["fixable"] = r["router_id"] in with_setup
+    next_offset = offset + len(infos)
+    return {
+        "online_total": total,
+        "offset": offset,
+        "scanned": len(results),
+        "next_offset": next_offset if next_offset < total else None,
+        "summary": anti_bypass_fleet.summarize(results),
+        "open": [r["router_id"] for r in results if r["status"] == "open"],
+        "results": results,
+    }
+
+
+class AntiBypassApplyRequest(BaseModel):
+    router_ids: List[int]
+    concurrency: int = 3
+
+    @field_validator("router_ids")
+    @classmethod
+    def _bounded(cls, v: List[int]) -> List[int]:
+        v = list(dict.fromkeys(v))
+        if not v:
+            raise ValueError("router_ids must not be empty")
+        if len(v) > ANTI_BYPASS_APPLY_MAX:
+            raise ValueError(f"at most {ANTI_BYPASS_APPLY_MAX} routers per call")
+        return v
+
+
+@router.post("/api/admin/anti-bypass/apply")
+async def apply_fleet_anti_bypass(
+    request: AntiBypassApplyRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Admin only. Close the HTTP Injector bypass on the given routers (at most 50),
+    a few at a time: exactly what POST /api/routers/{id}/anti-bypass does
+    (idempotent), then the check-up's check again on each router. One failure does
+    not stop the batch. Per router: fixed / failed / unreachable / error /
+    not_found / no_setup_record."""
+    from app.services import anti_bypass_fleet
+    from app.services.provisioning import portal_allow_entries
+
+    user = await get_current_user(token, db)
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin role required")
+
+    ids = request.router_ids
+    routers = {r.id: r for r in (await db.execute(select(Router).where(Router.id.in_(ids)))).scalars().all()}
+    tokens: dict[int, ProvisioningToken] = {}
+    for pt in (await db.execute(
+        select(ProvisioningToken).where(ProvisioningToken.router_id.in_(ids))
+        .order_by(ProvisioningToken.created_at.desc())
+    )).scalars().all():
+        tokens.setdefault(pt.router_id, pt)   # the latest setup record, as the one-router fix uses
+
+    skipped: dict[int, dict] = {}
+    jobs: list[tuple[dict, list[str]]] = []
+    for rid in ids:
+        r = routers.get(rid)
+        if r is None:
+            skipped[rid] = {"router_id": rid, "account_id": None, "status": "not_found"}
+        elif rid not in tokens:
+            skipped[rid] = {"router_id": rid, "account_id": r.user_id, "status": "no_setup_record"}
+        else:
+            jobs.append((anti_bypass_fleet.router_info(r), portal_allow_entries(tokens[rid])))
+    await db.commit()   # nothing held open across the RouterOS calls
+
+    done = {r["router_id"]: r for r in await anti_bypass_fleet.apply(jobs, request.concurrency)}
+    results = [done.get(rid) or skipped[rid] for rid in ids]
+    logger.info("Fleet anti-bypass by admin %s: %s", user.id, anti_bypass_fleet.summarize(results))
+    return {"summary": anti_bypass_fleet.summarize(results), "results": results}
