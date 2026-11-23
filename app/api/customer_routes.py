@@ -2420,8 +2420,12 @@ async def deactivate_pppoe_customer(
             raise HTTPException(status_code=400, detail="Customer does not have PPPoE credentials")
 
         remove_result = None
+        router_removal_pending = False
         if customer.router:
             payload = build_pppoe_remove_payload(customer, customer.router)
+            # The safety net (reconcile_inactive_pppoe_access_background) only
+            # covers direct-API routers.
+            deferrable = customer.router.auth_method != RouterAuthMethod.RADIUS
             await db.commit()
             remove_result = await call_pppoe_remove(payload)
             if not remove_result or not remove_result.get("success"):
@@ -2430,6 +2434,23 @@ async def deactivate_pppoe_customer(
                     if isinstance(remove_result, dict)
                     else "PPPoE removal returned no result"
                 )
+            if (
+                deferrable
+                and isinstance(remove_result, dict)
+                and remove_result.get("error") == "Failed to connect to router"
+            ):
+                # Router unreachable (CR-1123-B8): deactivate in billing now. The
+                # inactive-PPPoE safety net removes the secret and any session
+                # once the router is back, then records the success log that
+                # stops it repeating; until then there is no success log here.
+                router_removal_pending = True
+                logger.warning(
+                    "PPPoE customer %s deactivated while router %s is unreachable; "
+                    "router removal deferred to the inactive-PPPoE safety net",
+                    customer_id,
+                    customer.router_id,
+                )
+            elif not remove_result or not remove_result.get("success"):
                 logger.error(
                     "Refusing to deactivate PPPoE customer %s because router "
                     "enforcement failed: %s",
@@ -2454,19 +2475,51 @@ async def deactivate_pppoe_customer(
                 status="success",
                 details="Manual deactivation confirmed session and secret absent",
             ))
+        elif router_removal_pending:
+            db.add(ProvisioningLog(
+                customer_id=customer.id,
+                router_id=customer.router_id,
+                action="pppoe_deactivation",
+                status="pending",
+                details=(
+                    "Manual deactivation while the router was unreachable; the "
+                    "inactive-PPPoE safety net removes the secret when it is back"
+                ),
+            ))
         await db.commit()
         await record_customer_event(
             customer.id, "pppoe_deactivated",
-            "PPPoE deactivated: session disconnected and secret removed from the router",
+            (
+                "PPPoE deactivated in Bitwave; the router was unreachable, so the "
+                "secret and session are removed when it is back online"
+                if router_removal_pending
+                else "PPPoE deactivated: session disconnected and secret removed from the router"
+            ),
+            severity="warning" if router_removal_pending else "info",
             actor=user, user_id=user.id, router_id=customer.router_id,
         )
 
+        if router_removal_pending:
+            message = (
+                "The customer is deactivated in Bitwave. Their router is offline right "
+                "now, so their PPPoE login will be removed from the router automatically "
+                "when it is back online. Nothing else needs to be done."
+            )
+        elif remove_result:
+            message = "The customer is deactivated and removed from the router."
+        else:
+            message = "The customer is deactivated in Bitwave."
         return {
             "success": True,
             "customer_id": customer.id,
             "status": customer.status.value,
-            "remove_result": "ok" if remove_result and remove_result.get("success") else "failed",
+            "remove_result": (
+                "pending" if router_removal_pending
+                else "ok" if remove_result and remove_result.get("success") else "failed"
+            ),
             "remove_error": remove_result.get("error") if remove_result else None,
+            "router_removal_pending": router_removal_pending,
+            "message": message,
         }
     except HTTPException:
         raise
