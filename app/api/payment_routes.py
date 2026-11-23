@@ -14,6 +14,7 @@ from app.db.models import (
     OutageCompensation, OutageCompensationItem, PaymentStatus, UserRole,
 )
 from app.services.auth import verify_token, get_current_user
+from app.services import local_day
 from app.services.subscription import enforce_active_subscription
 from app.services.hotspot_provisioning import (
     build_hotspot_payload,
@@ -1413,9 +1414,9 @@ async def get_mpesa_transactions(
     - router_id: Filter by specific router (optional)
     - customer_id: Only this customer's payments -- their account history (optional)
     - payment_method: Filter by type -- mobile_money, voucher, cash, card, etc. (optional)
-    - date: Exact date filter (YYYY-MM-DD) -- returns transactions for that day only (optional)
-    - start_date: Range start (ISO format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS) (optional)
-    - end_date: Range end (ISO format) (optional)
+    - date: Exact date filter (YYYY-MM-DD) -- that calendar day on the account's own clock (optional)
+    - start_date: Range start: YYYY-MM-DD (a local day) or a time with its offset, e.g. 2026-11-23T00:30:00+03:00 (optional)
+    - end_date: Range end, inclusive, same forms (optional)
     - status: Filter by status -- completed, pending, failed, expired (optional)
     - search: Find one payment by its M-Pesa code or phone (exact; optional)
     - limit: Max results per page (default 200)
@@ -1426,26 +1427,24 @@ async def get_mpesa_transactions(
         # Called directly (not over HTTP) the default is the Query() marker.
         search = (search.strip() or None) if isinstance(search, str) else None
 
-        # Parse date filters once
+        # Parse date filters once. A date alone is that day on the account's
+        # own clock (local_day), not a UTC day.
         date_start = None
         date_end = None
         if date:
             try:
-                date_start = datetime.strptime(date, "%Y-%m-%d")
-                date_end = date_start.replace(hour=23, minute=59, second=59)
+                date_start, date_end = local_day.day_bounds(date, user)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
         else:
             if start_date:
                 try:
-                    date_start = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+                    date_start = local_day.range_start(start_date, user)
                 except ValueError:
                     raise HTTPException(status_code=400, detail="Invalid start_date format")
             if end_date:
                 try:
-                    date_end = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-                    if "T" not in end_date:
-                        date_end = date_end.replace(hour=23, minute=59, second=59)
+                    date_end = local_day.range_end(end_date, user)
                 except ValueError:
                     raise HTTPException(status_code=400, detail="Invalid end_date format")
 
@@ -2182,17 +2181,14 @@ async def get_mpesa_transactions_summary(
         date_end = None
         if date:
             try:
-                date_start = datetime.strptime(date, "%Y-%m-%d")
-                date_end = date_start.replace(hour=23, minute=59, second=59)
+                date_start, date_end = local_day.day_bounds(date, user)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
         else:
             if start_date:
-                date_start = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+                date_start = local_day.range_start(start_date, user)
             if end_date:
-                date_end = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-                if "T" not in end_date:
-                    date_end = date_end.replace(hour=23, minute=59, second=59)
+                date_end = local_day.range_end(end_date, user)
 
         rows = []
         want_mpesa = payment_method in (None, "mobile_money")
@@ -2471,16 +2467,14 @@ async def get_failed_mpesa_transactions(
         
         if start_date:
             try:
-                start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                start_dt = local_day.range_start(start_date, user)
                 stmt = stmt.where(MpesaTransaction.created_at >= start_dt)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid start_date format. Use ISO format (YYYY-MM-DD)")
         
         if end_date:
             try:
-                end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-                if 'T' not in end_date:
-                    end_dt = end_dt.replace(hour=23, minute=59, second=59)
+                end_dt = local_day.range_end(end_date, user)
                 stmt = stmt.where(MpesaTransaction.created_at <= end_dt)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid end_date format. Use ISO format (YYYY-MM-DD)")

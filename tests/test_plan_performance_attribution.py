@@ -144,7 +144,9 @@ async def test_plans_performance_uses_purchased_plan(db, monkeypatch):
 async def test_plans_performance_keeps_plans_without_sales_in_period(db, monkeypatch):
     await _setup(db, monkeypatch)
 
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    # A date alone is the reseller's own (Nairobi) day, so "today" is that date.
+    from app.services.subscription_reminders import to_local
+    today = to_local(datetime.utcnow(), "Africa/Nairobi").strftime("%Y-%m-%d")
     plans = await _plan_performance(db, start_date=today, end_date=today)
 
     assert set(plans) == {"Daily", "Weekly", "Unsold"}
