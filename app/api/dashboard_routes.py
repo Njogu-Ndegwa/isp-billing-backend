@@ -15,6 +15,7 @@ from app.db.models import (
     ShopOrder, ShopOrderPaymentStatus, UserRole, User,
 )
 from app.services.auth import verify_token, get_current_user
+from app.services import local_day
 from app.services.markets import REPORTING_CURRENCY, reseller_market, sql_kes_by_market
 from app.services.subscription import get_invoice_alert_for_user
 from app.services.subscription_reminders import _zone as market_zone
@@ -96,7 +97,7 @@ async def get_dashboard_overview(
     - router_id: Optional router ID to filter metrics for a specific router
     
     Returns:
-    - Total revenue (today, this week, this month, all time)
+    - Total revenue (today, this week, this month, all time; days on the account's own clock)
     - Active guests count
     - Total guests count
     - Revenue by router (or single router if router_id specified)
@@ -107,11 +108,14 @@ async def get_dashboard_overview(
         user = await get_current_user(token, db)
         user_id = user.id
         
-        now = datetime.utcnow()
-        today_start = datetime(now.year, now.month, now.day)
-        week_start = today_start - timedelta(days=now.weekday())
-        month_start = datetime(now.year, now.month, 1)
-        
+        now = _utcnow()
+        # Today, this week (from Monday) and this month are the account's own
+        # calendar (local_day), as naive UTC bounds for created_at.
+        local_today = datetime.combine(local_day.today(user, now), datetime.min.time())
+        today_start = local_day.from_wall_clock(local_today, user)
+        week_start = local_day.from_wall_clock(local_today - timedelta(days=local_today.weekday()), user)
+        month_start = local_day.from_wall_clock(local_today.replace(day=1), user)
+
         # Get all customers for this user (optionally filtered by router)
         customers_stmt = select(Customer).where(Customer.user_id == user_id)
         if router_id:
@@ -712,12 +716,16 @@ async def get_revenue_over_time(
 
     period: 7d | 30d | 90d | 6m | 1y  (ignored when start_date+end_date provided)
     group_by is auto-selected: daily ≤30 days, weekly ≤180 days, monthly otherwise
+    Days are the account's own calendar days (YYYY-MM-DD, local midnight to midnight).
     """
     try:
         user = await get_current_user(token, db)
         user_id = user.id
 
-        now = datetime.utcnow()
+        # Days, weeks and months are the account's own calendar (local_day):
+        # range_start/range_end are local midnights; the query uses them in UTC
+        # and every payment is bucketed by its local time.
+        now = local_day.wall_clock(_utcnow(), user)
 
         if start_date and end_date:
             try:
@@ -746,8 +754,8 @@ async def get_revenue_over_time(
 
         # Fetch all completed payments in the range
         base_where = [
-            CustomerPayment.created_at >= range_start,
-            CustomerPayment.created_at < range_end,
+            CustomerPayment.created_at >= local_day.from_wall_clock(range_start, user),
+            CustomerPayment.created_at < local_day.from_wall_clock(range_end, user),
             CustomerPayment.status == PaymentStatus.COMPLETED,
         ]
         if user.role != UserRole.ADMIN:
@@ -800,7 +808,7 @@ async def get_revenue_over_time(
                 return d.strftime("%b %Y")
 
         for row in rows:
-            key = bucket_key(row.created_at)
+            key = bucket_key(local_day.wall_clock(row.created_at, user))
             if key not in buckets:
                 buckets[key] = {"revenue": 0.0, "transactions": 0}
             # Count every payment, but only add to revenue when it counts as
@@ -1068,7 +1076,7 @@ async def get_daily_revenue_metrics(
     
     Query params:
     - router_id: Optional router ID to filter revenue for a specific router
-    - date: YYYY-MM-DD format (defaults to today)
+    - date: YYYY-MM-DD format (defaults to today), a day on the account's own clock; hours are local too
     """
     try:
         user = await get_current_user(token, db)
@@ -1081,11 +1089,14 @@ async def get_daily_revenue_metrics(
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
         else:
-            target_date = datetime.utcnow()
-        
+            target_date = local_day.wall_clock(_utcnow(), user)
+
+        # The day and its hours are on the account's own clock (local_day);
+        # day_start is the local date, the query bounds are its UTC midnights.
         day_start = datetime(target_date.year, target_date.month, target_date.day)
-        day_end = day_start + timedelta(days=1)
-        
+        utc_start = local_day.from_wall_clock(day_start, user)
+        utc_end = local_day.from_wall_clock(day_start + timedelta(days=1), user)
+
         # Get all payments for the day ordered by time
         if router_id:
             payments_stmt = select(
@@ -1096,8 +1107,8 @@ async def get_daily_revenue_metrics(
                 Customer, CustomerPayment.customer_id == Customer.id
             ).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= day_start,
-                CustomerPayment.created_at < day_end,
+                CustomerPayment.created_at >= utc_start,
+                CustomerPayment.created_at < utc_end,
                 func.coalesce(CustomerPayment.router_id, Customer.router_id) == router_id
             ).order_by(CustomerPayment.created_at)
         else:
@@ -1107,8 +1118,8 @@ async def get_daily_revenue_metrics(
                 CustomerPayment.counts_as_revenue
             ).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= day_start,
-                CustomerPayment.created_at < day_end
+                CustomerPayment.created_at >= utc_start,
+                CustomerPayment.created_at < utc_end
             ).order_by(CustomerPayment.created_at)
         
         result = await db.execute(payments_stmt)
@@ -1130,7 +1141,7 @@ async def get_daily_revenue_metrics(
             }
         
         for payment in payments:
-            hour = payment.created_at.hour
+            hour = local_day.wall_clock(payment.created_at, user).hour
             amount = float(payment.amount)
             # Count every payment, but only add to revenue when it counts as
             # revenue (compensation vouchers have counts_as_revenue=False).

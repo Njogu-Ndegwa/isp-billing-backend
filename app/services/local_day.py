@@ -35,6 +35,23 @@ def _day_end(day: date, user) -> datetime:
     return _day_start(day + timedelta(days=1), user) - _TICK
 
 
+def wall_clock(utc_naive: datetime, user) -> datetime:
+    """Naive UTC (as stored) -> naive wall time on the account's clock."""
+    zone = _zone(reseller_market(user).timezone)
+    return utc_naive.replace(tzinfo=timezone.utc).astimezone(zone).replace(tzinfo=None)
+
+
+def from_wall_clock(local_naive: datetime, user) -> datetime:
+    """Naive wall time on the account's clock -> naive UTC, for a DateTime column."""
+    zone = _zone(reseller_market(user).timezone)
+    return local_naive.replace(tzinfo=zone).astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def today(user, now_utc: datetime | None = None) -> date:
+    """The account's calendar date now (``now_utc`` is naive UTC; default: now)."""
+    return wall_clock(now_utc or datetime.utcnow(), user).date()
+
+
 def _read(value: str) -> tuple[date | None, datetime | None]:
     """A calendar day, or a moment as naive UTC. ValueError when it is neither."""
     text = value.strip()

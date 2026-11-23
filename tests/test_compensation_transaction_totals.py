@@ -246,7 +246,9 @@ async def test_revenue_over_time_excludes_comp_keeps_transaction_count(db, monke
     )
 
     # The day bucket for "today" must show the same: revenue 300, 2 transactions
-    today_key = datetime.utcnow().strftime("%Y-%m-%d")
+    # Buckets are the reseller's own (Nairobi) days.
+    from app.services.subscription_reminders import to_local
+    today_key = to_local(datetime.utcnow(), "Africa/Nairobi").strftime("%Y-%m-%d")
     today_bucket = next(
         (p for p in result["data"] if p["date"] == today_key), None
     )
