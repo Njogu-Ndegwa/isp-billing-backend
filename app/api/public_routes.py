@@ -755,7 +755,7 @@ async def get_portal_data(
         ResellerPaymentMethodType,
         User,
     )
-    from app.api.portal_routes import _build_public_response
+    from app.api.portal_routes import _build_public_response, get_router_theme
 
     stmt = (
         select(Router, User, ResellerPaymentMethod.method_type)
@@ -859,7 +859,10 @@ async def get_portal_data(
             "sharing_enabled": bool(shareable_plans),
             "max_shared_users": max_shared_users,
         },
-        "portal_settings": _build_public_response(portal_settings, reseller),
+        # The account's settings, with this router's own theme (if any) on top.
+        "portal_settings": _build_public_response(
+            portal_settings, reseller, await get_router_theme(db, router_obj.id)
+        ),
     }
 
 

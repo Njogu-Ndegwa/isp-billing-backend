@@ -856,6 +856,21 @@
   "user_id",
   "valid_until"
  ],
+ "portal_router_themes": [
+  "color_theme",
+  "company_logo_url",
+  "created_at",
+  "footer_text",
+  "header_bg_image_url",
+  "header_style",
+  "id",
+  "router_id",
+  "show_welcome_banner",
+  "updated_at",
+  "user_id",
+  "welcome_subtitle",
+  "welcome_title"
+ ],
  "portal_settings": [
   "announcement_text",
   "announcement_type",

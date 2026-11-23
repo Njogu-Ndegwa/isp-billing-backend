@@ -23,7 +23,7 @@ from app.db.models import (
     ProvisioningAttempt, CustomerUsagePeriod, UsageCapWatchState,
     Lead, LeadActivity, LeadFollowUp, LeadSource,
     FapshiTransaction, MtnMomoTransaction, AccessCredential,
-    PortalSettings, ShopProduct, ShopOrder, ShopOrderItem, ShopOrderTracking,
+    PortalRouterTheme, PortalSettings, ShopProduct, ShopOrder, ShopOrderItem, ShopOrderTracking,
     SubscriptionShareCode, C2BTransaction, UnmatchedC2BPayment,
     SmsCreditAccount, SmsCreditTransaction, SmsCreditOrder, MessageTemplate,
     SmsCampaign, SmsMessage, ResellerInboxMessage,
@@ -2090,6 +2090,7 @@ async def delete_reseller(
     )
 
     # Captive portal/shop data and cross-row shop references.
+    await db.execute(delete(PortalRouterTheme).where(PortalRouterTheme.user_id == reseller_id))
     await db.execute(delete(PortalSettings).where(PortalSettings.user_id == reseller_id))
     await db.execute(
         update(ShopOrderTracking)

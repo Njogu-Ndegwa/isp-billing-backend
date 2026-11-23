@@ -6,7 +6,7 @@ from typing import Optional, Literal
 from datetime import datetime
 
 from app.db.database import get_db
-from app.db.models import PortalSettings, Router, User
+from app.db.models import PortalRouterTheme, PortalSettings, Router, User
 from app.services.auth import verify_token, get_current_user
 from app.services.subscription import enforce_active_subscription
 from app.services.router_helpers import get_router_by_id
@@ -173,6 +173,50 @@ class PortalSettingsUpdate(BaseModel):
         return v
 
 
+# The part of the portal a single router can override: its look. Everything
+# else (support contacts, ads, ratings, language, package order) stays
+# account-wide. Mirrors the columns of PortalRouterTheme.
+ROUTER_THEME_FIELDS = (
+    "color_theme",
+    "header_style",
+    "show_welcome_banner",
+    "welcome_title",
+    "welcome_subtitle",
+    "company_logo_url",
+    "header_bg_image_url",
+    "footer_text",
+)
+
+
+class RouterThemeUpdate(BaseModel):
+    """Body of PUT /api/portal/router-themes/{router_id}.
+
+    Only the fields sent change. A field sent as null goes back to the account
+    default for this router, and a field never set follows the account default.
+    Other portal settings are rejected because they are account-wide.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    color_theme: Optional[str] = None
+    header_style: Optional[str] = None
+    show_welcome_banner: Optional[bool] = None
+    welcome_title: Optional[str] = None
+    welcome_subtitle: Optional[str] = None
+    company_logo_url: Optional[str] = None
+    header_bg_image_url: Optional[str] = None
+    footer_text: Optional[str] = None
+
+    @field_validator("color_theme")
+    @classmethod
+    def validate_theme(cls, v):
+        return PortalSettingsUpdate.validate_theme(v)
+
+    @field_validator("header_style")
+    @classmethod
+    def validate_header_style(cls, v):
+        return PortalSettingsUpdate.validate_header_style(v)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -234,6 +278,52 @@ async def _get_or_create_settings(db: AsyncSession, user_id: int) -> PortalSetti
         await db.commit()
         await db.refresh(settings)
     return settings
+
+
+async def get_router_theme(db: AsyncSession, router_id: int) -> Optional[PortalRouterTheme]:
+    """This router's own theme, or None when it uses the account default."""
+    result = await db.execute(
+        select(PortalRouterTheme).where(PortalRouterTheme.router_id == router_id)
+    )
+    return result.scalar_one_or_none()
+
+
+def _overridden_fields(theme: Optional[PortalRouterTheme]) -> list:
+    if theme is None:
+        return []
+    return [f for f in ROUTER_THEME_FIELDS if getattr(theme, f) is not None]
+
+
+def _apply_router_theme(settings: dict, theme: Optional[PortalRouterTheme]) -> dict:
+    """Lay a router's own theme over the account settings, field by field."""
+    merged = dict(settings)
+    for field in _overridden_fields(theme):
+        merged[field] = getattr(theme, field)
+    return merged
+
+
+async def _owned_router(db: AsyncSession, router_id: int, user: User) -> Router:
+    role = user.role.value if hasattr(user.role, "value") else user.role
+    router_obj = await get_router_by_id(db, router_id, user.id, role)
+    if router_obj is None:
+        raise HTTPException(status_code=404, detail="Router not found")
+    return router_obj
+
+
+async def _router_theme_payload(db: AsyncSession, router_obj: Router) -> dict:
+    account = _settings_to_dict(await _get_or_create_settings(db, router_obj.user_id))
+    theme = await get_router_theme(db, router_obj.id)
+    return {
+        "router_id": router_obj.id,
+        "router_name": router_obj.name,
+        "has_override": theme is not None,
+        "overridden_fields": _overridden_fields(theme),
+        "theme_fields": list(ROUTER_THEME_FIELDS),
+        # What this router's portal shows: the account settings with this
+        # router's own theme laid over them.
+        "settings": _apply_router_theme(account, theme),
+        "account_settings": account,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -362,6 +452,116 @@ async def reset_portal_settings(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Per-router themes (auth required)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/api/portal/router-themes")
+async def list_router_themes(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Every router on the account, and whether it has its own portal theme."""
+    user = await get_current_user(token, db)
+    routers = (await db.execute(
+        select(Router).where(Router.user_id == user.id).order_by(Router.name, Router.id)
+    )).scalars().all()
+    themes = {
+        t.router_id: t
+        for t in (await db.execute(
+            select(PortalRouterTheme).where(PortalRouterTheme.user_id == user.id)
+        )).scalars().all()
+    }
+    return {
+        "theme_fields": list(ROUTER_THEME_FIELDS),
+        "routers": [
+            {
+                "router_id": r.id,
+                "router_name": r.name,
+                "identity": r.identity,
+                "has_override": r.id in themes,
+                "overridden_fields": _overridden_fields(themes.get(r.id)),
+                "updated_at": (
+                    themes[r.id].updated_at.isoformat()
+                    if r.id in themes and themes[r.id].updated_at else None
+                ),
+            }
+            for r in routers
+        ],
+    }
+
+
+@router.get("/api/portal/router-themes/{router_id}")
+async def get_router_theme_settings(
+    router_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """What this router's captive portal shows, and which fields are its own."""
+    user = await get_current_user(token, db)
+    router_obj = await _owned_router(db, router_id, user)
+    return await _router_theme_payload(db, router_obj)
+
+
+@router.put("/api/portal/router-themes/{router_id}")
+async def update_router_theme(
+    router_id: int,
+    request: RouterThemeUpdate,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Give this router its own look. Only the fields sent change; a field sent
+    as null goes back to the account default for this router."""
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
+    router_obj = await _owned_router(db, router_id, user)
+
+    theme = await get_router_theme(db, router_obj.id)
+    if theme is None:
+        theme = PortalRouterTheme(router_id=router_obj.id, user_id=router_obj.user_id)
+        db.add(theme)
+
+    changed = [f for f in ROUTER_THEME_FIELDS if f in request.model_fields_set]
+    for field in changed:
+        setattr(theme, field, getattr(request, field))
+    theme.updated_at = datetime.utcnow()
+
+    if not _overridden_fields(theme):
+        # Nothing of its own left, so the router is back on the default.
+        if theme.id is not None:
+            await db.delete(theme)
+        else:
+            db.expunge(theme)
+    await db.commit()
+
+    logger.info("Portal theme for router %s (user %s) updated: %s", router_obj.id, user.id, changed)
+    payload = await _router_theme_payload(db, router_obj)
+    payload["message"] = "Router theme updated"
+    payload["updated_fields"] = changed
+    return payload
+
+
+@router.delete("/api/portal/router-themes/{router_id}")
+async def reset_router_theme(
+    router_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Put this router back on the account's default theme."""
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
+    router_obj = await _owned_router(db, router_id, user)
+
+    theme = await get_router_theme(db, router_obj.id)
+    if theme is not None:
+        await db.delete(theme)
+        await db.commit()
+    logger.info("Portal theme for router %s (user %s) reset to default", router_obj.id, user.id)
+    payload = await _router_theme_payload(db, router_obj)
+    payload["message"] = "Router now uses the default theme"
+    return payload
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public endpoint (no auth) — called by captive portal frontend
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -389,16 +589,37 @@ async def get_public_portal_settings(
         select(PortalSettings).where(PortalSettings.user_id == router_obj.user_id)
     )
     settings = result.scalar_one_or_none()
+    router_theme = await get_router_theme(db, router_obj.id)
 
-    if settings is None:
-        # Return defaults without persisting a row
-        return _build_public_response(None, reseller)
-
-    return _build_public_response(settings, reseller)
+    # A missing account row means defaults, served without persisting a row.
+    return _build_public_response(settings, reseller, router_theme)
 
 
-def _build_public_response(settings: Optional[PortalSettings], reseller: Optional[User]) -> dict:
-    """Build the public-facing settings payload with sensible fallbacks."""
+def _build_public_response(
+    settings: Optional[PortalSettings],
+    reseller: Optional[User],
+    router_theme: Optional[PortalRouterTheme] = None,
+) -> dict:
+    """Build the public-facing settings payload with sensible fallbacks.
+
+    `router_theme` is this router's own look, if it has one; its set fields
+    win over the account settings. Without one the payload is exactly the
+    account's, as it was before per-router themes existed.
+    """
+    payload = _build_account_public_response(settings, reseller)
+    overridden = _overridden_fields(router_theme)
+    for field in overridden:
+        payload[field] = getattr(router_theme, field)
+    if "welcome_title" in overridden and not payload["welcome_title"]:
+        # Same fallback as the account title: the business name.
+        payload["welcome_title"] = (
+            (reseller.business_name or reseller.organization_name) if reseller else None
+        )
+    return payload
+
+
+def _build_account_public_response(settings: Optional[PortalSettings], reseller: Optional[User]) -> dict:
+    """The account-wide public payload, with sensible fallbacks."""
 
     fallback_support_phone = reseller.support_phone if reseller else None
     org_name = reseller.organization_name if reseller else None
