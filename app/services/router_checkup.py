@@ -55,6 +55,20 @@ def finding(code: str, severity: str, title: str, detail: str, *, fix: Optional[
     return out
 
 
+def proxy_bypass_finding(filter_rules: list[dict], router_id: int) -> Optional[dict]:
+    """The open-proxy bypass check on a hotspot router's firewall filter rows:
+    a finding when Bitwave's relay block is missing, None when it is there.
+    Shared by the check-up and the fleet scan (anti_bypass_fleet)."""
+    if any(str(r.get("comment") or "") == PROXY_RELAY_BLOCK_COMMENT for r in filter_rules):
+        return None
+    return finding(
+        "proxy_bypass_open", "warn", "The hotspot can be bypassed without paying",
+        "The router's web proxy is open as a relay, which apps like HTTP Injector use to browse without "
+        "paying. Bitwave's block rule is not on this router.",
+        fix={"method": "POST", "path": f"/api/routers/{router_id}/anti-bypass",
+             "summary": "Close the hotspot proxy bypass (HTTP Injector)"})
+
+
 def check(api, router_id: int, now: Optional[datetime] = None) -> dict:
     """Run the checks on a connected MikroTikAPI. Never changes anything on the router."""
     now = now or datetime.now(timezone.utc)
@@ -110,13 +124,9 @@ def check(api, router_id: int, now: Optional[datetime] = None) -> dict:
         # 4. the open-proxy bypass (HTTP Injector): the relay block must be there
         rules = _rows(api.send_command("/ip/firewall/filter/print"))
         checked.append("hotspot bypass protection")
-        if not any(str(r.get("comment") or "") == PROXY_RELAY_BLOCK_COMMENT for r in rules):
-            found.append(finding(
-                "proxy_bypass_open", "warn", "The hotspot can be bypassed without paying",
-                "The router's web proxy is open as a relay, which apps like HTTP Injector use to browse without "
-                "paying. Bitwave's block rule is not on this router.",
-                fix={"method": "POST", "path": f"/api/routers/{router_id}/anti-bypass",
-                     "summary": "Close the hotspot proxy bypass (HTTP Injector)"}))
+        bypass = proxy_bypass_finding(rules, router_id)
+        if bypass:
+            found.append(bypass)
 
         # 5. devices let through without paying (stale bypassed bindings)
         bindings = _rows(api.send_command("/ip/hotspot/ip-binding/print"))
