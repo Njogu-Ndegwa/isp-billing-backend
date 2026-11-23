@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from app.config import settings
-from app.services.assistant import executor, known_issues, shaping, store, listing
+from app.services.assistant import executor, known_issues, shaping, store, listing, router_names
 from app.services.assistant.usage import TurnUsage
 from app.services.assistant.caller import Caller
 from urllib.parse import quote
@@ -228,6 +228,7 @@ How to work
 - If nothing in the index does what was asked, say so; do not improvise with an unrelated action.
 - If a call fails, read its error. Fix the request if you can (wrong field, missing id, wrong format); otherwise explain the error in plain words.
 - Ask a short question when the request is ambiguous in a way that matters (which of two customers, which router, how many days).
+- Two routers can share a name (a router row then lists the others in same_name_as). Never call one by that name alone: name each by identity and status, e.g. "#3 (Router-1735, online)", match other results to a router by its id, and ask which one is meant before acting on one.
 
 Getting started (onboarding)
 - A new account is set up in four steps, all done here in the chat: (1) connect a MikroTik router, (2) create the first plan, (3) add where customer payments go, (4) add a support phone number customers can call. Some accounts were set up before; check, do not assume.
@@ -1787,8 +1788,8 @@ class Turn:
                 })
         # figures over a cut list say when the read itself was only part of the list
         one_part = partial if narrowing else listing.partial_read(action.query_params, query, data)
-        out: dict = {"status": result.status,
-                     "data": localize_times(shaping.for_model(data, partial=one_part), await self._zone())}
+        out: dict = {"status": result.status, "data": localize_times(
+            shaping.for_model(router_names.mark_shared_names(data), partial=one_part), await self._zone())}
         if note:
             out["display"] = note
         if narrowed_note:
