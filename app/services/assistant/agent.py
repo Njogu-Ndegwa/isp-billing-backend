@@ -31,6 +31,7 @@ from app.services.assistant.catalog import (
     Action, Catalog, apply_form_values, body_problems, build_path, choice_groups, form_fields, get_catalog,
     pick_label,
 )
+from app.services.assistant.purpose import mark_purpose, purpose_problem
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,13 @@ TOOLS = [
                         "completes or corrects before Confirm. Put in body only what you know (for an "
                         "edit, the record's current values for the fields being changed); required "
                         "fields may be left out and the person fills them in."),
+                },
+                "purpose": {
+                    "type": "string",
+                    "description": (
+                        "For a form opened to set one field (add a phone, set the speed, rename): that "
+                        "field's exact name, e.g. \"phone\", \"speed\", \"name\". The card shows it first "
+                        "and Confirm waits until it is filled in and differs from what it was."),
                 },
                 "show": {
                     "type": "string", "enum": list(SHOW_VALUES),
@@ -775,6 +783,11 @@ class Turn:
             values = decision.get("values")
             if approve and isinstance(values, dict) and not await self._take_form_values(action_id, values):
                 continue  # refused: the card stays open with what to fix, nothing ran
+            if approve:
+                missed = await self._purpose_missed(action_id, values if isinstance(values, dict) else None)
+                if missed:
+                    lines.append(missed)  # the card stays open; the assistant says what is missing
+                    continue
             if approve and await self._preview_first(action_id):
                 continue  # what it would do is on the card now; the next Confirm does it
             if approve:
@@ -1040,6 +1053,26 @@ class Turn:
             if isinstance(row, dict):
                 names[cid] = pick_label(row, pick.get("label"))
         return names
+
+    async def _purpose_missed(self, action_id: str, typed: Optional[dict]) -> Optional[dict]:
+        """A card opened for one field, confirmed without it: refused, the card told why, and the
+        line for the model so it can say so. None when there is no purpose field or it is filled in."""
+        card = next((i for i in reversed(self.transcript)
+                     if i.get("type") == "action" and i.get("action_id") == action_id), None)
+        field = next((f for f in (card or {}).get("form") or [] if f.get("purpose")), None)
+        if field is None:
+            return None
+        action = await store.pending_action(self.caller, self.conversation["id"], action_id)
+        if action is None:
+            return None  # expired or decided: _run_confirmed says so
+        problem = purpose_problem(field, typed, action.get("body"))
+        if not problem:
+            return None
+        await self.emit("action_result", {"action_id": action_id, "status": "pending", "ok": False,
+                                          "detail": problem})
+        return {"action_id": action_id, "title": action["title"],
+                "outcome": problem + " The card is still open: ask the person to fill it in there, or to "
+                                     "tell you the value. Do not open another form for it."}
 
     async def _take_form_values(self, action_id: str, values: dict) -> bool:
         """Merge a form's values into its pending action. False (and the card told why) if they do not pass."""
@@ -1512,6 +1545,16 @@ class Turn:
         fields_for_form = form_fields(action, body, context, zone) if editable and body is not None else None
         if fields_for_form and not self.caller.is_admin:  # Bitwave-only fields (an ad's advertiser) are not asked
             fields_for_form = [f for f in fields_for_form if not f.get("admin_only")] or None
+        purpose = str(args.get("purpose") or "").strip()
+        if purpose and fields_for_form:
+            marked = mark_purpose(fields_for_form, purpose, context, method in ("PUT", "PATCH"), zone)
+            if marked is None:
+                return self._tool_result(tool_use_id, {
+                    "error": f"Not proposed: purpose '{purpose[:60]}' is not a field of this form. Its fields: "
+                             + ", ".join(f["name"] for f in fields_for_form if f.get("kind") != "password")
+                             + ". Send it again with one of those, or without purpose.",
+                }, True)
+            fields_for_form = marked
         narrowed = await self._offer_choices(fields_for_form, args.get("narrow"), method in ("PUT", "PATCH"),
                                              params, body) if fields_for_form else {}
         empty = {name: n for name, n in narrowed.items() if not n["fit"]}
