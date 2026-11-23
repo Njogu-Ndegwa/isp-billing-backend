@@ -13,6 +13,7 @@ from app.services.mikrotik_api import MikroTikAPI, normalize_mac_address
 from app.services.router_helpers import get_router_by_id
 from app.services.log_persistence import persist_notable_logs
 from app.services.router_concurrency import run_with_guard
+from app.services.router_time import read_router_clock, stamp_router_times
 from app.services.router_availability import (
     record_router_availability,
     router_recently_offline,
@@ -256,7 +257,9 @@ def _hotspot_logs_sync(router_info: dict, search: str = "", limit: int = 50) -> 
         if search:
             search_lower = search.lower()
             entries = [e for e in entries if search_lower in e.get("message", "").lower()]
-        return {"success": True, "data": entries[-limit:], "count": len(entries[-limit:])}
+        # Log stamps are the router's own clock: add true UTC next to each.
+        entries = stamp_router_times(entries[-limit:], read_router_clock(api))
+        return {"success": True, "data": entries, "count": len(entries)}
     except Exception as e:
         logger.error(f"Hotspot logs error: {e}")
         return {"error": str(e)}

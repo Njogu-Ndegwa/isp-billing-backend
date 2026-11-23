@@ -31,6 +31,7 @@ from app.services.device_classifier import classify_device, infer_hotspot_subnet
 from app.core.protected_devices import is_protected_device
 from app.services.router_availability import record_router_availability
 from app.services.router_concurrency import run_with_guard
+from app.services.router_time import read_router_clock, stamp_router_times
 from app.services import port_restart
 from app.services.router_remote_access import configure_router_remote_access_sync
 from app.services.provisioning import provision_base_url_for_vpn, fetch_certificate_flag_for_url
@@ -6120,7 +6121,7 @@ def _get_hotspot_diagnostics_sync(router_info: dict) -> dict:
         hosts_rows = _rows(hosts)
         fw_filter_rows = _rows(fw_filter)
         fw_nat_rows = _rows(fw_nat)
-        log_rows = _rows(hotspot_logs)
+        log_rows = stamp_router_times(_rows(hotspot_logs), read_router_clock(api))
 
         # ---- Findings -----------------------------------------------------
         findings = []
