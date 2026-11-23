@@ -22,6 +22,7 @@ from app.db.models import (
     UserRole,
 )
 from app.services import realtime_state
+from app.services import router_metric_history
 from app.services.static_ip import normalize_static_ip
 from app.services.auth import verify_token, get_current_user
 from app.services.usage_tracking import (
@@ -675,6 +676,51 @@ async def get_router_live(
             for d in devices
         ],
     )
+
+
+class HealthHistorySummaryOut(BaseModel):
+    cpu_avg: Optional[float]
+    cpu_max: Optional[int]
+    mem_avg: Optional[float]
+    mem_max: Optional[int]
+    reboots: int
+    link_drops: int
+    buckets_with_data: int
+
+
+class HealthHistoryOut(BaseModel):
+    """Column-wise series: slot i covers [start + i*step, start + (i+1)*step)."""
+    router_id: int
+    range: str
+    step_seconds: int
+    start: datetime
+    slots: int
+    cpu_avg: list[Optional[float]]
+    cpu_max: list[Optional[int]]
+    mem_avg: list[Optional[float]]
+    mem_max: list[Optional[int]]
+    reboots: list[int]
+    link_drops: list[int]
+    summary: HealthHistorySummaryOut
+
+
+@router.get("/api/routers/{router_id}/health-history", response_model=HealthHistoryOut)
+async def get_router_health_history(
+    router_id: int,
+    range_key: str = Query("24h", alias="range", pattern="^(24h|7d)$"),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """CPU and memory over time (average and peak per bucket), plus reboots and
+    WAN link drops: 5-minute buckets for 24h, hourly for 7d. Empty slots are
+    null. Read from router_metric_buckets, which is bounded by design."""
+    user = await get_current_user(token, db)
+    stmt = select(Router.id).where(Router.id == router_id)
+    if user.role != UserRole.ADMIN:
+        stmt = stmt.where(Router.user_id == user.id)
+    if (await db.execute(stmt)).scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Router not found or not accessible")
+    return await router_metric_history.history(db, router_id, range_key)
 
 
 async def _live_router_ids_for(db: AsyncSession, user) -> list[int]:

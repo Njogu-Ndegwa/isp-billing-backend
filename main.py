@@ -3307,6 +3307,20 @@ async def run_router_overload_alert_migrations():
     logger.info("Router overload-alert migrations complete")
 
 
+async def run_router_metric_history_migrations():
+    """Bounded health history for the router graphs (router_metric_history.py).
+    A new table only; nothing existing changes. Idempotent. Non-fatal: without
+    it the latest reading still records (the history write is in a savepoint)
+    and only the graphs are empty."""
+    from app.db.models import RouterMetricBucket
+
+    async with async_engine.begin() as conn:
+        await conn.run_sync(
+            lambda c: RouterMetricBucket.__table__.create(c, checkfirst=True)
+        )
+    logger.info("Migration: router_metric_buckets table ready")
+
+
 async def run_subscription_reminder_migrations():
     """Create the reseller subscription reminder log / dedupe table. Idempotent."""
     from app.db.models import SubscriptionExpiryReminder
@@ -4070,6 +4084,11 @@ async def startup_event():
         logger.info("Router status-alert migrations completed successfully")
     except Exception as e:
         logger.error(f"Router status-alert migration failed (non-fatal): {e}")
+
+    try:
+        await run_router_metric_history_migrations()
+    except Exception as e:
+        logger.error(f"Router metric-history migration failed (non-fatal): {e}")
 
     try:
         await run_static_ip_migrations()
