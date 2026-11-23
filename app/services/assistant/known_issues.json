@@ -888,7 +888,7 @@
       ],
       "cause": "When the M-Pesa prompt fails for many resellers at once, it's almost always Safaricom's side, not your setup. If only your customers are affected, look at your payment method setup (see payment-collection-setup) or the customer's own phone and line.",
       "checks": [
-        "GET /api/mpesa/transactions/failed for recent failed attempts and their errors.",
+        "GET /api/mpesa/transactions/failed for recent failed attempts and their errors. Each row's failure_fault and failure_explained say who is at fault: a wrong PIN ('initiator information is invalid'), a cancel, no answer or low balance is the customer, not your setup.",
         "GET /api/mpesa/transactions?router_id={router_id}: when did the last completed payment come in?",
         "Ask whether other resellers have the same problem now; ask the customer to retry with the phone unlocked and enough balance."
       ],
