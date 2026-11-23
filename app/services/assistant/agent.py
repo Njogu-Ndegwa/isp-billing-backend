@@ -236,7 +236,8 @@ Product facts (Bitwave support's own answers to resellers; check live data for n
 - Editing a plan that customers are on is risky; say so before proposing it.
 - PPPoE payments work two ways: customers pay the reseller directly and the reseller activates them (they still expire automatically), or customers pay through Bitwave, which activates and expires them itself and pays the reseller out. PPPoE customers are cut off automatically at expiry.
 - A customer with a TV or several devices: send them the connect link; it asks for their number and gives a code, or add the device to the customer by its MAC address.
-- SMS to customers picked by when their time ends ("expires today", "ran out this week"): the send's filter does it (expiring_today, expiring_tomorrow, expiring within 7 days, expired_recently); the customers list's expires filter shows who that is. Never send to a wider group and call it the same.
+- An action on a group of customers (SMS, and any other that takes customer_ids) whose fixed groups do not match what was asked ("ran out yesterday on router X", "PPPoE customers on Weekly 300"): read the customers list with its filters and where rules to get exactly them, show who that is, then pass their ids (customer_ids). Never offer a bigger or different group in its place; if none match, say so.
+- SMS to customers picked by when their time ends ("expires today", "ran out this week"): the send's filter does it (expiring_today, expiring_tomorrow, expiring within 7 days, expired_recently); the customers list's expires filter shows who that is.
 - SMS "can't send" or "shows zero": a send needs credits for every recipient × message part; check the balance and how many people they want to reach.
 - A new access point or router should show up by itself once it is added and provisioned; if it does not, check its provisioning.
 - Ads on the hotspot login page come in two kinds. Your own promo (POST /api/ads) advertises your own WiFi (bundles, offers) and always shows your support number from Settings. An ad for any other business, even a friend's shop, is an ad you sell (POST /api/ad-sales): the business pays by M-Pesa, Bitwave keeps 20% and the rest joins your payout. Ads only show when Show ads is on in portal settings. A photo or video is picked in the form, from the phone.
@@ -1559,6 +1560,35 @@ class Turn:
             **({"ignored_query_params": dropped} if dropped else {}),
         })
 
+    async def _all_pages(self, action: Action, path: str, query: Optional[dict], first: Any) -> tuple[Any, Optional[str]]:
+        """Every page of a paged list, joined, so a where rule sees all of it. Says when it stopped early."""
+        rows, _ = listing.find_list(first)
+        if rows is None:
+            return first, None
+        names = {p["name"] for p in action.query_params}
+        collected, data, q = list(rows), first, query
+        for _ in range(listing.MAX_PAGES):
+            q = listing.next_page(names, q, data, len(collected), len(listing.find_list(data)[0] or []))
+            if q is None:
+                break
+            if len(collected) >= listing.MAX_ROWS:
+                return listing.join_pages(first, collected), (
+                    f"Only the first {len(collected)} rows were read; add a server filter to cover the rest.")
+            result = await executor.call_api(self.app, self.caller, "GET", path, q, None)
+            page_rows = listing.find_list(result.data)[0] if result.ok else None
+            if not result.ok:
+                return listing.join_pages(first, collected), (
+                    f"Only the first {len(collected)} rows were read: the next page failed ({result.status}).")
+            if not page_rows:
+                break
+            collected.extend(page_rows)
+            data = result.data
+        else:
+            return listing.join_pages(first, collected), (
+                f"Only the first {len(collected)} rows were read ({listing.MAX_PAGES} pages); add a server "
+                "filter to cover the rest.")
+        return (listing.join_pages(first, collected) if len(collected) > len(rows) else first), None
+
     async def _read(self, tool_use_id, action: Action, method, path, query, body, show, dropped,
                     fields: Optional[dict] = None, narrowing: Optional[dict] = None) -> dict:
         call_id = uuid.uuid4().hex[:12]
@@ -1570,10 +1600,16 @@ class Turn:
         if not result.ok:
             return self._tool_result(tool_use_id, {"status": result.status, "error": result.detail()}, True)
         data, narrowed_note = result.data, None
+        partial = None
+        if narrowing and method == "GET":
+            # narrow the whole list, not its first page
+            data, partial = await self._all_pages(action, path, query, data)
         if narrowing:
             # what was asked, not the whole list: narrowed before anything is drawn
             try:
-                data, narrowed_note = listing.narrow(data, **narrowing)
+                data, narrowed_note = listing.narrow(data, **narrowing, tz_name=await self._zone())
+                if partial and narrowed_note is not None:
+                    narrowed_note["warning"] = partial
             except listing.ListingError as exc:
                 return self._tool_result(tool_use_id, {"error": str(exc)}, True)
         note = None

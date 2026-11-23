@@ -1473,6 +1473,43 @@ async def test_any_list_is_narrowed_by_its_rows_before_it_is_drawn(client, owner
 
 
 @pytest.mark.asyncio
+async def test_a_narrowed_list_reads_every_page_first(client, owner, db):
+    """"Whose time ends today" read from page one of many would quietly miss the rest."""
+    from datetime import datetime, timedelta as td
+
+    reseller, token = owner
+    plan = await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    now = datetime.utcnow()
+    for i in range(5):
+        await make_customer(db, reseller, plan, name=f"Far {i}", phone=f"25470000010{i}", expiry=now + td(days=20))
+    await make_customer(db, reseller, plan, name="Last Page", phone="254700000199", expiry=now + td(minutes=30))
+    await db.commit()
+    model = use_model([
+        tool_reply("call_api", {"method": "GET", "path": "/api/customers", "query": {"page": 1, "per_page": 2},
+                                "show": "table", "where": [{"field": "expiry", "op": "lte", "value": "now+2h"}]}, "tu_1"),
+        text_reply("One customer."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "who runs out soon?"},
+                                           headers=auth(token))).text)
+    told = [res for req in model.requests for res in tool_results(req)]
+    assert told[0]["narrowed"]["rows_read"] == 6, told[0]
+    assert told[0]["narrowed"]["rows_kept"] == 1
+    assert "warning" not in told[0]["narrowed"]
+
+
+@pytest.mark.asyncio
+async def test_customers_by_plan_on_the_server(client, owner, db):
+    reseller, token = owner
+    weekly = await make_plan(db, reseller, name="Weekly 300", price=300, duration_value=7)
+    daily = await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    await make_customer(db, reseller, weekly, name="On Weekly", phone="254700000021")
+    await make_customer(db, reseller, daily, name="On Daily", phone="254700000022")
+    await db.commit()
+    r = await client.get(f"/api/customers?plan_id={weekly.id}", headers=auth(token))
+    assert [c["name"] for c in r.json()] == ["On Weekly"]
+
+
+@pytest.mark.asyncio
 async def test_a_filter_an_action_does_not_have_is_refused_not_ignored(client, owner, db):
     """"Active customers" once came back with inactive ones: the unknown filter was
     dropped and the whole list drawn. Now nothing runs and the model is told why."""

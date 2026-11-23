@@ -1617,6 +1617,7 @@ async def get_customers_api(
                        Query(description="true: only those whose paid time has run out (paused ones excluded); false: leave them out")] = None,
     search: Annotated[Optional[str],
                       Query(max_length=80, description="Name, phone, account number or PPPoE username contains this")] = None,
+    plan_id: Annotated[Optional[int], Query(description="Only customers on this plan")] = None,
     expires: Annotated[Optional[Literal["today", "tomorrow", "next_7_days", "past_7_days"]],
                        Query(description=("Only customers whose paid time ends then: today or tomorrow (calendar days "
                                           "in the reseller's timezone; today includes earlier today), next_7_days, "
@@ -1657,6 +1658,8 @@ async def get_customers_api(
         elif tier_filter == "visitor":
             conditions.append(~has_paid)
         conditions.extend(_list_filters(status, connection_type, overdue, search, now))
+        if plan_id is not None:
+            conditions.append(Customer.plan_id == plan_id)
         if expires:
             from app.services.markets import reseller_market
             from app.services.sms_dispatch import expiry_between, expiry_window
