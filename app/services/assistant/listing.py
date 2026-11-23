@@ -29,7 +29,11 @@ WHERE_SCHEMA = {
         "plan.name, router.name). All rules must hold. Use it whenever the action has no query filter "
         "for what the person asked, e.g. [{\"field\": \"plan.name\", \"op\": \"eq\", \"value\": \"Weekly 300\"}], "
         "[{\"field\": \"amount\", \"op\": \"gte\", \"value\": 1000}], "
-        "[{\"field\": \"expiry\", \"op\": \"lt\", \"value\": \"now+48h\"}]. Dates take ISO times or now, now+3d, now-12h."),
+        "[{\"field\": \"expiry\", \"op\": \"lt\", \"value\": \"now+48h\"}]. Dates take ISO times, now, now+3d, now-12h, "
+        "or calendar moments in the person's own timezone: today_start, today_end, tomorrow_start, tomorrow_end, "
+        "yesterday_start, yesterday_end, week_start (Monday), month_start, last_month_start, year_start, each "
+        "with an optional offset (today_start-2d). Time ending today: [{\"field\": \"expiry\", \"op\": \"gt\", "
+        "\"value\": \"today_start\"}, {\"field\": \"expiry\", \"op\": \"lte\", \"value\": \"today_end\"}]."),
     "items": {
         "type": "object",
         "properties": {
@@ -89,20 +93,62 @@ def _get(row: dict, field: str) -> Any:
     return value
 
 
-_REL = re.compile(r"^now\s*(?:([+-])\s*(\d+(?:\.\d+)?)\s*([mhdw]))?$", re.I)
+_ANCHORS = ("now", "today_start", "today_end", "tomorrow_start", "tomorrow_end", "yesterday_start",
+            "yesterday_end", "week_start", "month_start", "last_month_start", "year_start")
+_REL = re.compile(r"^(" + "|".join(sorted(_ANCHORS, key=len, reverse=True)) +
+                  r")\s*(?:([+-])\s*(\d+(?:\.\d+)?)\s*([mhdw]))?$", re.I)
 _UNIT = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
 
 
-def _as_time(value: Any) -> Optional[datetime]:
+def _midnight(local: datetime, days: int) -> datetime:
+    """Local midnight `days` days from `local`'s day, safe across a clock change."""
+    day = local.replace(hour=12, minute=0, second=0, microsecond=0) + timedelta(days=days)
+    return day.replace(hour=0).astimezone(local.tzinfo) if local.tzinfo else day.replace(hour=0)
+
+
+def anchor_time(name: str, now: Optional[datetime] = None, tz_name: Optional[str] = None) -> datetime:
+    """A calendar moment ("today_end") as an aware UTC time, the day counted in `tz_name`."""
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    name = name.lower()
+    if name == "now":
+        return now
+    try:
+        zone = ZoneInfo(tz_name) if tz_name else timezone.utc
+    except ZoneInfoNotFoundError:
+        zone = timezone.utc
+    local = now.astimezone(zone)
+    days = {"today_start": 0, "today_end": 1, "tomorrow_start": 1, "tomorrow_end": 2,
+            "yesterday_start": -1, "yesterday_end": 0}
+    if name in days:
+        moment = _midnight(local, days[name])
+    elif name == "week_start":
+        moment = _midnight(local, -local.weekday())
+    elif name == "month_start":
+        moment = _midnight(local, 1 - local.day)
+    elif name == "last_month_start":
+        first = _midnight(local, 1 - local.day)
+        moment = _midnight(first - timedelta(days=1), 1 - (first - timedelta(days=1)).day)
+    elif name == "year_start":
+        moment = _midnight(local, 1 - local.timetuple().tm_yday)
+    else:
+        raise ValueError(name)
+    return moment.astimezone(timezone.utc)
+
+
+def _as_time(value: Any, tz_name: Optional[str] = None) -> Optional[datetime]:
     if not isinstance(value, str) or len(value) < 3:
         return None
     m = _REL.match(value.strip())
     if m:
-        now = datetime.now(timezone.utc)
-        if not m.group(1):
-            return now
-        delta = timedelta(**{_UNIT[m.group(3).lower()]: float(m.group(2))})
-        return now + delta if m.group(1) == "+" else now - delta
+        base = anchor_time(m.group(1), tz_name=tz_name)
+        if not m.group(2):
+            return base
+        delta = timedelta(**{_UNIT[m.group(4).lower()]: float(m.group(3))})
+        return base + delta if m.group(2) == "+" else base - delta
     if not re.match(r"^\d{4}-\d{2}-\d{2}", value):
         return None
     try:
@@ -139,9 +185,9 @@ def _same(a: Any, b: Any) -> bool:
     return _text(a) == _text(b)
 
 
-def _order(a: Any, b: Any) -> Optional[int]:
+def _order(a: Any, b: Any, tz_name: Optional[str] = None) -> Optional[int]:
     """-1, 0, 1 comparing a row's value with the rule's, as times, then numbers, then text."""
-    ta, tb = _as_time(a), _as_time(b)
+    ta, tb = _as_time(a, tz_name), _as_time(b, tz_name)
     if ta is not None and tb is not None:
         return (ta > tb) - (ta < tb)
     na, nb = _as_number(a), _as_number(b)
@@ -153,7 +199,7 @@ def _order(a: Any, b: Any) -> Optional[int]:
     return (sa > sb) - (sa < sb)
 
 
-def _holds(row: dict, rule: dict) -> bool:
+def _holds(row: dict, rule: dict, tz_name: Optional[str] = None) -> bool:
     value = _get(row, rule["field"])
     op, want = rule["op"], rule.get("value")
     if value is _MISSING:
@@ -175,7 +221,7 @@ def _holds(row: dict, rule: dict) -> bool:
         return _same(value, want)
     if op == "ne":
         return not _same(value, want)
-    c = _order(value, want)
+    c = _order(value, want, tz_name)
     if c is None:
         return False
     return {"gt": c > 0, "gte": c >= 0, "lt": c < 0, "lte": c <= 0}[op]
@@ -209,8 +255,10 @@ def _fields_of(rows: list) -> list[str]:
     return list(seen)
 
 
-def narrow(data: Any, where: Any = None, sort: Any = None, limit: Any = None) -> tuple[Any, Optional[dict]]:
-    """``data`` with its list narrowed, and a note for the model (None when nothing was asked)."""
+def narrow(data: Any, where: Any = None, sort: Any = None, limit: Any = None,
+           tz_name: Optional[str] = None) -> tuple[Any, Optional[dict]]:
+    """``data`` with its list narrowed, and a note for the model (None when nothing was asked).
+    Calendar moments in rules (today_end, month_start) are days in ``tz_name``."""
     if where is None and sort is None and limit is None:
         return data, None
     rows, key = find_list(data)
@@ -222,7 +270,7 @@ def narrow(data: Any, where: Any = None, sort: Any = None, limit: Any = None) ->
         if rows and all(_get(r, name) is _MISSING for r in rows):
             raise ListingError(
                 f"No row has a field '{name}'. The rows' fields are: {', '.join(known[:40])}.")
-    kept = [r for r in rows if all(_holds(r, rule) for rule in rules)]
+    kept = [r for r in rows if all(_holds(r, rule, tz_name) for rule in rules)]
     if isinstance(sort, dict) and sort.get("field"):
         field, desc = sort["field"], bool(sort.get("desc"))
         present = [r for r in kept if _get(r, field) not in (_MISSING, None)]
@@ -254,3 +302,62 @@ def narrow(data: Any, where: Any = None, sort: Any = None, limit: Any = None) ->
         note["warning"] = ("Only this page was narrowed: the list has more pages. Read it without page/per_page "
                            "(or use a server filter) to cover everything.")
     return out, note
+
+
+# ---- reading every page --------------------------------------------------------------
+
+MAX_PAGES = 40
+MAX_ROWS = 5000
+_SIZE_KEYS = ("per_page", "page_size", "size")
+
+
+def next_page(param_names: set, query: Optional[dict], data: Any, rows_so_far: int,
+              page_rows: int) -> Optional[dict]:
+    """The query for the page after this one, or None when this was the last.
+
+    Narrowing a list must see all of it: "customers whose time ends today" read from the
+    first page of 50 would quietly miss the rest. Both paging styles are followed:
+    page/per_page (stops at total_pages, a total, or a short page) and limit/offset
+    (stops at has_more false or a short page)."""
+    q = dict(query or {})
+    if page_rows == 0:
+        return None
+    meta = data if isinstance(data, dict) else {}
+    if meta.get("has_more") is False:
+        return None
+    total = next((meta[k] for k in ("total", "total_count", "total_items", "count")
+                  if isinstance(meta.get(k), int) and not isinstance(meta.get(k), bool)), None)
+    if total is not None and rows_so_far >= total:
+        return None
+    if "page" in param_names:
+        page = meta.get("page") if isinstance(meta.get("page"), int) else int(q.get("page") or 1)
+        pages = meta.get("total_pages") if isinstance(meta.get("total_pages"), int) else None
+        if pages is not None:
+            if page >= pages:
+                return None
+        elif total is None and meta.get("has_more") is not True:
+            size_key = next((k for k in _SIZE_KEYS if k in q or isinstance(meta.get(k), int)), None)
+            size = q.get(size_key) or meta.get(size_key) if size_key else None
+            # no total and no page count: a full page may have more after it
+            if not size or page_rows < int(size):
+                return None
+        q["page"] = page + 1
+        return q
+    if "offset" in param_names:
+        limit = q.get("limit") or meta.get("limit")
+        if meta.get("has_more") is not True and (not limit or page_rows < int(limit)):
+            return None
+        q["offset"] = int(q.get("offset") or 0) + page_rows
+        return q
+    return None
+
+
+def join_pages(first: Any, rows: list) -> Any:
+    """The first page's result carrying every page's rows."""
+    if isinstance(first, list):
+        return rows
+    _, key = find_list(first)
+    out = {**first, key: rows}
+    for k in ("total_pages", "page", "has_more", "offset"):
+        out.pop(k, None)
+    return out

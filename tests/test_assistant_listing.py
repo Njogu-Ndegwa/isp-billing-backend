@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from app.services.assistant.listing import ListingError, find_list, narrow
+from app.services.assistant.listing import ListingError, anchor_time, find_list, join_pages, narrow, next_page
 
 ROWS = [
     {"id": 1, "name": "Jane", "status": "active", "amount": 1500, "plan": {"name": "Weekly 300"},
@@ -74,3 +74,49 @@ def test_not_a_list_is_an_error():
 
 def test_nothing_asked_changes_nothing():
     assert narrow(ROWS) == (ROWS, None)
+
+
+def test_calendar_moments_are_days_in_the_persons_timezone():
+    from datetime import timezone
+    now = datetime(2026, 1, 15, 22, 0, tzinfo=timezone.utc)   # already 16 Jan, 01:00 in Nairobi
+    nbo = "Africa/Nairobi"
+    assert anchor_time("today_start", now, nbo) == datetime(2026, 1, 15, 21, 0, tzinfo=timezone.utc)
+    assert anchor_time("today_end", now, nbo) == datetime(2026, 1, 16, 21, 0, tzinfo=timezone.utc)
+    assert anchor_time("yesterday_start", now, nbo) == datetime(2026, 1, 14, 21, 0, tzinfo=timezone.utc)
+    assert anchor_time("month_start", now, nbo) == datetime(2025, 12, 31, 21, 0, tzinfo=timezone.utc)
+    assert anchor_time("last_month_start", now, nbo) == datetime(2025, 11, 30, 21, 0, tzinfo=timezone.utc)
+    assert anchor_time("week_start", now, nbo) == datetime(2026, 1, 11, 21, 0, tzinfo=timezone.utc)  # Mon 12 Jan
+
+
+def test_where_takes_calendar_moments_with_offsets():
+    from datetime import timezone
+    from app.services.assistant import listing
+    start = listing.anchor_time("today_start", None, "Africa/Nairobi")
+    rows = [{"name": "early", "expiry": (start + timedelta(hours=1)).isoformat()},
+            {"name": "tomorrow", "expiry": (start + timedelta(days=1, hours=1)).isoformat()},
+            {"name": "yesterday", "expiry": (start - timedelta(hours=1)).isoformat()}]
+    today = [{"field": "expiry", "op": "gt", "value": "today_start"}, {"field": "expiry", "op": "lte", "value": "today_end"}]
+    out, _ = narrow(rows, where=today, tz_name="Africa/Nairobi")
+    assert [r["name"] for r in out] == ["early"]
+    out, _ = narrow(rows, where=[{"field": "expiry", "op": "gt", "value": "today_start-1d"},
+                                 {"field": "expiry", "op": "lte", "value": "today_start"}], tz_name="Africa/Nairobi")
+    assert [r["name"] for r in out] == ["yesterday"]
+
+
+def test_next_page_follows_both_paging_styles():
+    paged = {"page", "per_page"}
+    assert next_page(paged, {"page": 1, "per_page": 2}, {"data": [{}, {}], "total_pages": 3, "page": 1}, 2, 2) == {"page": 2, "per_page": 2}
+    assert next_page(paged, {"page": 3}, {"data": [{}], "total_pages": 3, "page": 3}, 5, 1) is None
+    assert next_page(paged, {}, {"items": [{}, {}], "total": 2}, 2, 2) is None
+    assert next_page(paged, {"per_page": 2}, [{}, {}], 2, 2) == {"per_page": 2, "page": 2}
+    assert next_page(paged, {}, [{}, {}, {}], 3, 3) is None   # a bare list with no page size is everything
+    offset = {"limit", "offset"}
+    assert next_page(offset, {"limit": 2}, {"rows": [{}, {}], "has_more": True}, 2, 2) == {"limit": 2, "offset": 2}
+    assert next_page(offset, {"limit": 2}, {"rows": [{}], "has_more": False}, 3, 1) is None
+    assert next_page(offset, {"limit": 2}, [{}], 1, 1) is None
+    assert next_page(set(), {}, {"data": [{}], "total_pages": 9}, 1, 1) is None
+
+
+def test_joined_pages_keep_the_envelope():
+    assert join_pages({"data": [{"a": 1}], "total": 3, "total_pages": 2, "page": 1}, [{"a": 1}, {"a": 2}, {"a": 3}]) ==         {"data": [{"a": 1}, {"a": 2}, {"a": 3}], "total": 3}
+    assert join_pages([{"a": 1}], [{"a": 1}, {"a": 2}]) == [{"a": 1}, {"a": 2}]
