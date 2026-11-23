@@ -122,3 +122,41 @@ async def test_safety_net_batches_router_candidate_recheck(
     assert removed == 1
     assert recheck_calls == [{"AA:BB:CC:DD:EE:01", "AA:BB:CC:DD:EE:02"}]
     assert remove_calls == [("10.0.0.2", {"AA:BB:CC:DD:EE:01"})]
+
+
+@pytest.mark.parametrize("status", ["SUSPENDED", "INACTIVE"])
+async def test_safety_net_skips_cut_off_owners_routers(
+    db,
+    session_factory,
+    monkeypatch,
+    status,
+):
+    """A suspended/inactive reseller's routers are dead and never re-probed, so
+    "recently offline" stops skipping them. Scanning them held the shared fleet
+    slots for minutes and starved the bandwidth poller (router 750, 2026-11-23)."""
+    from app.db.models import SubscriptionStatus
+
+    monkeypatch.setattr(mikrotik_background, "async_session", session_factory)
+    monkeypatch.setattr(mikrotik_background, "_router_recently_offline", lambda *_a: False)
+
+    cut_off = await make_reseller(db, subscription_status=getattr(SubscriptionStatus, status))
+    await make_router(db, cut_off, ip_address="10.0.0.20", port=8728, last_status=False)
+    live = await make_reseller(db)
+    await make_router(db, live, ip_address="10.0.0.21", port=8728)
+
+    scanned = []
+
+    def fake_find_candidates(router_info, active_macs):
+        scanned.append(router_info["ip"])
+        return set()
+
+    monkeypatch.setattr(
+        mikrotik_background,
+        "_find_router_binding_cleanup_candidates_sync",
+        fake_find_candidates,
+    )
+
+    removed = await mikrotik_background._cleanup_bypassing_for_all_routers(db)
+
+    assert removed == 0
+    assert scanned == ["10.0.0.21"]
