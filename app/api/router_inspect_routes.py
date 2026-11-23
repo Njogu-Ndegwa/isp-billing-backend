@@ -21,6 +21,7 @@ from app.services.auth import get_current_user, verify_token
 from app.services.mikrotik_api import MikroTikAPI
 from app.services.router_availability import record_router_availability
 from app.services.router_helpers import get_router_by_id
+from app.services.router_time import ROUTER_CLOCK_KEYS, read_router_clock, stamp_router_times
 
 router = APIRouter(tags=["routers"])
 
@@ -66,7 +67,13 @@ def _print_sync(info: dict, menu: str) -> dict:
     if not api.connect():
         return {"error": "connect_failed"}
     try:
-        return api.send_command(f"{menu}/print")
+        result = api.send_command(f"{menu}/print")
+        # Stamps in a row (log time, last-logged-out, ...) are the router's own
+        # clock; the clock read in this session turns them into true UTC.
+        rows = result.get("data") or [] if result.get("success") else []
+        if any(isinstance(r, dict) and ROUTER_CLOCK_KEYS.intersection(r) for r in rows):
+            result["clock"] = read_router_clock(api)
+        return result
     finally:
         api.disconnect()
 
@@ -105,7 +112,8 @@ async def read_router_menu(
         raise HTTPException(status_code=502, detail=f"The router refused {menu}: {result['error']}")
     await record_router_availability(db, router_id, True, "router_inspect")
 
-    rows = [clean_row(r) for r in result.get("data") or [] if isinstance(r, dict)]
+    rows = [stamp_router_times(clean_row(r), result.get("clock")) for r in result.get("data") or []
+            if isinstance(r, dict)]
     if contains:
         needle = contains.lower()
         rows = [r for r in rows if any(needle in str(v).lower() for v in r.values())]
