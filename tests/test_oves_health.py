@@ -465,3 +465,38 @@ def test_own_probe_traffic_is_not_a_client_failure():
     lines = [_ing("GET", "/", 500, ua="bitwave-oves-health/1", up="erm-open-token-microservice-3101")] * 25
     s = parsers.parse_ingress_lines(lines)["open-token-microservice"].summary()
     assert (s["real_5xx"], s["bot_5xx"], s["real_requests"]) == (0, 25, 0)
+
+
+@pytest.mark.asyncio
+async def test_cdn_timeout_falls_back_to_origin_and_reports_amber_not_down():
+    import httpx
+
+    probe = probes.Probe("abs", "ABS", "tencent", "http", "https://abs.example.com/graphql",
+                         method="POST", body={"query": "{__typename}"}, expect_text="Query",
+                         critical=True, origin="lb.origin.example")
+    seen = []
+
+    def handler(origin_ok):
+        def h(req: httpx.Request):
+            seen.append((req.url.host, req.headers["host"], req.extensions.get("sni_hostname")))
+            if req.url.host == "abs.example.com":
+                raise httpx.ReadTimeout("edge hung", request=req)
+            if origin_ok:
+                return httpx.Response(200, json={"data": {"__typename": "Query"}})
+            raise httpx.ConnectError("refused", request=req)
+        return h
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler(True))) as c:
+        res = await probes.run_probe(c, probe, 5)
+    assert res["status"] == "slow" and res["via_origin"]
+    assert "origin answers" in res["detail"]
+    assert seen[1] == ("lb.origin.example", "abs.example.com", "abs.example.com")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler(False))) as c:
+        res = await probes.run_probe(c, probe, 5)
+    assert res["status"] == "down" and "origin also ConnectError" in res["detail"]
+
+    plain = probes.Probe("x", "X", "tencent", "http", "https://abs.example.com/graphql")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler(True))) as c:
+        res = await probes.run_probe(c, plain, 5)
+    assert res["status"] == "down" and res["detail"] == "timed out"

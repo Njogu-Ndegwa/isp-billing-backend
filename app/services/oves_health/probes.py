@@ -63,6 +63,11 @@ class Probe:
     expect_text: str = ""
     critical: bool = False         # down -> critical alert (else warning)
     slow_ms: int = 3000
+    # Origin host behind the CDN. When the public URL times out or will not
+    # connect, the same request is retried straight at the origin (TLS still
+    # verified against the public name). If the origin answers, the app is up
+    # and only the CDN path from this monitor failed: "slow" (amber), not down.
+    origin: str = ""
 
 
 P = Probe
@@ -265,6 +270,43 @@ def interpret_login(text: str) -> tuple[str, str]:
     return "down", f"unexpected: {msg}"
 
 
+async def _http_check(client: httpx.AsyncClient, probe: Probe, timeout: float,
+                      origin: str = "") -> tuple[str, str, int]:
+    """One plain http probe. With ``origin`` the request goes to that host but
+    carries the public name as Host and TLS SNI, so the certificate is still
+    verified against the public name (like ``curl --resolve``)."""
+    url, headers, ext = probe.target, None, None
+    if origin:
+        u = httpx.URL(probe.target)
+        url = u.copy_with(host=origin)
+        headers = {"Host": u.netloc.decode()}
+        ext = {"sni_hostname": u.host}
+    resp = await client.request(probe.method, url, json=probe.body, timeout=timeout,
+                                headers=headers, extensions=ext)
+    if resp.status_code not in probe.expect_status:
+        return "down", f"HTTP {resp.status_code}", resp.status_code
+    if probe.expect_text and probe.expect_text not in resp.text:
+        return "down", f"unexpected body: {resp.text[:80]}", resp.status_code
+    return "up", f"HTTP {resp.status_code}", resp.status_code
+
+
+async def _origin_fallback(client: httpx.AsyncClient, probe: Probe, timeout: float,
+                           failure: str) -> dict:
+    start = time.perf_counter()
+    try:
+        status, detail, code = await _http_check(client, probe, timeout, origin=probe.origin)
+    except Exception as exc:  # noqa: BLE001
+        why = "timed out" if isinstance(exc, httpx.TimeoutException) else type(exc).__name__
+        return _result(probe, "down", timeout * 1000, f"{failure}; origin also {why}")
+    ms = (time.perf_counter() - start) * 1000
+    if status != "up":
+        return _result(probe, "down", ms, f"{failure}; origin: {detail}", code)
+    res = _result(probe, "slow", ms,
+                  f"CDN path from monitor {failure}; origin answers ({detail})", code)
+    res["via_origin"] = True
+    return res
+
+
 async def run_probe(client: httpx.AsyncClient, probe: Probe, timeout: float) -> dict:
     try:
         if probe.kind in ("tcp", "tcp_closed"):
@@ -337,15 +379,15 @@ async def run_probe(client: httpx.AsyncClient, probe: Probe, timeout: float) -> 
             res["latency_ms"] = None    # vendor page latency says nothing useful
             return res
 
-        resp = await client.request(probe.method, probe.target, json=probe.body,
-                                    timeout=timeout)
+        try:
+            status, detail, code = await _http_check(client, probe, timeout)
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
+            failure = "timed out" if isinstance(exc, httpx.TimeoutException)                 else f"{type(exc).__name__}: {exc}"[:120]
+            if not probe.origin:
+                raise
+            return await _origin_fallback(client, probe, timeout, failure)
         ms = (time.perf_counter() - start) * 1000
-        if resp.status_code not in probe.expect_status:
-            return _result(probe, "down", ms, f"HTTP {resp.status_code}", resp.status_code)
-        if probe.expect_text and probe.expect_text not in resp.text:
-            return _result(probe, "down", ms, f"unexpected body: {resp.text[:80]}",
-                           resp.status_code)
-        return _result(probe, "up", ms, f"HTTP {resp.status_code}", resp.status_code)
+        return _result(probe, status, ms, detail, code)
     except httpx.TimeoutException:
         return _result(probe, "down", timeout * 1000, "timed out")
     except Exception as exc:  # noqa: BLE001
