@@ -498,6 +498,17 @@ def _now_label(tz_name: Optional[str] = None) -> str:
 
 _ISO_TIME = re.compile(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$")
 
+# Router wall-clock fields (CR-1123-B3). A router writes these on its own clock,
+# local and sometimes hours off, so they are never converted as if UTC. The
+# backend adds "<field>_utc" (true UTC, from the router's clock read in the
+# same connection) where it can; any field with such a companion is router time.
+_ROUTER_CLOCK_ONLY = frozenset({"last_logged_out", "last-logged-out", "router_time"})
+# Moments that are over by definition: never "in 2 h".
+_PAST_EVENT_KEY = re.compile(
+    r"^(last_at|router_time)$|last[_-]?(logged[_-]?out|seen|disconnect|log[_-]?in|log[_-]?out)"
+    r"|disconnect(ed)?[_-]?at$", re.I)
+_UNVERIFIED = "router clock, unverified"
+
 
 def localize_times(data: Any, tz_name: Optional[str], now: Optional[datetime] = None) -> Any:
     """Every moment in a result, on the person's own clock and how far from now.
@@ -515,7 +526,7 @@ def localize_times(data: Any, tz_name: Optional[str], now: Optional[datetime] = 
 
     now = now or datetime.utcnow()
 
-    def one(value: str) -> str:
+    def one(value: str, past: bool = False) -> str:
         m = _ISO_TIME.match(value.strip())
         if not m:
             return value
@@ -527,6 +538,8 @@ def localize_times(data: Any, tz_name: Optional[str], now: Optional[datetime] = 
             when = when.astimezone(_tz.utc).replace(tzinfo=None)
         local = to_local(when, tz_name)
         secs = (when - now).total_seconds()
+        if past and secs > 120:
+            return f"{value} ({_UNVERIFIED})"
         span = abs(secs)
         if span < 90:
             rel = "now"
@@ -542,8 +555,23 @@ def localize_times(data: Any, tz_name: Optional[str], now: Optional[datetime] = 
         if isinstance(v, list):
             return [walk(x) for x in v]
         if isinstance(v, dict):
-            return {k: walk(x) for k, x in v.items()}
+            return {k: field(v, k, x) for k, x in v.items()}
         return v
+
+    def field(row: dict, key: Any, value: Any) -> Any:
+        if not isinstance(key, str) or not isinstance(value, str) or len(value) > 40:
+            return walk(value)
+        if key.endswith("_utc"):
+            return one(value, past=True)
+        companion = key.replace("-", "_") + "_utc"
+        if companion in row or key in _ROUTER_CLOCK_ONLY:
+            if not value.strip():
+                return value
+            if row.get(companion):
+                return f"{value} (router's own clock; true time in {companion})"
+            return f"{value} ({_UNVERIFIED})"
+        past = bool(_PAST_EVENT_KEY.search(key)) or (key == "time" and "message" in row)
+        return one(value, past=past)
 
     return walk(data)
 

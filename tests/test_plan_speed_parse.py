@@ -186,7 +186,9 @@ def test_recent_auth_failures_counts_only_this_login():
 
     result = pppoe_monitor._recent_auth_failures(api, "LKR0101")
 
-    assert result == {"lookup_success": True, "count": 3, "last_at": "19:02:05", "error": None}
+    # No router clock passed: the router-time stamp has no UTC companion.
+    assert result == {"lookup_success": True, "count": 3, "last_at": "19:02:05", "last_at_utc": None,
+                      "error": None}
 
 
 def test_recent_auth_failures_unknown_when_log_unreadable():
