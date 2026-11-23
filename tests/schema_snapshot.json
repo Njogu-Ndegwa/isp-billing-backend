@@ -1143,6 +1143,19 @@
   "topic",
   "username"
  ],
+ "router_metric_buckets": [
+  "bucket_start",
+  "cpu_max",
+  "cpu_samples",
+  "cpu_sum",
+  "link_drops",
+  "mem_max",
+  "mem_samples",
+  "mem_sum",
+  "reboots",
+  "router_id",
+  "step_seconds"
+ ],
  "router_public_contacts": [
   "contacted_at",
   "id",

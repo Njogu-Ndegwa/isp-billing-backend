@@ -3933,8 +3933,10 @@ def _fetch_bandwidth_data_sync():
 
 async def _prune_bandwidth_history(db, now) -> None:
     from app.db.models import CustomerUsageBucket
+    from app.services import router_metric_history
     from app.services.usage_tracking import CUSTOMER_USAGE_BUCKET_RETENTION_DAYS
 
+    await router_metric_history.prune(db, now)
     cutoff = now - timedelta(days=BANDWIDTH_HISTORY_RETENTION_DAYS)
     await db.execute(delete(BandwidthSnapshot).where(BandwidthSnapshot.recorded_at < cutoff))
     await db.execute(delete(RouterUsageBucket).where(RouterUsageBucket.bucket_start < cutoff))
