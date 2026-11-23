@@ -18,7 +18,7 @@ from app.db.models import (
     ResellerInboxMessage, Customer, Router,
 )
 from app.services.auth import verify_token, get_current_user
-from app.services import customer_expiry_notifications, sms_credits, sms_dispatch
+from app.services import alert_contacts, customer_expiry_notifications, sms_credits, sms_dispatch
 from app.services import customer_sms_templates as sms_templates
 from app.services.markets import reseller_market
 from app.services.messaging import accounts as provider_accounts
@@ -167,6 +167,54 @@ async def update_expiry_settings(body: ExpirySettingsIn,
     await db.commit()
     await db.refresh(row)
     return _expiry_settings_payload(row)
+
+
+# ---- Router status alert contacts -----------------------------------------
+
+class AlertContactsIn(BaseModel):
+    # The whole list, in send order. [] = alerts go to the support phone.
+    phones: list[str] = Field(
+        default_factory=list,
+        description="Mobile numbers that get router offline/online SMS alerts, up to 3. "
+                    "Empty sends alerts to the support phone.",
+    )
+
+
+def _alert_contacts_payload(user: User) -> dict:
+    return {
+        "phones": alert_contacts.configured_alert_phones(user),
+        "support_phone": user.support_phone,
+        # Who the next alert actually goes to (the support phone when the list is empty).
+        "recipients": alert_contacts.alert_recipients(user),
+        "using_support_phone": not alert_contacts.configured_alert_phones(user),
+        "max_phones": alert_contacts.MAX_ALERT_PHONES,
+    }
+
+
+@router.get("/api/messaging/alert-contacts")
+async def get_alert_contacts(db: AsyncSession = Depends(get_db),
+                             token: str = Depends(verify_token)):
+    """Numbers that receive this reseller's router status SMS alerts."""
+    user = await _require_reseller(token, db)
+    return _alert_contacts_payload(user)
+
+
+@router.put("/api/messaging/alert-contacts")
+async def update_alert_contacts(body: AlertContactsIn,
+                                db: AsyncSession = Depends(get_db),
+                                token: str = Depends(verify_token)):
+    """Replace the router status SMS alert numbers (each recipient uses SMS credit)."""
+    user = await _require_reseller(token, db)
+    if len(body.phones) > 10:
+        raise HTTPException(status_code=400, detail="Too many phone numbers")
+    try:
+        phones = alert_contacts.validate_alert_phones(body.phones, user)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    user.alert_phones = phones or None
+    await db.commit()
+    await db.refresh(user)
+    return _alert_contacts_payload(user)
 
 
 # ---- Customer event messages and message wording --------------------------

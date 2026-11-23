@@ -1502,6 +1502,7 @@
   "acquisition_campaign",
   "acquisition_details",
   "acquisition_source",
+  "alert_phones",
   "business_name",
   "created_at",
   "created_by",
