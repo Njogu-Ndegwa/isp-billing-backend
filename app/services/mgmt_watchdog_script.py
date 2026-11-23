@@ -21,7 +21,10 @@ What the scripts do (patient, never reboot):
   disabled/enabled), with the same hold-off and backoff. As in the SSTP
   variant, the handshake is read again after the splay delay: a peer that
   handshook in the meantime is not reset, and the hold-off just written is
-  removed again.
+  removed again. A fresh ``wg-hz`` handshake (< 4 min) ends the run early
+  (v6): management rides wg-hz, so a dead AWS peer alone no longer costs the
+  slow path every minute. Never disable ``wg-aws`` to get the same effect: the
+  router's 10.0.X.Y management address lives on it (router 75, 2026-11-23).
 * State lives in RAM-only dynamic address-list entries (``bw-wd-*``, with
   timeouts): script ``:global`` variables do NOT persist between scheduler runs
   of an API-created script (verified on RouterOS 6.48.6).
@@ -125,12 +128,15 @@ _SSTP_TEMPLATE = r'''# bw-mgmt-watchdog v4 (Bitwave): restart the SSTP managemen
 }
 '''
 
-_WG_TEMPLATE = r'''# bw-mgmt-watchdog-wg v5 (Bitwave, RouterOS 7): reset a WireGuard management peer whose handshake is stale.
+_WG_TEMPLATE = r'''# bw-mgmt-watchdog-wg v6 (Bitwave, RouterOS 7): reset a WireGuard management peer whose handshake is stale.
 # Never reboots. State in RAM-only address-list entries (bw-wd-*). Test hook: list bw-wd-test-stale => treat all as stale.
 # v3: healthy fast path (every watched peer enabled with a fresh handshake) exits before pings/address-list scans.
 # v4: only tunnels whose INTERFACE is enabled are watched, so a Hetzner-only router with wg-aws switched off is not
 # treated as stale every minute (and the AWS peer is never touched).
 # v5: re-check the handshake after the splay delay; a peer that handshook meanwhile is not reset.
+# v6: management rides wg-hz. While a wg-hz peer handshook < 4 min the router is reachable, so a dead wg-aws peer
+# no longer sends every run down the slow path (router 75, 2026-11-23: ~30 s of 100% CPU each minute).
+# wg-aws itself is never disabled here: it carries the router's 10.0.X.Y management address.
 :local hzOn ([:len [/interface wireguard find where name="wg-hz" disabled=no]] > 0)
 :local awsOn ([:len [/interface wireguard find where name="wg-aws" disabled=no]] > 0)
 :local fresh true
@@ -141,6 +147,12 @@ _WG_TEMPLATE = r'''# bw-mgmt-watchdog-wg v5 (Bitwave, RouterOS 7): reset a WireG
       :local qh [/interface wireguard peers get $q last-handshake]
       :if ([:typeof $qh] != "time") do={ :set fresh false } else={ :if ($qh >= 4m) do={ :set fresh false } }
     }
+  }
+}
+:if ($hzOn) do={
+  :foreach q in=[/interface wireguard peers find where interface="wg-hz" disabled=no] do={
+    :local qh [/interface wireguard peers get $q last-handshake]
+    :if ([:typeof $qh] = "time") do={ :if ($qh < 4m) do={ :set fresh true } }
   }
 }
 :if ($fresh = false) do={

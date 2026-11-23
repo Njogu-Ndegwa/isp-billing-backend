@@ -43,6 +43,7 @@ from app.services.mikrotik_api import (
     customer_queue_mac,
     find_conflicting_customer_queues,
     is_hotspot_parent_queue_name,
+    live_router_ips,
     normalize_mac_address,
 )
 from app.services.router_availability import (
@@ -3065,6 +3066,24 @@ def _sweep_orphan_customer_queues(
     return removed
 
 
+def _prune_queue_bypass_list(api, router_name: str, live_ips) -> dict:
+    """Best effort: drop stale ``isp_queue_limited_clients`` entries, never fail the sync."""
+    try:
+        result = api.prune_queue_fasttrack_bypass_list(live_ips)
+    except Exception as exc:  # noqa: BLE001 - hygiene must not break queue sync
+        logger.warning("[SYNC] Bypass-list prune on %s raised: %s", router_name, exc)
+        return {"error": str(exc)}
+    if result.get("error"):
+        logger.warning("[SYNC] Bypass-list prune on %s: %s", router_name, result.get("error"))
+    elif result.get("removed"):
+        logger.info(
+            "[SYNC] Pruned %d stale %s entries on %s (%d listed, %d stale)",
+            result["removed"], QUEUE_FASTTRACK_BYPASS_LIST, router_name,
+            result.get("entries", 0), result.get("stale", 0),
+        )
+    return result
+
+
 def _reconcile_mac_login_router_sync(router_info: dict, customers_data: list) -> dict:
     """MAC-login routers: the router owns the queues, so reconcile users instead.
 
@@ -3101,6 +3120,11 @@ def _reconcile_mac_login_router_sync(router_info: dict, customers_data: list) ->
         }
         if summary.get("provisioned") or summary.get("orphans_removed") or summary.get("unstuck") or summary.get("errors"):
             logger.warning("[SYNC] MAC-login reconcile on %s: %s", router_name, results["details"])
+        # The bypass list is redundant here (the hotspot NO_FASTTRACK rules cover
+        # MAC-login clients) but older provisioning filled it; one filtered read
+        # per pass, and the router is only read further when the list is big.
+        if api.connected:
+            _prune_queue_bypass_list(api, router_name, None)
         return results
     except Exception as exc:
         logger.error("[SYNC] MAC-login reconcile on %s failed: %s", router_name, exc)
@@ -3311,6 +3335,14 @@ def _sync_single_router_queues_sync(router_info: dict, customers_data: list, que
                 logger.warning(f"[SYNC] FastTrack bypass setup failed on {router_name}: {fasttrack_bypass_result.get('error')}")
             elif fasttrack_bypass_result.get("fasttrack_enabled"):
                 logger.info(f"[SYNC] FastTrack bypass active on {router_name} (list={fasttrack_bypass_result.get('list_name')}, ips_added={fasttrack_bypass_result.get('ips_added', 0)})")
+
+        # Drop list entries no device holds any more (the list only ever grew).
+        # Only from a complete set of reads: a failed read is not "no devices".
+        if not any(r.get("error") for r in (arp_result, dhcp_result, hosts_result, active_result, queues_result)):
+            live_ips = live_router_ips(dhcp_leases, arp_entries, hotspot_hosts, hotspot_active,
+                                       queues=existing_queues)
+            live_ips.update(connected_customer_ips)
+            _prune_queue_bypass_list(api, router_name, live_ips)
 
         queue_by_name = {str(q.get("name", "")).lower(): q for q in existing_queues if q.get("name")}
         queue_by_mac = {}
