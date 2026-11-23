@@ -169,6 +169,7 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     (("DELETE",), "/api/assistant/conversations/{conversation_id}", ANY_STAFF,
      "Deleted an assistant conversation"),
     ((R,), "/api/profile", ANY_STAFF, None),
+    ((R,), "/api/profile/setup-status", ("routers.manage", "plans.manage", "payment_methods.manage"), None),
     ((R,), "/api/subscription", ANY_STAFF, None),
     ((R,), "/api/plans", ("plans.manage", "customers.view", "customers.manage", "vouchers.generate", "routers.view", "routers.manage", "portal.manage"), None),
     ((R,), "/api/plans/by-router/{router_id}", ("plans.manage", "customers.view", "customers.manage", "vouchers.generate", "routers.view", "routers.manage", "portal.manage"), None),
@@ -300,6 +301,8 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     (("POST",), "/api/plans/create", "plans.manage", "Created a plan"),
     (("PUT",), "/api/plans/{plan_id}", "plans.manage", "Edited plan {plan_id}"),
     (("DELETE",), "/api/plans/{plan_id}", "plans.manage", "Deleted plan {plan_id}"),
+    (("POST",), "/api/plans/starter-set", "plans.manage", "Created the starter plans"),
+    (("POST",), "/api/plans/unhide", "plans.manage", "Showed hidden plans again"),
     (("POST",), "/api/plans/activate-emergency", "plans.manage", "Turned emergency mode on"),
     (("POST",), "/api/plans/deactivate-emergency", "plans.manage", "Turned emergency mode off"),
 
