@@ -266,6 +266,7 @@ Answering
 - Say the answer once, after your last lookup. Words you write next to a tool call are not shown, so do not narrate ("I'll look that up"): the page already shows that you are checking.
 - Never mention database ids ("id 1", "#34") unless the person asked for one; use names.
 - Times: each moment in a result already comes with the person's own clock and how far from now ("... = Sat 21 Nov 05:12 EAT, in 5 h"). Say that local time as it is, with "in 5 hours" or "2 days ago" for anything near; never convert times yourself and never write "UTC" unless asked.
+- Dates in a query (date, start_date, end_date, "today", "yesterday", a month) are the person's own calendar dates: their date today from the message header and the days counted from it, never the UTC date. Payments (/api/mpesa/transactions...), plan performance and analytics read a date alone as that day on their clock. A time of day goes with their offset (2026-11-23T00:30:00+03:00 in Kenya).
 - [Account now: ...] before a message lists facts about the account itself: a Bitwave subscription that is suspended, lapsed or about to end, and SMS credits that have run out. When the question touches it (customers who cannot buy or connect, sending SMS, renewals, money) or it is the first answer in the chat, add one short line about it and offer to fix it here: paying the subscription (the subscription invoice and pay actions) or buying SMS credits. Otherwise do not repeat it. Never refuse or hold back anything else because of it.
 - When something the account lacks stands in the way of what was asked (no SMS credits for a send, no plan for a customer, no router for a plan), say so in one line and open the form that fixes it, then carry on with what they asked once it is done.
 - Look things up quietly: a read is drawn only when you set "show". While you are working something out, leave show out. Draw only the one result that answers the question (two at most); if a quiet lookup turned out to be the answer, call it again with show set. Never draw the same list twice, and never draw a lookup that turned out not to help.
@@ -485,18 +486,22 @@ def conversation_lock(conversation_id: str) -> asyncio.Lock:
     return lock
 
 
-def _now_label(tz_name: Optional[str] = None) -> str:
-    """The moment of a message: UTC (what the API uses), and the person's own clock."""
+def _now_label(tz_name: Optional[str] = None, now: Optional[datetime] = None) -> str:
+    """The moment of a message: UTC (what the API uses), and the person's own clock.
+
+    It ends with their local date as YYYY-MM-DD: the date a query's ``date`` /
+    ``start_date`` needs (the API reads a date alone as a day on their clock).
+    """
     from app.services.subscription_reminders import to_local, zone_abbreviation
 
-    now = datetime.utcnow()
+    now = now or datetime.utcnow()
     if not tz_name:
         return now.strftime("%Y-%m-%d %H:%M UTC")
     local = to_local(now, tz_name)
     offset = round((local - now).total_seconds() / 3600, 1)
     sign = "+" if offset >= 0 else "-"
     return (f"{now:%Y-%m-%d %H:%M} UTC = {local:%a %d %b %H:%M} {zone_abbreviation(tz_name, now)} "
-            f"(UTC{sign}{abs(offset):g}) for this person")
+            f"(UTC{sign}{abs(offset):g}) for this person; their date today is {local:%Y-%m-%d}")
 
 
 _ISO_TIME = re.compile(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$")

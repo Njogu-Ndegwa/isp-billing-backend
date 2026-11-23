@@ -15,6 +15,7 @@ from app.db.models import (
     MtnMomoTransaction, MtnMomoTransactionStatus, FapshiTransaction, FapshiTransactionStatus,
 )
 from app.services.auth import verify_token, get_current_user
+from app.services import local_day
 from app.services.plan_cache import (
     get_plans_cached,
     invalidate_plan_cache,
@@ -798,14 +799,14 @@ async def get_plan_performance(
         )
 
         # Apply date filters if provided
+        # A date alone is that day on the account's own clock, as on the
+        # payment listings (local_day).
         if start_date:
-            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+            start_dt = local_day.range_start(start_date, user)
             payments = payments.where(CustomerPayment.created_at >= start_dt)
 
         if end_date:
-            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-            if 'T' not in end_date:
-                end_dt = end_dt.replace(hour=23, minute=59, second=59)
+            end_dt = local_day.range_end(end_date, user)
             payments = payments.where(CustomerPayment.created_at <= end_dt)
 
         payments = payments.subquery()
