@@ -26,6 +26,7 @@ from app.services.hotspot_provisioning import (
     serialize_delivery_attempt,
 )
 from app.services.mpesa_transactions import update_mpesa_transaction_status
+from app.services import mpesa_results
 from app.services.payment_numbers import PAYMENT_SEARCH_DESCRIPTION, payment_search_condition
 from app.services.billing import apply_failed_payment_customer_status, make_payment
 from app.services.plan_cache import FREE_TRIAL_NOT_PURCHASABLE, plan_model_allows_router
@@ -1552,6 +1553,7 @@ async def get_mpesa_transactions(
                     "result_code": tx.result_code,
                     "result_desc": tx.result_desc,
                     "failure_source": tx.failure_source.value if tx.failure_source else None,
+                    **_failure_fields(tx),
                     "transaction_date": tx.transaction_date.isoformat() if tx.transaction_date else None,
                     "created_at": tx.created_at.isoformat(),
                     "customer": {
@@ -2427,6 +2429,22 @@ async def get_mpesa_transactions_summary(
         raise HTTPException(status_code=500, detail=f"Failed to fetch summary: {str(e)}")
 
 
+def _failure_fields(tx) -> dict:
+    """failure_fault + failure_explained for a failed/expired STK row (one source:
+    app/services/mpesa_results.py), so the same M-Pesa reply always reads the same."""
+    if tx.status not in (MpesaTransactionStatus.failed, MpesaTransactionStatus.expired):
+        return {}
+    code = tx.result_code
+    source = getattr(tx.failure_source, "value", tx.failure_source)
+    if not code and (tx.status == MpesaTransactionStatus.expired or source == "timeout"):
+        code = "TIMEOUT"
+    e = mpesa_results.explain(code, tx.result_desc)
+    return {
+        "failure_fault": e["fault"],
+        "failure_explained": f"{e['explanation']} Next: {e['next_step']}",
+    }
+
+
 @router.get("/api/mpesa/transactions/failed")
 async def get_failed_mpesa_transactions(
     router_id: Optional[int] = None,
@@ -2506,7 +2524,8 @@ async def get_failed_mpesa_transactions(
             if reason not in failure_reasons:
                 failure_reasons[reason] = {
                     "count": 0, "result_code": tx.result_code, "total_amount": 0,
-                    "failure_source": tx.failure_source.value if tx.failure_source else "unknown"
+                    "failure_source": tx.failure_source.value if tx.failure_source else "unknown",
+                    **_failure_fields(tx),
                 }
             failure_reasons[reason]["count"] += 1
             failure_reasons[reason]["total_amount"] += float(tx.amount)
@@ -2518,6 +2537,8 @@ async def get_failed_mpesa_transactions(
                 "reason": reason,
                 "result_code": data["result_code"],
                 "failure_source": data["failure_source"],
+                "failure_fault": data.get("failure_fault"),
+                "failure_explained": data.get("failure_explained"),
                 "count": data["count"],
                 "total_amount_lost": data["total_amount"]
             }
@@ -2536,6 +2557,7 @@ async def get_failed_mpesa_transactions(
                 "failure_source": tx.failure_source.value if tx.failure_source else None,
                 "result_code": tx.result_code,
                 "result_desc": tx.result_desc,
+                **_failure_fields(tx),
                 "created_at": tx.created_at.isoformat(),
                 "updated_at": tx.updated_at.isoformat() if tx.updated_at else None,
                 "customer": {
