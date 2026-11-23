@@ -1605,6 +1605,28 @@ def _list_filters(status, connection_type, overdue, search, now) -> list:
     return out
 
 
+async def _did_you_mean(db: AsyncSession, conditions: list, search: str) -> list[dict]:
+    """Close matches for a search that found no one, best first: a short read of four
+    columns of this reseller's customers (capped), scored in memory."""
+    from app.services import customer_fuzzy
+
+    pool = (await db.execute(
+        select(Customer.id, Customer.name, Customer.phone, Customer.account_number)
+        .where(*conditions).order_by(Customer.id).limit(customer_fuzzy.MAX_POOL)
+    )).all()
+    close = customer_fuzzy.close_matches(search, pool)
+    if not close:
+        return []
+    by_id = {r.id: r for r in pool}
+    statuses = dict((await db.execute(
+        select(Customer.id, Customer.status).where(Customer.id.in_([m["id"] for m in close]))
+    )).all())
+    return [{"id": m["id"], "name": by_id[m["id"]].name, "phone": by_id[m["id"]].phone,
+             "account_number": by_id[m["id"]].account_number,
+             "status": getattr(statuses.get(m["id"]), "value", None),
+             "matched_on": m["matched_on"], "score": m["score"]} for m in close]
+
+
 @router.get("/api/customers")
 async def get_customers_api(
     router_id: Optional[int] = None,
@@ -1642,6 +1664,10 @@ async def get_customers_api(
 
     With both `page` and `per_page`, returns one page (ordered by id) as
     `{data, page, per_page, total, total_pages}`; otherwise the full array.
+
+    When `search` matches no one, close matches by name, phone (one digit off) or
+    account number come back as `{data: [], total: 0, did_you_mean: [...]}`
+    (best first). They are not results: offer them ("Did you mean Amina?").
     """
     tier_filter = _validate_tier(tier)
     try:
@@ -1657,7 +1683,7 @@ async def get_customers_api(
             conditions.append(has_paid)
         elif tier_filter == "visitor":
             conditions.append(~has_paid)
-        conditions.extend(_list_filters(status, connection_type, overdue, search, now))
+        conditions.extend(_list_filters(status, connection_type, overdue, None, now))
         if plan_id is not None:
             conditions.append(Customer.plan_id == plan_id)
         if expires:
@@ -1666,6 +1692,8 @@ async def get_customers_api(
             conditions.extend(expiry_between(*expiry_window(expires, now, reseller_market(user).timezone)))
         if online is not None:
             conditions.append(await _online_condition(db, user, online))
+        base = list(conditions)   # everything but the search, for close matches
+        conditions.extend(_list_filters(None, None, None, search, now))
         stmt = (
             select(Customer, has_paid.label("has_paid"))
             .where(*conditions)
@@ -1724,7 +1752,14 @@ async def get_customers_api(
             }
             for c, c_has_paid in rows
         ]
-        return _page_envelope(items, page, per_page, total) if paged else items
+        out = _page_envelope(items, page, per_page, total) if paged else items
+        if (search or "").strip() and not items and not total:
+            # nothing contains it: offer close matches (one wrong letter or digit) beside the
+            # empty result, among the same customers the other filters allow
+            close = await _did_you_mean(db, base, search)
+            if close:
+                out = {**(out if paged else {"data": [], "total": 0}), "did_you_mean": close}
+        return out
     except Exception as e:
         logger.error(f"Error fetching customers: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch customers")

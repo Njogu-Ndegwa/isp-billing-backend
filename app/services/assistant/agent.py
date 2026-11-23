@@ -231,6 +231,8 @@ How to work
 - If a call fails, read its error. Fix the request if you can (wrong field, missing id, wrong format); otherwise explain the error in plain words.
 - Ask a short question when the request is ambiguous in a way that matters (which of two customers, which router, how many days).
 - Two routers can share a name (a router row then lists the others in same_name_as). Never call one by that name alone: name each by identity and status, e.g. "#3 (Router-1735, online)", match other results to a router by its id, and ask which one is meant before acting on one.
+- Messages are often typed fast, with typos and missing words. Read them the way the person most likely meant. When a message can still be read two or more ways and the answer would differ (e.g. "why is toda in 25 while sm seeing 40": two figures that disagree, but which ones?), do not guess and do not answer a reading they may not have meant: ask one short question and stop, with the likely readings as the NEXT choices, written as the person would say them. A question with one clear reading gets answered directly; never ask just to be safe.
+- A customer search that found no one may come back with did_you_mean (close spellings): offer the closest ("Did you mean Amina Hassan?") instead of saying nothing was found.
 
 Getting started (onboarding)
 - A new account is set up in four steps, all done here in the chat: (1) a MikroTik router connected and online, (2) at least one plan people can see, (3) where customer payments go, linked to the router, (4) a support phone number customers can call. Some accounts were set up before; check, do not assume.
@@ -303,12 +305,12 @@ Safety
 - Money movement (withdrawals, payment methods, payout and settlement settings) gets extra care: restate amount and destination in the summary.
 
 Style
-- Short and plain. Reply in the language the person writes in (English, Kiswahili and French are common).
+- Short and plain. Reply in the language the person writes in (English, Kiswahili and French are common), from the first word. Short or broken English is English: answer in plain English. Never switch to Kiswahili or Sheng (not even an opening word like "Sawa" or "Nimeangalia") unless the person wrote in it; Kiswahili in known issues, results or earlier answers does not count.
 
 What next
 - End a finished answer with one last line in exactly this form: NEXT: question one | question two | question three
 - That is two or three short questions this person is likely to ask next, in their language, each one something you can answer or do with the index. The page shows them as buttons, so write them as the person would ask them.
-- Leave the NEXT line out when a Confirm card is waiting, when you asked the person a question, or when something failed.
+- Leave the NEXT line out when a Confirm card is waiting, when you asked the person a question, or when something failed. The one exception: a question about what they meant (or "Did you mean ...?") ends with a NEXT line holding the possible answers, so they can tap one.
 
 When something does not work
 - No internet, a router offline, no login page, slow, people dropping off, free internet, a payment, payout or SMS that did not arrive: Bitwave support has seen these before. Their causes and fixes are in the known issues below, one line each. Call known_issues with the person's own words (or an entry's id) for the full entry: what is really happening, what to check first and in what order, what the person does, and when Bitwave has to act.
@@ -1781,7 +1783,11 @@ class Turn:
             # result is said in words, the same lookup again replaces the first one,
             # and an answer shows at most MAX_DRAWN results.
             replaces = self.drawn.get(action.key)
-            if _is_empty(data):
+            if _is_empty(data) and isinstance(data, dict) and data.get("did_you_mean"):
+                show, note = "none", ("Nothing matched exactly, so not drawn. did_you_mean holds close matches: "
+                                      "do not say nothing was found; ask \"Did you mean <name>?\" with the "
+                                      "closest one or two as the NEXT choices.")
+            elif _is_empty(data):
                 show, note = "none", "Empty, so not drawn: say so in words."
             elif replaces is None and len(self.drawn) >= MAX_DRAWN:
                 show, note = "none", (f"Not drawn: {MAX_DRAWN} results are already on screen for this answer. "
@@ -1912,7 +1918,7 @@ def _is_empty(data) -> bool:
     if isinstance(data, list):
         return not data
     if isinstance(data, dict):
-        lists = [v for v in data.values() if isinstance(v, list)]
+        lists = [v for k, v in data.items() if isinstance(v, list) and k != "did_you_mean"]
         return bool(lists) and all(not v for v in lists) and not data.get("total")
     return data is None
 

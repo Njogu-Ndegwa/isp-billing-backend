@@ -67,8 +67,9 @@ def find_list(data: Any) -> tuple[Optional[list], Optional[str]]:
         return (data, None) if all(isinstance(r, dict) for r in data) else (None, None)
     if not isinstance(data, dict):
         return None, None
+    # did_you_mean: close matches beside an empty search result, never the result itself
     lists = {k: v for k, v in data.items()
-             if isinstance(v, list) and v and all(isinstance(r, dict) for r in v)}
+             if k != "did_you_mean" and isinstance(v, list) and v and all(isinstance(r, dict) for r in v)}
     for key in _LIST_KEYS:
         if key in lists:
             return lists[key], key
