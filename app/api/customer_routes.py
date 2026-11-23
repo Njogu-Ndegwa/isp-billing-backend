@@ -3018,7 +3018,8 @@ async def get_pppoe_credentials(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Get PPPoE credentials for a customer (admin use -- to give to customer)."""
+    """A PPPoE customer's login: the username and password typed into their own router, plus the
+    MikroTik it dials and the ports PPPoE runs on there. The reseller gives this to the customer."""
     try:
         user = await get_current_user(token, db)
 
@@ -3051,6 +3052,9 @@ async def get_pppoe_credentials(
             "expiry": customer.expiry.isoformat() if customer.expiry else None,
             "plan_name": customer.plan.name if customer.plan else None,
             "router_name": customer.router.name if customer.router else None,
+            "router_id": customer.router_id,
+            # the router ports the customer's own router plugs into (its WAN port to one of these)
+            "pppoe_ports": list(customer.router.pppoe_ports or []) if customer.router else [],
         }
     except HTTPException:
         raise

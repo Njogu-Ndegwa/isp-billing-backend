@@ -225,6 +225,8 @@ How to work
 - Why an M-Pesa payment failed: each failed row and failure_summary entry carries failure_fault (customer, mpesa, merchant_setup, bitwave or unknown) and failure_explained. Say who is at fault and what to do from those two fields only; never work out a cause yourself from result_desc or result_code, and never contradict them. "The initiator information is invalid" is a wrong PIN, not the payment setup. When failure_fault is unknown, say the cause is not known and quote M-Pesa's words.
 - For a change to many records, use a bulk action if the index has one; otherwise propose one call per record, at most {max_proposals} per turn, and say how many remain.
 - Never ask for, repeat or send a password, API key or other secret. Results show them hidden. If an action needs one, tell the person which dashboard page to use instead.
+- One exception, a PPPoE customer's login: when someone asks for a PPPoE customer's password, login or credentials, read their pppoe-credentials (the customer's own GET .../pppoe-credentials). That draws the PPPoE login card on their screen only: username, password behind a Show tap with a copy button, the router and its PPPoE ports. Do not refuse and do not say it is hidden or masked; say it is on the card. You never see the password, so never type it. For a PPPoE customer, "credentials" or "password" means this PPPoE login, not the account's access credentials (hotspot logins), unless the person says so.
+- Setting up a PPPoE customer's own router (Tenda, TP-Link...) to dial PPPoE: router mode (not bridge or access-point mode), WAN / internet connection type PPPoE, the username and password from the PPPoE login card, a cable from that router's WAN port to one of the MikroTik's PPPoE ports, no VLAN. Bridge mode fits only when another device behind it dials PPPoE instead. The known issue pppoe-customer-router-setup has the steps.
 - If nothing in the index does what was asked, say so; do not improvise with an unrelated action.
 - If a call fails, read its error. Fix the request if you can (wrong field, missing id, wrong format); otherwise explain the error in plain words.
 - Ask a short question when the request is ambiguous in a way that matters (which of two customers, which router, how many days).
@@ -1769,6 +1771,8 @@ class Turn:
             except listing.ListingError as exc:
                 return self._tool_result(tool_use_id, {"error": str(exc)}, True)
         note = None
+        if action.key == PPPOE_LOGIN_ACTION and isinstance(data, dict):
+            return await self._pppoe_login_card(tool_use_id, call_id, action, method, path, data, status=result.status)
         if show != "none":
             # What reaches the screen is the answer, not the search for it: an empty
             # result is said in words, the same lookup again replaces the first one,
@@ -1798,6 +1802,38 @@ class Turn:
         if dropped:
             out["ignored_query_params"] = dropped
         return self._tool_result(tool_use_id, out)
+
+    async def _pppoe_login_card(self, tool_use_id, call_id, action: Action, method, path, data: dict, *, status) -> dict:
+        """A PPPoE customer's login, drawn for the signed-in person only.
+
+        The API already decided this person may see it (their own customer, and
+        customers.manage for staff, as on the classic customers page). The card on
+        their screen carries the password; the model, the stored transcript and the
+        support view get it masked. A reopened chat fetches it again on Show.
+        """
+        login = {k: data.get(k) for k in PPPOE_LOGIN_FIELDS}
+        replaces = self.drawn.get(action.key)
+        self.drawn[action.key] = call_id
+        event = {"call_id": call_id, "title": action.title, "method": method, "path": path, "query": None,
+                 "show": "pppoe_login", **({"replaces": replaces} if replaces else {})}
+        await self.emit("data", {**event, "payload": login}, keep=False)
+        kept = {k: v for k, v in login.items() if k != "pppoe_password"}
+        kept["password_on_request"] = bool(data.get("pppoe_password"))
+        self.transcript.append({"type": "data", "at": datetime.utcnow().isoformat() + "Z", **event, "payload": kept})
+        return self._tool_result(tool_use_id, {
+            "status": status,
+            "data": localize_times(shaping.for_model(data), await self._zone()),
+            "display": ("The PPPoE login card is on the person's screen: username, the password behind a Show "
+                        "tap with a copy button, the router and its PPPoE ports. Do not refuse or call the "
+                        "password hidden: tell them to tap Show on the card and type both exactly as shown into "
+                        "the customer's router. Never write the password yourself."),
+        })
+
+
+# The PPPoE customer's login (GET /api/customers/{id}/pppoe-credentials) is drawn as its own card.
+PPPOE_LOGIN_ACTION = "GET /api/customers/{customer_id}/pppoe-credentials"
+PPPOE_LOGIN_FIELDS = ("customer_id", "name", "pppoe_username", "pppoe_password", "router_id", "router_name",
+                      "pppoe_ports", "status", "expiry", "plan_name")
 
 
 def _without_overrides(action: Action, query: Optional[dict], body: Any) -> tuple:
