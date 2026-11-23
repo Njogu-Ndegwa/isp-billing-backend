@@ -3959,20 +3959,39 @@ async def collect_bandwidth_snapshot():
             # positions the cursor had already passed and were starved for hours
             # while quiet ones were revisited 5-6x (observed 2026-07-29: 37
             # distinct routers covered in 210 visit slots).
-            routers_result = await db.execute(select(Router).order_by(Router.id))
-            routers = routers_result.scalars().all()
-            if not routers:
+            from app.db.models import User
+            from app.services.ops_health import is_owner_cut_off
+
+            routers_result = await db.execute(
+                select(Router, User.subscription_status)
+                .outerjoin(User, User.id == Router.user_id)
+                .order_by(Router.id)
+            )
+            rows = routers_result.all()
+            if not rows:
                 logger.warning("No routers found in database for bandwidth collection")
                 return
             await db.commit()
+            routers = [router for router, _owner_status in rows]
 
             eligible_routers = []
             skipped_radius = 0
             skipped_offline = 0
             skipped_pushing = 0
-            for router in routers:
+            skipped_cut_off = 0
+            for router, owner_status in rows:
                 if getattr(router, 'auth_method', None) == 'RADIUS':
                     skipped_radius += 1
+                    continue
+                if is_owner_cut_off(owner_status):
+                    # A suspended/inactive reseller's routers are not probed by
+                    # the reachability job, so their last_checked_at goes stale
+                    # and _router_recently_offline() stops skipping them. On
+                    # 2026-11-23 that put 238 dead routers into a 270-slot
+                    # rotation: each live poll-only router (hAP lites, which
+                    # never push) was read about 3 times a day and its hotspot
+                    # customers showed 0 MB (router 750 TOLE #1).
+                    skipped_cut_off += 1
                     continue
                 if reports_metrics(router.id, now):
                     # The router pushes its own interface counters and session
@@ -3992,9 +4011,11 @@ async def collect_bandwidth_snapshot():
 
             if not eligible_routers:
                 logger.info(
-                    "[BANDWIDTH] No eligible routers this run (total=%d, radius=%d, recently_offline=%d, pushing=%d)",
+                    "[BANDWIDTH] No eligible routers this run (total=%d, radius=%d, "
+                    "owner_cut_off=%d, recently_offline=%d, pushing=%d)",
                     len(routers),
                     skipped_radius,
+                    skipped_cut_off,
                     skipped_offline,
                     skipped_pushing,
                 )
@@ -4009,11 +4030,12 @@ async def collect_bandwidth_snapshot():
             processed_count = 0
             logger.info(
                 "[BANDWIDTH] Processing %d/%d eligible router(s) this run "
-                "(total=%d, radius=%d, recently_offline=%d, pushing=%d, cursor=%d)",
+                "(total=%d, radius=%d, owner_cut_off=%d, recently_offline=%d, pushing=%d, cursor=%d)",
                 len(routers_to_process),
                 len(eligible_routers),
                 len(routers),
                 skipped_radius,
+                skipped_cut_off,
                 skipped_offline,
                 skipped_pushing,
                 start_index,
