@@ -1424,6 +1424,9 @@ async def test_the_customer_list_filters_on_the_server(client, owner, db):
     assert await names("connection_type=hotspot&status=active") == ["Paid Up", "Ran Out"]
     assert await names("search=0711222333") == ["Home Line"]
     assert await names("search=paid") == ["Paid Up"]
+    assert await names("expires=next_7_days") == ["Paid Up"]
+    assert await names("expires=past_7_days") == ["Ran Out"]
+    assert (await client.get("/api/customers?expires=someday", headers=auth(token))).status_code == 422
     assert (await client.get("/api/customers?status=happy", headers=auth(token))).status_code == 422
 
 

@@ -552,7 +552,7 @@ async def list_recipients(filter: str = Query("all"),
         if exclude_customer_ids else None
     recips = await sms_dispatch.resolve_recipients(
         db, user.id, filter=filter, plan_id=plan_id, search=search,
-        exclude_customer_ids=exclude)
+        exclude_customer_ids=exclude, tz_name=reseller_market(user).timezone)
     page = recips[offset:offset + limit]
     return {"count": len(recips), "recipients": page,
             "has_more": offset + limit < len(recips)}
@@ -564,8 +564,16 @@ class SendRequest(BaseModel):
                                                  "x-required-for": {"filter": {"by_plan": ["plan_id"]}}})
 
     body: str = Field(..., min_length=1, max_length=1000, json_schema_extra={"x-sms": True})
-    # who gets it when no customer is picked: everyone, active, time ending within 7 days, one plan
-    filter: Literal["all", "active", "expiring", "by_plan"] = "all"
+    # who gets it when no customer is picked
+    filter: Literal["all", "active", "expiring", "expiring_today", "expiring_tomorrow",
+                    "expired_recently", "by_plan"] = Field("all", description=(
+        "Who gets it when no customer is picked: all, active, expiring (time ends within 7 days), "
+        "expiring_today (time ends today, including earlier today), expiring_tomorrow, "
+        "expired_recently (time ran out in the last 7 days), by_plan (one plan's customers)"),
+        json_schema_extra={"x-enum-labels": {
+            "all": "Everyone", "active": "Active customers", "expiring": "Time ends within 7 days",
+            "expiring_today": "Time ends today", "expiring_tomorrow": "Time ends tomorrow",
+            "expired_recently": "Time ran out in the last 7 days", "by_plan": "One plan's customers"}})
     plan_id: Optional[int] = None
     customer_ids: Optional[list[int]] = None
     exclude_customer_ids: Optional[list[int]] = None
@@ -584,7 +592,8 @@ async def send_messages(req: SendRequest, background: BackgroundTasks,
     recips = await sms_dispatch.resolve_recipients(
         db, user.id, filter=req.filter, plan_id=req.plan_id,
         customer_ids=req.customer_ids,
-        exclude_customer_ids=req.exclude_customer_ids)
+        exclude_customer_ids=req.exclude_customer_ids,
+        tz_name=reseller_market(user).timezone)
     if not recips:
         raise HTTPException(status_code=400, detail="No recipients matched")
 
