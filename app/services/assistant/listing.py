@@ -403,6 +403,33 @@ def bigger_pages(params: list, query: Optional[dict], first: Any, page_rows: int
     return None
 
 
+def partial_read(params: list, query: Optional[dict], data: Any) -> Optional[str]:
+    """Why one read's list is not the whole list (one page of more, a full limit, an offset),
+    or None when it is all of it. Figures over its rows then say they cover only those rows."""
+    rows, _ = find_list(data)
+    if not rows:
+        return None
+    meta = data if isinstance(data, dict) else {}
+    q = query or {}
+    names = {p["name"]: p for p in params}
+    total = next((meta[k] for k in ("total", "total_count", "total_items", "count")
+                  if isinstance(meta.get(k), int) and not isinstance(meta.get(k), bool)), None)
+    pages = meta.get("total_pages") if isinstance(meta.get("total_pages"), int) else None
+    if (pages and pages > 1) or (total is not None and total > len(rows)):
+        return (f"this read is one page of {len(rows)} rows" + (f" out of {total} rows" if total else "")
+                + (f" in {pages} pages" if pages and pages > 1 else ""))
+    if meta.get("has_more") is True:
+        return f"there are more rows after these {len(rows)}"
+    offset = q.get("offset")
+    if "offset" in names and offset and int(offset) > 0:
+        return f"the first {int(offset)} rows were skipped (offset {int(offset)})"
+    if "limit" in names:
+        limit = q.get("limit") or (names["limit"].get("schema") or {}).get("default")
+        if limit and len(rows) >= int(limit):
+            return f"one read returns at most {int(limit)} rows and this one is full"
+    return None
+
+
 def join_pages(first: Any, rows: list) -> Any:
     """The first page's result carrying every page's rows."""
     if isinstance(first, list):
