@@ -87,10 +87,13 @@ async def resolve_recipients(db, reseller_id: int, *, filter: str = "all",
     elif filter == "active":
         stmt = stmt.where(Customer.status == CustomerStatus.ACTIVE)
     elif filter == "expiring":
-        cutoff = datetime.utcnow() + timedelta(days=expiring_days)
-        # Paused customers are not expiring: their expiry is frozen at the pause.
-        stmt = stmt.where(Customer.expiry.isnot(None), Customer.expiry <= cutoff,
-                          Customer.paused_at.is_(None))
+        # Time still running and ending within the window: someone whose time already ran
+        # out is not "expiring" (that is expired_recently). Paused customers are not
+        # expiring either: their expiry is frozen at the pause.
+        moment = now or datetime.utcnow()
+        cutoff = moment + timedelta(days=expiring_days)
+        stmt = stmt.where(Customer.expiry.isnot(None), Customer.expiry > moment,
+                          Customer.expiry <= cutoff, Customer.paused_at.is_(None))
     elif filter in _FILTER_WINDOWS:
         stmt = stmt.where(*expiry_between(*expiry_window(_FILTER_WINDOWS[filter], now, tz_name)))
     if exclude_customer_ids and not customer_ids:
