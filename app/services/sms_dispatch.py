@@ -7,8 +7,9 @@ refunded in their own short transaction.
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select, delete
 
@@ -27,12 +28,55 @@ from app.services.messaging import gateway_health
 logger = logging.getLogger(__name__)
 
 
+# When a customer's paid time ends, as the reseller says it: "today" and "tomorrow" are
+# calendar days in the reseller's own timezone, not the next 24 hours.
+EXPIRY_WINDOWS = ("today", "tomorrow", "next_7_days", "past_7_days")
+
+
+def expiry_window(name: str, now: Optional[datetime] = None,
+                  tz_name: Optional[str] = None) -> tuple[datetime, datetime]:
+    """(start, end] in naive UTC, as expiry is stored, for one of EXPIRY_WINDOWS.
+    today: the whole local day, so it includes time that ran out this morning."""
+    now = now or datetime.utcnow()
+    if name == "next_7_days":
+        return now, now + timedelta(days=7)
+    if name == "past_7_days":
+        return now - timedelta(days=7), now
+    try:
+        zone = ZoneInfo(tz_name or "Africa/Nairobi")
+    except ZoneInfoNotFoundError:
+        zone = ZoneInfo("Africa/Nairobi")
+    local = now.replace(tzinfo=timezone.utc).astimezone(zone)
+    day = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    if name == "tomorrow":
+        day = (day + timedelta(days=1, hours=12)).replace(hour=0)  # a DST-safe next midnight
+    elif name != "today":
+        raise ValueError(f"unknown expiry window {name!r}")
+    end = (day + timedelta(days=1, hours=12)).replace(hour=0)
+    to_utc = lambda d: d.astimezone(timezone.utc).replace(tzinfo=None)
+    return to_utc(day), to_utc(end)
+
+
+def expiry_between(start: datetime, end: datetime):
+    """Customers whose paid time ends in (start, end]. Paused ones are left out: their
+    expiry is frozen at the pause."""
+    return (Customer.expiry.isnot(None), Customer.expiry > start, Customer.expiry <= end,
+            Customer.paused_at.is_(None))
+
+
+# the send filters that pick customers by when their time ends
+_FILTER_WINDOWS = {"expiring_today": "today", "expiring_tomorrow": "tomorrow",
+                   "expired_recently": "past_7_days"}
+
+
 async def resolve_recipients(db, reseller_id: int, *, filter: str = "all",
                              plan_id: Optional[int] = None,
                              customer_ids: Optional[list[int]] = None,
                              exclude_customer_ids: Optional[list[int]] = None,
                              search: Optional[str] = None,
-                             expiring_days: int = 7) -> list[dict]:
+                             expiring_days: int = 7,
+                             tz_name: Optional[str] = None,
+                             now: Optional[datetime] = None) -> list[dict]:
     """Return [{customer_id, name, phone}] for a reseller, de-duplicated by phone."""
     stmt = select(Customer.id, Customer.name, Customer.phone).where(
         Customer.user_id == reseller_id, Customer.phone.isnot(None))
@@ -47,6 +91,8 @@ async def resolve_recipients(db, reseller_id: int, *, filter: str = "all",
         # Paused customers are not expiring: their expiry is frozen at the pause.
         stmt = stmt.where(Customer.expiry.isnot(None), Customer.expiry <= cutoff,
                           Customer.paused_at.is_(None))
+    elif filter in _FILTER_WINDOWS:
+        stmt = stmt.where(*expiry_between(*expiry_window(_FILTER_WINDOWS[filter], now, tz_name)))
     if exclude_customer_ids and not customer_ids:
         stmt = stmt.where(Customer.id.notin_(exclude_customer_ids))
     if search:
