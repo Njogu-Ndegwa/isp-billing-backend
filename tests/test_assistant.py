@@ -1980,3 +1980,181 @@ def test_a_router_is_added_with_a_two_question_setup_form_never_by_hand():
     assert fields["is_routerboard"]["when"] == {"vpn_type": ["l2tp"]}
     assert fields["payment_methods"].get("admin_only") is True
     assert "business name" in fields["ssid"]["hint"]
+
+
+# ---------------------------------------------------------------------------
+# SMS reminders: the server's cost, resuming after credits are bought, the draft's language
+# ---------------------------------------------------------------------------
+
+REMIND_TODAY = "Send a reminder SMS to the customers whose internet time ends today, asking them to buy again"
+
+
+@pytest.mark.asyncio
+async def test_an_sms_card_opens_with_the_servers_cost_and_one_confirm_sends(client, owner, db, monkeypatch):
+    """The cost is the server's: recipients without a phone are left out, a long message counts
+    its parts, and the model is handed the same figures it must quote."""
+    import app.api.messaging_routes as mr
+
+    reseller, token = owner
+    plan = await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    for i in range(3):
+        await make_customer(db, reseller, plan, name=f"Guest {i}", phone=f"25471100010{i}")
+    await make_customer(db, reseller, plan, name="No phone", phone="")
+    await make_sms_account(db, reseller, balance=32)
+    await db.commit()
+
+    async def _no_dispatch(cid):
+        pass
+    monkeypatch.setattr(mr.sms_dispatch, "dispatch_campaign", _no_dispatch)
+
+    text = "Hello, your internet time ends today. " * 5   # 190 GSM-7 characters: 2 parts
+    model = use_model([
+        tool_reply("describe_action", {"method": "POST", "path": "/api/messaging/send"}, "tu_1"),
+        tool_reply("call_api", {"method": "POST", "path": "/api/messaging/send",
+                                "body": {"body": text, "filter": "all"}, "summary": "Reminder to everyone"}, "tu_2"),
+        text_reply("Ready: 3 recipients, 6 credits. Tap Confirm."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "remind everyone"},
+                                           headers=auth(token))).text)
+    card = next(e for e in events if e["type"] == "action")
+    shown = next(e for e in events if e["type"] == "action_result" and e["action_id"] == card["action_id"])
+    assert shown["status"] == "pending" and shown["preview_of"]
+    assert shown["preview"]["credits_needed"] == 6 and shown["preview"]["recipients"] == 3
+    assert shown["preview"]["parts_per_message"] == 2 and shown["preview"]["without_phone"] == 1
+    told = tool_results(model.requests[2])[0]
+    assert told["status"] == "waiting_for_confirmation"
+    assert told["preview"]["credits_needed"] == 6 and told["preview"]["credits_balance"] == 32
+    assert "never your own estimate" in told["preview_note"]
+
+    use_model([text_reply("Sent.")])
+    r = await client.post(f"/api/assistant/conversations/{events[0]['id']}/decide", headers=auth(token),
+                          json={"decisions": [{"action_id": card["action_id"], "approve": True}]})
+    result = next(e for e in sse_events(r.text) if e["type"] == "action_result")
+    assert result["status"] == "done" and result["ok"] is True
+    assert result["payload"]["credits_reserved"] == 6 and result["payload"]["recipient_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_an_english_request_gets_an_english_draft(client, owner, db):
+    """A Swahili draft for someone who wrote English goes back to the model to be written in
+    English; only the English card reaches the person."""
+    reseller, token = owner
+    plan = await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    await make_customer(db, reseller, plan, name="Guest 1", phone="254711000201")
+    await make_sms_account(db, reseller, balance=50)
+    await db.commit()
+    swahili = ("Habari! Muda wako wa internet unaisha leo. Nunua tena kupitia M-Pesa ili uendelee "
+               "kuwa online. Asante.")
+    english = "Hello! Your internet time ends today. Buy again through M-Pesa to stay online. Thank you."
+    model = use_model([
+        tool_reply("describe_action", {"method": "POST", "path": "/api/messaging/send"}, "tu_1"),
+        tool_reply("call_api", {"method": "POST", "path": "/api/messaging/send",
+                                "body": {"body": swahili, "filter": "expiring_today"}}, "tu_2"),
+        tool_reply("call_api", {"method": "POST", "path": "/api/messaging/send",
+                                "body": {"body": english, "filter": "expiring_today"}}, "tu_3"),
+        text_reply("Ready. Tap Confirm."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": REMIND_TODAY},
+                                           headers=auth(token))).text)
+    cards = [e for e in events if e["type"] == "action"]
+    assert len(cards) == 1 and cards[0]["body"]["body"] == english
+    refused = tool_results(model.requests[2])[0]
+    assert refused["_is_error"] and "in English" in refused["error"]
+
+    # someone who writes Swahili gets their Swahili draft as it is
+    use_model([
+        tool_reply("call_api", {"method": "POST", "path": "/api/messaging/send",
+                                "body": {"body": swahili, "filter": "expiring_today"}}, "tu_4"),
+        text_reply("Tayari."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", headers=auth(token), json={
+        "message": "Tuma ujumbe kwa wateja wangu ambao muda wao unaisha leo", "conversation_id": events[0]["id"]})).text)
+    assert [e["body"]["body"] for e in events if e["type"] == "action"] == [swahili]
+
+
+@pytest.mark.asyncio
+async def test_an_account_set_to_swahili_keeps_a_swahili_draft(client, owner, db):
+    reseller, token = owner
+    reseller.preferred_language = "sw"
+    plan = await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    await make_customer(db, reseller, plan, name="Guest 1", phone="254711000301")
+    await make_sms_account(db, reseller, balance=50)
+    await db.commit()
+    swahili = "Habari! Muda wako wa internet unaisha leo. Nunua tena ili uendelee kuwa online. Asante."
+    use_model([
+        tool_reply("describe_action", {"method": "POST", "path": "/api/messaging/send"}, "tu_1"),
+        tool_reply("call_api", {"method": "POST", "path": "/api/messaging/send",
+                                "body": {"body": swahili, "filter": "expiring_today"}}, "tu_2"),
+        text_reply("Ready."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": REMIND_TODAY},
+                                           headers=auth(token))).text)
+    assert [e["body"]["body"] for e in events if e["type"] == "action"] == [swahili]
+
+
+@pytest.mark.asyncio
+async def test_paid_credits_bring_the_reminder_card_back_without_asking(client, owner, db, monkeypatch):
+    """0 credits: the assistant offers to buy some and promises the reminder. Once M-Pesa says
+    paid, the chat carries on by itself and the reminder card is proposed again."""
+    import asyncio
+
+    import app.api.assistant_routes as ar
+    import app.api.messaging_routes as mr
+    from app.db.models import SmsCreditOrder, SmsCreditOrderStatus, SmsCreditTxnKind
+    from app.services import sms_credits
+
+    reseller, token = owner
+    plan = await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    guest = await make_customer(db, reseller, plan, name="Guest 4936", phone="254711000401")
+    await make_sms_account(db, reseller, balance=0)
+    await db.commit()
+    monkeypatch.setattr(ar, "PAYMENT_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(ar, "PAYMENT_FOLLOW_SECONDS", 20.0)
+
+    class _Stk:
+        checkout_request_id = "ws_CO_77"
+        merchant_request_id = "mr_77"
+
+    async def _fake_stk(**kwargs):
+        return _Stk()
+    monkeypatch.setattr(mr, "initiate_stk_push_direct", _fake_stk)
+
+    use_model([
+        tool_reply("describe_action", {"method": "POST", "path": "/api/messaging/credits/purchase"}, "tu_d"),
+        tool_reply("call_api", {"method": "POST", "path": "/api/messaging/credits/purchase",
+                                "body": {"quantity": 10, "phone_number": "0712345678"},
+                                "summary": "Buy 10 SMS credits"}, "tu_p"),
+        text_reply("Your SMS credits are 0. Buy 10 here; once it is paid I'll send the reminder."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": REMIND_TODAY},
+                                           headers=auth(token))).text)
+    conversation_id = events[0]["id"]
+    buy = next(e for e in events if e["type"] == "action")
+    use_model([text_reply("Check your phone and enter the PIN.")])
+    r = await client.post(f"/api/assistant/conversations/{conversation_id}/decide", headers=auth(token),
+                          json={"decisions": [{"action_id": buy["action_id"], "approve": True}]})
+    assert next(e for e in sse_events(r.text) if e["type"] == "action_result")["awaiting"]["kind"] == "mpesa"
+
+    reminder = "Hello! Your internet time ends today. Buy again to stay online."
+    model = use_model([
+        tool_reply("describe_action", {"method": "POST", "path": "/api/messaging/send"}, "tu_s1"),
+        tool_reply("call_api", {"method": "POST", "path": "/api/messaging/send",
+                                "body": {"body": reminder, "customer_ids": [guest.id]},
+                                "summary": "Reminder to Guest 4936"}, "tu_s2"),
+        text_reply("Paid: 10 credits added. The reminder is ready, tap Confirm."),
+    ])
+    # M-Pesa's callback settles the order
+    order = (await db.execute(select(SmsCreditOrder))).scalar_one()
+    order.status = SmsCreditOrderStatus.COMPLETED
+    await sms_credits.grant(db, reseller.id, 10, SmsCreditTxnKind.PURCHASE, reference=f"SMS-{order.id}")
+    await db.commit()
+    await asyncio.wait_for(asyncio.gather(*list(ar._TASKS)), timeout=15)
+
+    told = model.requests[0]["messages"][-1]["content"][0]["text"]
+    assert told.startswith("[Confirmation results]") and '"payment_of":"' + buy["action_id"] + '"' in told
+    assert "paid" in told and "propose that step's card now" in told
+    conv = (await client.get(f"/api/assistant/conversations/{conversation_id}", headers=auth(token))).json()
+    cards = [i for i in conv["transcript"] if i["type"] == "action"]
+    assert cards[-1]["path"] == "/api/messaging/send" and cards[-1]["body"]["body"] == reminder
+    assert any(i["type"] == "action_result" and i["action_id"] == cards[-1]["action_id"]
+               and i.get("preview", {}).get("credits_needed") == 1 for i in conv["transcript"])

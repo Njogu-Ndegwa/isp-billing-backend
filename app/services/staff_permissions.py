@@ -514,6 +514,7 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     ((R,), "/api/messaging/templates", "messaging.send", None),
     ((R,), "/api/messaging/gateway/status", ("messaging.send", "messaging.settings"), None),
     (("POST",), "/api/messaging/send", "messaging.send", "Sent an SMS campaign"),
+    (("POST",), "/api/messaging/send/preview", "messaging.send", None),
     (("POST",), "/api/messaging/templates", "messaging.send", "Saved an SMS template"),
     (("DELETE",), "/api/messaging/templates/{template_id}", "messaging.send",
      "Deleted SMS template {template_id}"),

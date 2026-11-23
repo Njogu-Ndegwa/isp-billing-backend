@@ -28,6 +28,7 @@ READ_ONLY_POSTS = frozenset({
     "/api/feedback/requests",       # only writes down a feature someone asked for
     "/api/customers/usage/bulk",
     "/api/messaging/customer-events/preview",
+    "/api/messaging/send/preview",  # what a send costs; sends nothing
     "/api/compensation/outage/preview",
     "/api/customers/{customer_id}/audit-log/router-logs",
     "/api/routers/{router_id}/diagnose/dual-port",
@@ -81,6 +82,9 @@ class Action:
     overrides: tuple = ()        # declared OVERRIDE_FLAGS (query or body)
     apply_flag: Optional[str] = None  # a declared APPLY_FLAG: without it the request is a preview
     preview: Optional[str] = None     # a separate read that previews this change (x-preview)
+    # the preview is a cheap read shown on the card as soon as it is proposed (x-preview-now),
+    # so its figures (what an SMS costs) are there before the first tap and one Confirm does it
+    preview_now: bool = False
 
     @property
     def key(self) -> str:
@@ -293,6 +297,7 @@ class Catalog:
                     overrides=declared(OVERRIDE_FLAGS),
                     apply_flag=apply_flags[0] if apply_flags and method != "get" else None,
                     preview=op.get("x-preview") if isinstance(op.get("x-preview"), str) else None,
+                    preview_now=op.get("x-preview-now") is True,
                 ))
         return cls(actions)
 

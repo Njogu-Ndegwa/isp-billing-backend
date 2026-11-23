@@ -500,3 +500,51 @@ async def test_a_failed_payment_keeps_mpesas_reason_in_plain_words(db, client, m
     status = (await client.get(f"/api/messaging/credits/orders/{order_id}")).json()
     assert status["status"] == "failed" and status["paid"] is False
     assert "cancelled on the phone" in status["summary"] and "1032" in status["summary"]
+
+
+@pytest.mark.asyncio
+async def test_send_preview_counts_credits_for_the_real_recipients(db, client, monkeypatch):
+    """The preview the assistant quotes: customers without a phone are not counted, a long
+    message is charged per part, and a short balance says how many recipients it covers."""
+    r = await make_reseller(db); _auth_as(monkeypatch, r)
+    await make_sms_account(db, r, balance=5)
+    p = await make_plan(db, r)
+    for i in range(4):
+        await make_customer(db, r, p, name=f"Has phone {i}", phone=f"25470000030{i}")
+    await make_customer(db, r, p, name="No phone", phone="")
+    await make_customer(db, r, p, name="Blank phone", phone="  ")
+
+    long_text = "Hello, your internet time ends today. " * 5          # 190 GSM-7 chars: 2 parts
+    resp = await client.post("/api/messaging/send/preview", json={"body": long_text, "filter": "all"})
+    assert resp.status_code == 200, resp.text
+    out = resp.json()
+    assert out["recipients"] == 4 and out["without_phone"] == 2
+    assert out["encoding"] == "GSM-7" and out["parts_per_message"] == 2
+    assert out["credits_needed"] == 8 and out["credits_balance"] == 5
+    assert out["enough_credits"] is False and out["balance_covers_recipients"] == 2
+    assert "4 recipients × 2 SMS parts = 8 credits; you have 5, enough for 2 of the 4" in out["summary"]
+    assert "2 picked customers have no phone number" in out["summary"]
+
+    short = await client.post("/api/messaging/send/preview", json={"body": "Don’t forget to renew", "filter": "all"})
+    out = short.json()
+    assert out["encoding"] == "UCS-2" and out["non_gsm_characters"] == ["’"]
+    assert out["parts_per_message"] == 1 and out["credits_needed"] == 4 and out["enough_credits"] is True
+    assert out["balance_covers_recipients"] == 4
+
+    # nothing was sent or charged
+    acct = await sms_credits.get_or_create_account(db, r.id)
+    await db.refresh(acct)
+    assert acct.balance == 5
+
+
+@pytest.mark.asyncio
+async def test_send_refusal_says_how_many_the_balance_covers(db, client, monkeypatch):
+    r = await make_reseller(db); _auth_as(monkeypatch, r)
+    await make_sms_account(db, r, balance=3)
+    p = await make_plan(db, r)
+    for i in range(5):
+        await make_customer(db, r, p, phone=f"25470000040{i}")
+    resp = await client.post("/api/messaging/send", json={"body": "Hi", "filter": "all"})
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["required"] == 5 and detail["balance"] == 3 and detail["balance_covers_recipients"] == 3

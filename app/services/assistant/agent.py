@@ -24,6 +24,7 @@ from typing import Any, Optional
 from app.config import settings
 from app.services.assistant import executor, known_issues, shaping, store, listing, router_names
 from app.services.assistant import chat_images
+from app.services.assistant import sms_language
 from app.services.assistant.usage import TurnUsage
 from app.services.assistant.caller import Caller
 from urllib.parse import quote
@@ -256,6 +257,8 @@ Product facts (Bitwave support's own answers to resellers; check live data for n
 - An action on a group of customers (SMS, and any other that takes customer_ids) whose fixed groups do not match what was asked ("ran out yesterday on router X", "PPPoE customers on Weekly 300"): read the customers list with its filters and where rules to get exactly them, show who that is, then pass their ids (customer_ids). Never offer a bigger or different group in its place; if none match, say so.
 - SMS to customers picked by when their time ends ("expires today", "ran out this week"): the send's filter does it (expiring_today, expiring_tomorrow, expiring within 7 days, expired_recently); the customers list's expires filter shows who that is.
 - SMS "can't send" or "shows zero": a send needs credits for every recipient × message part; check the balance and how many people they want to reach.
+- What an SMS send costs comes from the server: the send card's preview (also POST /api/messaging/send/preview) gives recipients, parts per message and credits. Say those figures, never your own estimate; when credits are short, say how many recipients the balance covers.
+- An SMS you write for customers is in the language the person writes to you in. Swahili only when they write Swahili, ask for it, or their account's language is Swahili.
 - A new access point or router should show up by itself once it is added and provisioned; if it does not, check its provisioning.
 - Ads on the hotspot login page come in two kinds. Your own promo (POST /api/ads) advertises your own WiFi (bundles, offers) and always shows your support number from Settings. An ad for any other business, even a friend's shop, is an ad you sell (POST /api/ad-sales): the business pays by M-Pesa, Bitwave keeps 20% and the rest joins your payout. Ads only show when Show ads is on in portal settings. A photo or video is picked in the form, from the phone, or is a picture sent in this chat (see Photos).
 - A notice on the hotspot login page (maintenance tonight, a price change) is the portal announcement (portal settings: show_announcement, announcement_type, announcement_text), not an ad. 'Tangazo' can mean either: a notice for customers is the announcement; promoting a business is an ad.
@@ -723,6 +726,9 @@ class Turn:
         self._tz_known = False
         self.usage = TurnUsage()
         self.is_question = False
+        # M-Pesa prompts this turn sent: watched afterwards, so a paid one comes back to the chat
+        self.payment_waits: list[dict] = []
+        self._language_checked = False  # a drafted SMS is sent back for its language once per turn
         self.waiting_card: Optional[dict] = None  # the one card a typed "confirm" pointed at
 
     def _card_name(self, action: dict) -> str:
@@ -906,6 +912,27 @@ class Turn:
         self.messages.append({"role": "user", "content": [{
             "type": "text",
             "text": "[Confirmation results] " + shaping.to_json_text(lines),
+        }]})
+        await self._loop()
+
+    async def payment_settled(self, wait: dict, status: Any) -> None:
+        """An M-Pesa payment started from this chat was paid. The model is told, so it carries on
+        with what the payment was for (the reminder that could not go out without credits) in this
+        turn, without the person asking. Told once per payment."""
+        marker = shaping.to_json_text({"payment_of": wait["action_id"]})[1:-1]
+        for m in self.messages:
+            if m.get("role") == "user" and isinstance(m.get("content"), list) and any(
+                    marker in str(b.get("text") or "") for b in m["content"] if isinstance(b, dict)):
+                return
+        line = {
+            "payment_of": wait["action_id"], "title": wait["title"],
+            "outcome": ("paid: the M-Pesa payment went through. Say so in one line. If it was bought for a "
+                        "step still to do in this chat (a reminder SMS that could not go out without credits), "
+                        "propose that step's card now, the same request as before, without waiting to be asked."),
+            "status": shaping.for_model(status, limit_chars=800),
+        }
+        self.messages.append({"role": "user", "content": [{
+            "type": "text", "text": "[Confirmation results] " + shaping.to_json_text([line]),
         }]})
         await self._loop()
 
@@ -1323,6 +1350,54 @@ class Turn:
         })
         return True
 
+    async def _sms_language_problem(self, spec: Action, body: Any) -> Optional[str]:
+        """A drafted SMS (an x-sms field) in Swahili for someone who writes English: sent back once
+        per turn to be written in their language (sms_language)."""
+        props = (spec.body_schema or {}).get("properties") or {}
+        drafts = [body[k] for k, p in props.items()
+                  if isinstance(p, dict) and p.get("x-sms") and isinstance(body, dict) and isinstance(body.get(k), str)]
+        if not drafts or self._language_checked:
+            return None
+        problem = sms_language.draft_problem(drafts, sms_language.person_texts(self.messages))
+        if problem is None:
+            return None
+        try:  # the account's own language setting allows Swahili
+            from sqlalchemy import select
+
+            from app.db.database import async_session
+            from app.db.models import User
+
+            async with async_session() as db:
+                preferred = (await db.execute(
+                    select(User.preferred_language).where(User.id == self.caller.user_id))).scalar()
+        except Exception:
+            preferred = None
+        if (preferred or "").strip().lower().startswith("sw"):
+            return None
+        self._language_checked = True
+        return problem
+
+    async def _preview_now(self, spec: Action, params: dict, action: dict) -> Any:
+        """A cheap preview (x-preview-now) put on the card as it is proposed, as if the person had
+        tapped Preview: the card opens with the figures and one Confirm does it. None when the
+        request cannot be previewed yet (a form still to fill in)."""
+        request = self._preview_request(spec, params, action)
+        if request is None:
+            return None
+        method, path, query, body = request
+        try:
+            result = await executor.call_api(self.app, self.caller, method, path, query, body)
+        except Exception:
+            logger.warning("[assistant] preview of %s %s failed", method, path, exc_info=True)
+            return None
+        if not result.ok:
+            return None  # the first Confirm previews it again, once the form is complete
+        await self.emit("action_result", {
+            "action_id": action["id"], "status": "pending", "ok": True, "http_status": result.status,
+            "preview_of": _fingerprint(action), "detail": "", "preview": shaping.for_screen(result.data),
+        })
+        return shaping.for_model(result.data, limit_chars=2000)
+
     async def _offer_retry(self, action: dict, spec: Action, reason: str) -> Optional[str]:
         """The API refused (a duplicate, a conflict) and has a flag to do it anyway: the same
         request with that flag, as a card of its own. Nothing runs until the person confirms it."""
@@ -1380,6 +1455,8 @@ class Turn:
             **({"awaiting": awaiting} if awaiting else {}),
         })
         retry = await self._offer_retry(action, spec, reason or detail) if overridable else None
+        if awaiting and awaiting.get("kind") == "mpesa":
+            self.payment_waits.append({"action_id": action_id, "title": action["title"], "poll": awaiting["poll"]})
         if awaiting:
             outcome = ("payment prompt sent, NOT paid yet: M-Pesa is asking for the PIN on the phone. Say "
                        "so (check the phone, enter the PIN); the card shows when it is paid. Never say it is "
@@ -1713,6 +1790,9 @@ class Turn:
             return self._tool_result(tool_use_id, {
                 "error": "Not proposed, fix the request first: " + "; ".join(problems) + ".",
             }, True)
+        wrong_language = await self._sms_language_problem(action, body)
+        if wrong_language:
+            return self._tool_result(tool_use_id, {"error": wrong_language}, True)
         if self.caller.read_only:
             return self._tool_result(tool_use_id, {"error": "View-as is read-only: changes are disabled."}, True)
         if self.proposals >= MAX_PROPOSALS_PER_TURN:
@@ -1740,9 +1820,14 @@ class Turn:
             **({"form": fields_for_form} if fields_for_form else {}),
             **({"previews": True} if action.previews else {}),
         })
+        preview = await self._preview_now(action, params, pending) if action.preview_now else None
         return self._tool_result(tool_use_id, {
             "status": "waiting_for_confirmation",
             "action_id": pending["id"],
+            **({"preview": preview,
+                "preview_note": ("These are the server's own figures, also shown on the card: quote them "
+                                 "(credits, recipients, parts) exactly, never your own estimate.")}
+               if preview is not None else {}),
             "note": ("Not run yet. The person sees this as a form, fills in or corrects the fields, "
                      "and confirms; the confirmation result tells you the values that ran. If this fixes a "
                      "problem the person raised, say the cause in words first.")
