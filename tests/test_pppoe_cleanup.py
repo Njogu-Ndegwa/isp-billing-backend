@@ -166,6 +166,104 @@ async def test_deactivate_pppoe_marks_inactive_only_after_router_cleanup_succeed
     assert "Manual deactivation" in cleanup_log.details
 
 
+async def test_deactivate_pppoe_offline_router_deactivates_and_defers_router_removal(
+    db, session_factory, monkeypatch,
+):
+    # CR-1123-B8 (KENJOE NETWORKS, 23 Nov 2026): the router had been offline for
+    # two days, so the deactivation kept failing with 503 and the customer stayed
+    # active although she had already been told she was deactivated.
+    from app.services import mikrotik_background
+
+    reseller, router, customer = await _seed_pppoe_customer(db, status=CustomerStatus.ACTIVE)
+    db.add(ProvisioningLog(
+        customer_id=customer.id, router_id=router.id, action="pppoe_activation",
+        status="success", details="earlier delivery",
+        log_date=datetime.utcnow() - timedelta(days=10),
+    ))
+    await db.commit()
+
+    async def _unreachable(_payload):
+        return {"error": "Failed to connect to router"}
+
+    monkeypatch.setattr(customer_routes, "call_pppoe_remove", _unreachable)
+
+    response = await customer_routes.deactivate_pppoe_customer(customer.id, db, _token(reseller))
+
+    assert response["success"] is True
+    assert response["status"] == CustomerStatus.INACTIVE.value
+    assert response["remove_result"] == "pending"
+    assert response["router_removal_pending"] is True
+    assert "deactivated in Bitwave" in response["message"]
+    assert "back online" in response["message"]
+    await db.refresh(customer)
+    assert customer.status == CustomerStatus.INACTIVE
+    logs = (
+        await db.execute(
+            select(ProvisioningLog).where(
+                ProvisioningLog.customer_id == customer.id,
+                ProvisioningLog.action == "pppoe_deactivation",
+            )
+        )
+    ).scalars().all()
+    assert [log.status for log in logs] == ["pending"]
+
+    # The router-side removal is carried by the existing inactive-PPPoE safety
+    # net: nothing while the router is still offline, then exactly once.
+    monkeypatch.setattr(mikrotik_background, "async_session", session_factory)
+    monkeypatch.setattr(mikrotik_background, "_background_db_pool_is_busy", lambda _job: False)
+    monkeypatch.setattr(mikrotik_background, "inactive_pppoe_reconcile_running", False)
+    monkeypatch.setattr(mikrotik_background, "_inactive_pppoe_reconcile_cursor", 0)
+    calls = []
+
+    def _router_cleanup(router_info, customers_data):
+        calls.append((router_info["ip"], [(row["id"], row["pppoe_username"]) for row in customers_data]))
+        return {
+            "removed": [{"id": row["id"], "details": {}} for row in customers_data],
+            "failed": [],
+            "connected": True,
+        }
+
+    monkeypatch.setattr(mikrotik_background, "_cleanup_single_router_pppoe_sync", _router_cleanup)
+
+    router.last_status = False
+    router.last_checked_at = datetime.utcnow()
+    await db.commit()
+    while_offline = await mikrotik_background.reconcile_inactive_pppoe_access_background()
+    assert while_offline["selected"] == 0
+    assert calls == []
+
+    router.last_status = True
+    router.last_checked_at = datetime.utcnow()
+    await db.commit()
+    back_online = await mikrotik_background.reconcile_inactive_pppoe_access_background()
+    again = await mikrotik_background.reconcile_inactive_pppoe_access_background()
+
+    assert back_online["removed"] == 1
+    assert again["selected"] == 0
+    assert calls == [(router.ip_address, [(customer.id, "Festo")])]
+
+
+async def test_deactivate_pppoe_offline_radius_router_still_refuses(db, monkeypatch):
+    # The safety net only covers direct-API routers; elsewhere keep today's 503.
+    from app.db.models import RouterAuthMethod
+
+    reseller, router, customer = await _seed_pppoe_customer(db, status=CustomerStatus.ACTIVE)
+    router.auth_method = RouterAuthMethod.RADIUS
+    await db.commit()
+
+    async def _unreachable(_payload):
+        return {"error": "Failed to connect to router"}
+
+    monkeypatch.setattr(customer_routes, "call_pppoe_remove", _unreachable)
+
+    with pytest.raises(HTTPException) as exc:
+        await customer_routes.deactivate_pppoe_customer(customer.id, db, _token(reseller))
+
+    assert exc.value.status_code == 503
+    await db.refresh(customer)
+    assert customer.status == CustomerStatus.ACTIVE
+
+
 def _api_with_commands(*results):
     api = MikroTikAPI.__new__(MikroTikAPI)
     api.connected = True
