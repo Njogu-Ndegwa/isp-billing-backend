@@ -1567,6 +1567,14 @@ class Turn:
             return first, None
         names = {p["name"] for p in action.query_params}
         collected, data, q = list(rows), first, query
+        bigger = listing.bigger_pages(action.query_params, query, first, len(rows))
+        if bigger is not None:
+            # the model asked for small pages of a long list: start again with the largest page
+            # the action allows, so 3,000 customers are 6 reads, not 60
+            result = await executor.call_api(self.app, self.caller, "GET", path, bigger, None)
+            again = listing.find_list(result.data)[0] if result.ok else None
+            if again is not None:
+                rows, collected, data, q, first = again, list(again), result.data, bigger, result.data
         for _ in range(listing.MAX_PAGES):
             q = listing.next_page(names, q, data, len(collected), len(listing.find_list(data)[0] or []))
             if q is None:
@@ -1607,7 +1615,9 @@ class Turn:
         if narrowing:
             # what was asked, not the whole list: narrowed before anything is drawn
             try:
-                data, narrowed_note = listing.narrow(data, **narrowing, tz_name=await self._zone())
+                # off the event loop: thousands of rows take a moment, and other requests must not wait
+                data, narrowed_note = await asyncio.to_thread(
+                    listing.narrow, data, **narrowing, tz_name=await self._zone())
                 if partial and narrowed_note is not None:
                     narrowed_note["warning"] = partial
             except listing.ListingError as exc:
