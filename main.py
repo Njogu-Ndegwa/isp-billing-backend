@@ -2862,6 +2862,17 @@ async def run_free_setup_column_migration():
             ))
 
 
+async def run_alert_contacts_migrations():
+    """Add users.alert_phones (JSON list of up to 3 numbers for router status
+    SMS alerts). NULL for every existing account, which keeps alerts going to
+    support_phone. Idempotent: ADD COLUMN IF NOT EXISTS."""
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS alert_phones JSON NULL"
+        ))
+    logger.info("Alert contacts migrations complete")
+
+
 async def run_settlement_mode_migrations():
     """Add users.settlement_mode ('platform' | 'direct').
 
@@ -4148,6 +4159,11 @@ async def startup_event():
         await run_international_subscription_migrations()
     except Exception as e:
         logger.error(f"International subscription migration failed (non-fatal): {e}")
+
+    try:
+        await run_alert_contacts_migrations()
+    except Exception as e:
+        logger.error(f"Alert contacts migration failed (non-fatal): {e}")
 
     try:
         await run_settlement_mode_migrations()

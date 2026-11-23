@@ -415,7 +415,7 @@ async def test_recovery_alert_queues_charged_sms(db, monkeypatch):
     assert _OPT_OUT_HINT not in sms.body
     assert sms.segments == 1
     assert sms.credits_charged == 1
-    assert calls == [(sms.id, "TALKSASA")]
+    assert calls == [([sms.id], "TALKSASA")]
 
     acct = await sms_credits.get_or_create_account(db, reseller.id)
     await db.refresh(acct)
