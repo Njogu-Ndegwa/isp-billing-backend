@@ -45,7 +45,7 @@ from app.services.router_availability import (
     uptime_timeline,
     ROUTER_AVAILABILITY_RETENTION_DAYS,
 )
-from app.services.provisioning import provision_base_url_for_vpn
+from app.services.provisioning import provision_base_url_for_vpn, router_name_taken
 from app.services.router_helpers import connect_to_router
 from app.services.router_remote_access import (
     RouterRemoteAccessError,
@@ -1839,6 +1839,9 @@ async def get_router_uptime(
     }
 
 
+ROUTER_NAME_TAKEN = "Another of your routers already has this name. Pick a different name."
+
+
 @router.post("/api/routers/create")
 async def create_router_api(
     request: RouterCreateRequest,
@@ -1856,8 +1859,9 @@ async def create_router_api(
         existing_result = await db.execute(existing_router_stmt)
         if existing_result.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="Router with this IP address already exists")
-        
-        
+        if await router_name_taken(db, user.id, request.name):
+            raise HTTPException(status_code=409, detail=ROUTER_NAME_TAKEN)
+
         router_obj = Router(
             user_id=user.id,
             name=request.name,
@@ -2019,7 +2023,11 @@ async def update_router(
         
         if not router_obj:
             raise HTTPException(status_code=404, detail="Router not found")
-        
+        if request.name != router_obj.name and await router_name_taken(
+            db, user.id, request.name, exclude_router_id=router_obj.id
+        ):
+            raise HTTPException(status_code=409, detail=ROUTER_NAME_TAKEN)
+
         router_obj.name = request.name
         router_obj.ip_address = request.ip_address
         router_obj.port = request.port
