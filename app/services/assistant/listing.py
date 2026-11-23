@@ -12,6 +12,7 @@ customers" once came back with the inactive ones too.
 """
 from __future__ import annotations
 
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 import re
 from typing import Any, Optional
@@ -139,9 +140,23 @@ def anchor_time(name: str, now: Optional[datetime] = None, tz_name: Optional[str
     return moment.astimezone(timezone.utc)
 
 
+# Within one narrow() each distinct text is read as a time once: a 3,000-row sort compares
+# every value many times, and "today_end" would otherwise be worked out per row.
+_TIMES: ContextVar[Optional[dict]] = ContextVar("listing_times", default=None)
+
+
 def _as_time(value: Any, tz_name: Optional[str] = None) -> Optional[datetime]:
     if not isinstance(value, str) or len(value) < 3:
         return None
+    memo = _TIMES.get()
+    if memo is None:
+        return _parse_time(value, tz_name)
+    if value not in memo:
+        memo[value] = _parse_time(value, tz_name)
+    return memo[value]
+
+
+def _parse_time(value: str, tz_name: Optional[str]) -> Optional[datetime]:
     m = _REL.match(value.strip())
     if m:
         base = anchor_time(m.group(1), tz_name=tz_name)
@@ -197,6 +212,16 @@ def _order(a: Any, b: Any, tz_name: Optional[str] = None) -> Optional[int]:
         return None
     sa, sb = _text(a), _text(b)
     return (sa > sb) - (sa < sb)
+
+
+def _sort_key(value: Any) -> tuple:
+    t = _as_time(value)
+    if t is not None:
+        return (0, t.timestamp(), "")
+    n = _as_number(value)
+    if n is not None:
+        return (1, n, "")
+    return (2, 0.0, _text(value))
 
 
 def _holds(row: dict, rule: dict, tz_name: Optional[str] = None) -> bool:
@@ -259,6 +284,14 @@ def narrow(data: Any, where: Any = None, sort: Any = None, limit: Any = None,
            tz_name: Optional[str] = None) -> tuple[Any, Optional[dict]]:
     """``data`` with its list narrowed, and a note for the model (None when nothing was asked).
     Calendar moments in rules (today_end, month_start) are days in ``tz_name``."""
+    token = _TIMES.set({})
+    try:
+        return _narrow(data, where, sort, limit, tz_name)
+    finally:
+        _TIMES.reset(token)
+
+
+def _narrow(data: Any, where: Any, sort: Any, limit: Any, tz_name: Optional[str]) -> tuple[Any, Optional[dict]]:
     if where is None and sort is None and limit is None:
         return data, None
     rows, key = find_list(data)
@@ -275,12 +308,8 @@ def narrow(data: Any, where: Any = None, sort: Any = None, limit: Any = None,
         field, desc = sort["field"], bool(sort.get("desc"))
         present = [r for r in kept if _get(r, field) not in (_MISSING, None)]
         absent = [r for r in kept if _get(r, field) in (_MISSING, None)]
-        import functools
-
-        def cmp(a, b):
-            c = _order(_get(a, field), _get(b, field))
-            return c or 0
-        present.sort(key=functools.cmp_to_key(cmp), reverse=desc)
+        # one key per row (times, then numbers, then text), not a parse per comparison
+        present.sort(key=lambda r: _sort_key(_get(r, field)), reverse=desc)
         kept = present + absent   # rows without the value go last either way
     if limit is not None:
         try:
@@ -348,6 +377,28 @@ def next_page(param_names: set, query: Optional[dict], data: Any, rows_so_far: i
         if meta.get("has_more") is not True and (not limit or page_rows < int(limit)):
             return None
         q["offset"] = int(q.get("offset") or 0) + page_rows
+        return q
+    return None
+
+
+def bigger_pages(params: list, query: Optional[dict], first: Any, page_rows: int) -> Optional[dict]:
+    """When a long list was read in small pages, the first-page query with the largest page
+    the action allows; None when the page is already that size or there is no more."""
+    names = {p["name"] for p in params}
+    if next_page(names, query, first, page_rows, page_rows) is None:
+        return None
+    q = dict(query or {})
+    for p in params:
+        if p["name"] not in (*_SIZE_KEYS, "limit"):
+            continue
+        schema = p.get("schema") or {}
+        top = schema.get("maximum") or next((s.get("maximum") for s in schema.get("anyOf", []) if s.get("maximum")), None)
+        if not top or (q.get(p["name"]) and int(q[p["name"]]) >= top) or page_rows >= top:
+            continue
+        q[p["name"]] = int(top)
+        q.pop("offset", None)
+        if "page" in names:
+            q["page"] = 1
         return q
     return None
 

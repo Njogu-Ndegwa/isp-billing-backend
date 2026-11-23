@@ -120,3 +120,21 @@ def test_next_page_follows_both_paging_styles():
 def test_joined_pages_keep_the_envelope():
     assert join_pages({"data": [{"a": 1}], "total": 3, "total_pages": 2, "page": 1}, [{"a": 1}, {"a": 2}, {"a": 3}]) ==         {"data": [{"a": 1}, {"a": 2}, {"a": 3}], "total": 3}
     assert join_pages([{"a": 1}], [{"a": 1}, {"a": 2}]) == [{"a": 1}, {"a": 2}]
+
+
+def test_small_pages_of_a_long_list_restart_at_the_largest_page():
+    from app.services.assistant.listing import bigger_pages
+    params = [{"name": "page", "schema": {}}, {"name": "per_page", "schema": {"anyOf": [{"type": "integer", "maximum": 500}]}}]
+    first = {"data": [{}, {}], "total_pages": 30, "page": 1}
+    assert bigger_pages(params, {"page": 1, "per_page": 2}, first, 2) == {"page": 1, "per_page": 500}
+    assert bigger_pages(params, {"per_page": 500}, {"data": [{}] * 500, "total_pages": 3, "page": 1}, 500) is None
+    assert bigger_pages(params, {}, {"data": [{}], "total_pages": 1, "page": 1}, 1) is None
+
+
+def test_sorting_thousands_of_rows_is_quick():
+    import time
+    rows = [{"t": (datetime(2026, 1, 1) + timedelta(minutes=i * 7 % 5000)).isoformat()} for i in range(5000)]
+    started = time.perf_counter()
+    out, _ = narrow(rows, sort={"field": "t", "desc": True}, limit=3)
+    assert time.perf_counter() - started < 1.0
+    assert out[0]["t"] >= out[1]["t"] >= out[2]["t"]
