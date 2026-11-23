@@ -327,6 +327,27 @@ def _observed_mac(tables: _RouterTables, ip: str) -> Optional[str]:
     return None
 
 
+def _device_state(tables: _RouterTables, ip: str) -> Dict[str, Any]:
+    """Whether the customer's device answers the router right now (ARP / traffic).
+
+    Access (binding, queue) only says the router would let the device through.
+    Judged exactly as GET /api/routers/{id}/offline-customers judges a static line.
+    """
+    from app.services.offline_customers import classify
+
+    online, offline = classify(
+        [{"customer_id": 0, "connection_type": "static_ip", "static_ip": ip}],
+        {"arp": tables.arp, "queues": tables.queues, "hs_active": []},
+    )
+    arp = next((r for r in tables.arp if str(r.get("address") or "").split("/")[0] == ip), None)
+    row = offline[0] if offline else {}
+    return {
+        "online": bool(online),
+        "arp_status": (arp or {}).get("status"),
+        "reason": None if online else row.get("reason"),
+    }
+
+
 def _bindings_for(tables: _RouterTables, ip: str) -> list:
     return [
         b for b in tables.bindings
@@ -713,6 +734,7 @@ def inspect_static_ip_sync(router: dict, ip: str) -> Dict[str, Any]:
             "pinned_mac": _pin_mac(pins[0]) if pins else None,
             "pin_hits": sum(int(p.get("packets") or 0) for p in pins),
             "observed_mac": _observed_mac(tables, ip),
+            "device": _device_state(tables, ip),
             "host": None if not hosts else {
                 "mac": hosts[0].get("mac-address"),
                 "bypassed": _is_true(hosts[0].get("bypassed")),
