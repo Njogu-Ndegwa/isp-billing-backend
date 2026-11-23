@@ -178,6 +178,77 @@ async def actions_for(caller: Caller, conversation_id: str) -> dict[str, dict]:
     return out
 
 
+async def pending_actions(caller: Caller, conversation_id: str) -> list[dict]:
+    """This caller's pending, unexpired actions in the conversation, oldest first."""
+    now = datetime.utcnow()
+    async with db_module.async_session() as db:
+        rows = (await db.execute(
+            select(AssistantAction).where(
+                AssistantAction.conversation_id == conversation_id,
+                AssistantAction.status == "pending",
+                AssistantAction.expires_at >= now,
+                _owner_filter(AssistantAction, caller),
+            ).order_by(AssistantAction.created_at)
+        )).scalars().all()
+    return [action_view(a) for a in rows]
+
+
+def _comparable(body: Any) -> Any:
+    if isinstance(body, dict):
+        return {k: v for k, v in body.items() if k != "idempotency_key"}
+    return body
+
+
+def same_change(old: dict, new: dict) -> bool:
+    """Whether a new proposal is for the same change as an older one.
+
+    Same method and concrete path. A path naming a record or setting (a router's
+    anti-bypass, customer 47532, the portal settings) is one target, so a newer body
+    for it supersedes the older one. A create (POST to a path with no id in it) makes
+    a new record each time: it is the same change only when the request is the same,
+    or names the same record (the same ``name``).
+    """
+    if old["method"] != new["method"] or old["path"] != new["path"]:
+        return False
+    if new["method"] != "POST" or "{" in (new.get("template") or ""):
+        return True
+    a, b = _comparable(old.get("body")), _comparable(new.get("body"))
+    if a == b and (old.get("query") or None) == (new.get("query") or None):
+        return True
+    return (isinstance(a, dict) and isinstance(b, dict) and bool(a.get("name"))
+            and str(a.get("name")).strip().lower() == str(b.get("name") or "").strip().lower())
+
+
+async def retire_superseded(caller: Caller, conversation_id: str, newest: dict) -> list[dict]:
+    """Close the older pending cards for the same change as ``newest`` (status expired).
+
+    Only the newest card can then be confirmed; confirming a retired one is refused
+    like any expired card. Returns the retired actions.
+    """
+    now = datetime.utcnow()
+    async with db_module.async_session() as db:
+        rows = (await db.execute(
+            select(AssistantAction).where(
+                AssistantAction.conversation_id == conversation_id,
+                AssistantAction.id != newest["id"],
+                AssistantAction.status == "pending",
+                AssistantAction.method == newest["method"],
+                AssistantAction.path == newest["path"],
+                _owner_filter(AssistantAction, caller),
+            )
+        )).scalars().all()
+        older = [a for a in rows if same_change(action_view(a), newest)]
+        if not older:
+            return []
+        await db.execute(
+            update(AssistantAction)
+            .where(AssistantAction.id.in_([a.id for a in older]), AssistantAction.status == "pending")
+            .values(status="expired", decided_at=now, result_summary="replaced by a newer card")
+        )
+        await db.commit()
+        return [{"id": a.id, "title": a.title} for a in older]
+
+
 async def claim_action(caller: Caller, conversation_id: str, action_id: str,
                        new_status: str) -> Optional[dict]:
     """Atomically move a pending, unexpired action of this caller to ``new_status``.

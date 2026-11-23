@@ -209,6 +209,7 @@ How to work
 - Never say a form or a change is ready unless call_api answered "waiting_for_confirmation". If it returned an error, fix the request and send it again, or say plainly what went wrong.
 - A moment in a form body is UTC like the API's (or written with its zone): the form shows it on the person's clock. Leave out force and allow_duplicate: when the API refuses a change as a duplicate or conflict, its card says why and offers Do it anyway, so say the reason in one line and do not propose it again.
 - A ✎ call does not run when you make it. It becomes a confirmation card and the person taps Confirm or Cancel. After proposing, end your turn with one or two sentences saying what is ready and that it runs when they tap Confirm, e.g. "Ready to create the plan — tap Confirm." Never say you created, changed, set up or sent anything until you have its result.
+- Typing "confirm", "yes", "ok do it", "sawa" or "ndio" in the chat runs nothing: only the tap on the card does. When the person types a go-ahead while a card is waiting, say in one line that it runs when they tap Confirm on that card; never propose the same change again. One card per change: proposing a change again closes its earlier card, so propose again only to change what it does.
 - Confirmed and cancelled actions come back in a message that starts with [Confirmation results]. Report what happened plainly, failures included, then continue the task if more steps remain.
 - A customer can be given internet without paying through M-Pesa: register them if new, then activate with the activate action for their connection (activate-hotspot, activate-pppoe or activate-static), payment_method cash (cash received), other (paid elsewhere) or none (free: a comp, a test). A hotspot customer needs their device MAC.
 - When someone asks for something no action can do (a feature the app does not have), say so plainly, offer the nearest thing it can do, and record the request with POST /api/feedback/requests (title: the feature in a few words; asked: their words). It runs without a Confirm. If the reply says it was added to an existing request, tell them others asked too and that Bitwave sees it. Do not record ordinary questions, things an action already does, or bugs (those go to support).
@@ -665,6 +666,14 @@ class Turn:
         self._tz_known = False
         self.usage = TurnUsage()
         self.is_question = False
+        self.waiting_card: Optional[dict] = None  # the one card a typed "confirm" pointed at
+
+    def _card_name(self, action: dict) -> str:
+        """What the card says on screen: the summary it was drawn with, else its title."""
+        for item in reversed(self.transcript):
+            if item.get("type") == "action" and item.get("action_id") == action["id"]:
+                return str(item.get("summary") or item.get("title") or action["title"])
+        return action["title"]
 
     def reload(self, conversation: dict) -> None:
         """Start from the stored history (taken under the conversation lock)."""
@@ -728,7 +737,15 @@ class Turn:
         tz_name, notes = await account_state(self.caller)
         self._tz, self._tz_known = tz_name, True
         account = f"\n[Account now: {' '.join(notes)}]" if notes else ""
-        content.append({"type": "text", "text": f"[{_now_label(tz_name)}]{account} {label}"})
+        waiting = ""
+        if not images and is_go_ahead(text):
+            pending = await store.pending_actions(self.caller, self.conversation["id"])
+            if len(pending) == 1:
+                self.waiting_card = pending[0]
+                waiting = (f"\n[A card is waiting: \"{self._card_name(pending[0])}\". Typed words never run it; "
+                           "only a tap on its Confirm button does. Say in one line that it runs when they tap "
+                           "Confirm on that card. Do not propose it or any other change again.]")
+        content.append({"type": "text", "text": f"[{_now_label(tz_name)}]{account}{waiting} {label}"})
         self.transcript.append({
             "type": "user", "at": datetime.utcnow().isoformat() + "Z", "text": text,
             **({"images": [i.get("thumbnail") for i in images if i.get("thumbnail")]} if images else {}),
@@ -1291,6 +1308,11 @@ class Turn:
                 said = " ".join(b.get("text", "") for b in content if b.get("type") == "text")
                 if not checked_claim and self.proposals == 0 and _CLAIMS_A_CARD.search(said):
                     checked_claim = True
+                    if self.waiting_card or (not self.is_question and await store.pending_actions(
+                            self.caller, self.conversation["id"])):
+                        # after a typed go-ahead or a tap, "tap Confirm" points at a card already on
+                        # screen: never make it again
+                        return
                     self.messages.append({"role": "user", "content": [{"type": "text", "text": (
                         "[Check] You told the person a form or change is ready, but you did not call "
                         "call_api for it in this answer, so nothing is on their screen. Call "
@@ -1486,6 +1508,14 @@ class Turn:
         if action.is_read(query, body):
             return await self._read(tool_use_id, action, method, path, query, body, show, dropped, fields,
                                     narrowing)
+        if self.waiting_card is not None:
+            # The person typed "confirm" / "sawa" at the one card on screen: another card would
+            # only be a second copy to tap (OPIC router 487 ran its anti-bypass twice this way).
+            return self._tool_result(tool_use_id, {
+                "status": "already_waiting", "action_id": self.waiting_card["id"],
+                "note": (f"Not proposed. The card \"{self._card_name(self.waiting_card)}\" is still on the "
+                         "person's screen and runs only when they tap Confirm on it. Say that in one line."),
+            })
         if action.key not in self._described():
             return self._tool_result(tool_use_id, {
                 "error": f"Before proposing a change, call describe_action for {action.method} "
@@ -1540,6 +1570,11 @@ class Turn:
             query=query or None, body=body, title=action.title, permission=permission,
             tool_use_id=tool_use_id,
         )
+        # The same change proposed again: only the newest card can be confirmed.
+        replaced = await store.retire_superseded(self.caller, self.conversation["id"], pending)
+        for old in replaced:
+            await self.emit("action_result", {"action_id": old["id"], "status": "expired", "ok": False,
+                                              "detail": "Replaced by a newer card for the same change."})
         await self.emit("action", {
             "action_id": pending["id"], "title": action.title, "summary": summary,
             "method": method, "path": path, "query": shaping.mask(query) if query else None,
@@ -1558,6 +1593,9 @@ class Turn:
                     if fields_for_form else "Not run yet. The person sees a confirm card with this exact request.",
             **({"pickers": {name: n["fit"] for name, n in narrowed.items()}} if narrowed else {}),
             **({"ignored_query_params": dropped} if dropped else {}),
+            **({"replaced": [old["id"] for old in replaced],
+                "replaced_note": "This card replaces the earlier card for the same change; that one is "
+                                 "closed and cannot run."} if replaced else {}),
         })
 
     async def _all_pages(self, action: Action, path: str, query: Optional[dict], first: Any) -> tuple[Any, Optional[str]]:
@@ -1733,6 +1771,26 @@ def _is_empty(data) -> bool:
 _CLAIMS_A_CARD = re.compile(
     r"(tap confirm|bonyeza confirm|fill (it|them|this|the form|in the form)? ?in|form is ready|"
     r"fomu iko tayari|jaza fomu)", re.I)
+
+# A typed go-ahead and nothing else ("confirm", "ok do it", "sawa"). Words never run a card.
+_GO_AHEAD = frozenset({
+    "confirm", "confirmed", "i confirm", "confirm it", "yes", "yes confirm", "yes do it", "yes go ahead",
+    "yes proceed", "yep", "yeah", "yah", "sure", "ok", "okay", "ok confirm", "ok do it", "okay do it",
+    "ok go ahead", "do it", "go ahead", "go on", "proceed", "run it", "approve", "approved",
+    "sawa", "sawa sawa", "sawa fanya", "fanya", "endelea", "ndio", "ndiyo", "ndio fanya", "thibitisha",
+})
+_GO_AHEAD_FILLER = frozenset({"please", "pls", "plz", "now", "thanks", "thank you", "asante", "tafadhali"})
+
+
+def is_go_ahead(text: str) -> bool:
+    words = re.sub(r"[^\w\s]", " ", str(text or "").lower()).split()
+    phrase = " ".join(words)
+    for filler in sorted(_GO_AHEAD_FILLER, key=len, reverse=True):
+        if phrase.endswith(" " + filler):
+            phrase = phrase[: -len(filler) - 1]
+        if phrase.startswith(filler + " "):
+            phrase = phrase[len(filler) + 1:]
+    return phrase in _GO_AHEAD
 
 # A state read from a live thing, as people say it ("ether2 · PPPoE").
 _STATE_WORDS = {"pppoe": "PPPoE", "plain": "Plain (no login)", "dual": "PPPoE + hotspot", "hotspot": "Hotspot",
