@@ -2982,7 +2982,13 @@ async def static_customer_status(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Live router view of a static-IP customer: access, speed queue, pin, device."""
+    """Live router view of a static-IP customer: access, speed queue, pin, device.
+
+    actual_access / in_sync say whether the router lets the customer through.
+    device_online says whether their device answers the router right now (its ARP
+    entry, traffic on the queue); device_note says why not. "Is X offline" is
+    device_online, never access: access can be enabled while the device is off.
+    """
     user = await get_current_user(token, db)
     customer = await _load_static_customer(db, customer_id, user)
     expected_access = customer_should_have_access(customer)
@@ -3004,11 +3010,18 @@ async def static_customer_status(
         None if router_state.get("error")
         else "enabled" if binding.get("enabled") else "suspended"
     )
+    device = router_state.get("device") or {}
     return {
         **info,
         "router": router_state,
         "actual_access": actual_access,
         "in_sync": actual_access == info["expected_access"] and bool(router_state.get("queue")),
+        "device_online": None if router_state.get("error") or not device else device.get("online"),
+        "device_note": (
+            "unknown: the router could not be read" if router_state.get("error") or not device
+            else "the device answers the router" if device.get("online")
+            else device.get("reason") or "the device is not answering the router"
+        ),
     }
 
 

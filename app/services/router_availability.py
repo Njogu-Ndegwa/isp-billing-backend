@@ -433,6 +433,29 @@ def split_tunnel_outages(
     return {**judged, "outages": significant_outages(site, now), "tunnel_outages": tunnel}
 
 
+def with_down_since(outages: Iterable[Dict[str, Any]], contacts: Iterable[datetime]) -> list[Dict[str, Any]]:
+    """Each outage with plainly named times for "when did it go down".
+
+    ``started_at`` is when our checks began failing (the first failed check after
+    the last success), which can be minutes after the router actually went quiet.
+    ``down_since`` is the last successful contact before that (a report, a check
+    that worked, or a call over the public internet): the time to give a person.
+    ``checks_failing_since`` keeps ``started_at`` as a second detail.
+    """
+    times = sorted(contacts)
+    out = []
+    for outage in outages:
+        start = datetime.fromisoformat(outage["started_at"])
+        i = bisect_right(times, start)
+        last = times[i - 1] if i else None
+        out.append({
+            **outage,
+            "down_since": (last or start).isoformat(),
+            "checks_failing_since": outage["started_at"],
+        })
+    return out
+
+
 async def public_contact_times(
     db: AsyncSession, router_id: int, *, since: datetime, until: datetime
 ) -> list[datetime]:
@@ -566,8 +589,9 @@ def build_router_status(router: Router, now: Optional[datetime] = None) -> Dict[
     last_checked = getattr(router, "last_checked_at", None)
     age_seconds = (now - last_checked).total_seconds() if last_checked else None
     status = derive_router_status(router, now=now)
+    last_online = getattr(router, "last_online_at", None)
 
-    return {
+    out = {
         "status": status,
         "status_is_stale": status == "unknown" and last_checked is not None,
         "status_age_seconds": round(age_seconds, 1) if age_seconds is not None else None,
@@ -577,6 +601,11 @@ def build_router_status(router: Router, now: Optional[datetime] = None) -> Dict[
         "availability_checks": int(getattr(router, "availability_checks", 0) or 0),
         "availability_successes": int(getattr(router, "availability_successes", 0) or 0),
     }
+    if status == "offline":
+        # "When did it go down" is the last successful contact; status_last_checked_at
+        # is only when our checks last ran (and failed).
+        out["down_since"] = last_online.isoformat() if last_online else None
+    return out
 
 
 async def record_router_availability(
