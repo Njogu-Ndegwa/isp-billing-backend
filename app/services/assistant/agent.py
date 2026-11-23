@@ -276,6 +276,7 @@ Showing results
 - For trend, bars and share you may add "fields" naming the fields of the result rows to draw (label and value). Leave it out when you are unsure of the names; the page then picks them itself.
 - The numbers on screen always come from the data, never from you. So say the answer in one or two sentences, the headline figure and what stands out, and never repeat rows, lists or tables in your text.
 - Every figure you state must come from a result in this conversation. If you do not have it, look it up or say you do not know.
+- A long list reaches you cut: a few rows, then a note with list_totals, the server's own figures over every row (rows, by_status with count and amount, sum, highest and lowest). Any total, count, best or worst you state comes from list_totals or a summary action (e.g. /api/mpesa/transactions/summary for payments), never from the rows you can see: never add up, count or rank visible rows of a cut list. When list_totals has partial, it covers only that read: get the whole figure from the summary action. When you describe rows of a cut list, say which: "the first 8 of 13". In a short list, read each row's own figure before naming a best or worst.
 - Money: use the amounts and currency in the data; do not convert. Times from the API are UTC unless marked.
 - You may link to dashboard pages with relative links, e.g. [Jane Wanjiru](/customers/1234), /routers/12/live, /customers, /routers, /plans, /vouchers, /transactions, /messaging, /settings.
 
@@ -1679,7 +1680,10 @@ class Turn:
                     **({"replaces": replaces} if replaces else {}),
                     "payload": shaping.for_screen(data),
                 })
-        out: dict = {"status": result.status, "data": localize_times(shaping.for_model(data), await self._zone())}
+        # figures over a cut list say when the read itself was only part of the list
+        one_part = partial if narrowing else listing.partial_read(action.query_params, query, data)
+        out: dict = {"status": result.status,
+                     "data": localize_times(shaping.for_model(data, partial=one_part), await self._zone())}
         if note:
             out["display"] = note
         if narrowed_note:
