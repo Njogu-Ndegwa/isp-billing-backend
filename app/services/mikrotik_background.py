@@ -1198,6 +1198,7 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
             return_exceptions=True,
         )
         removed_per_router: dict[int, int] = {}
+        removed_macs_per_router: dict[int, set[str]] = {}
         for i, outcome in enumerate(removal_outcomes):
             if isinstance(outcome, Exception):
                 logger.error(f"[SAFETY-NET] Error removing bindings on router {candidate_groups[i]['router_info']['name']}: {outcome}")
@@ -1206,8 +1207,13 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
                 router_id = candidate_groups[i]["router_info"].get("id")
                 if outcome and router_id is not None:
                     removed_per_router[router_id] = removed_per_router.get(router_id, 0) + int(outcome)
+                    removed_macs_per_router[router_id] = candidate_groups[i]["candidates"] & confirmed_orphans
         if removed_per_router:
             await _record_safety_net_removals(removed_per_router)
+            # BD-8: tell the reseller (own short session, after all router I/O).
+            from app.services.unpaid_device_alerts import notify_unpaid_devices_removed
+
+            await notify_unpaid_devices_removed(removed_macs_per_router)
     except Exception as e:
         logger.error(f"[SAFETY-NET] Cleanup failed: {e}")
     return total_removed
