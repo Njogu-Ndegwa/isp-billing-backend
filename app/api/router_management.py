@@ -2916,7 +2916,7 @@ async def close_hotspot_proxy_bypass(
     if not pt:
         raise HTTPException(status_code=409, detail=(
             "This router has no setup record, so the addresses it must still reach are unknown. "
-            "Set it up again from the Routers page to get the protection."))
+            "Set it up again with a new setup code to get the protection."))
     allow = portal_allow_entries(pt)
     info = {"ip": router_obj.ip_address, "username": router_obj.username,
             "password": router_obj.password, "port": router_obj.port}

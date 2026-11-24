@@ -61,7 +61,7 @@ def render(router_name: str, macs: Iterable[str], at: datetime) -> tuple[str, st
         f"Bitwave: on your router '{router_name}', {devices} had internet without an "
         f"active plan and {'was' if count == 1 else 'were'} cut off at {when} "
         f"(device {shown}). If one of them should stay online, give it a plan or a "
-        f"voucher from the dashboard."
+        f"voucher in the Bitwave assistant."
     )
     return subject, body
 

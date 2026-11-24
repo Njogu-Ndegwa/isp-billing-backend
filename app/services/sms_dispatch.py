@@ -76,13 +76,14 @@ async def resolve_recipients(db, reseller_id: int, *, filter: str = "all",
                              search: Optional[str] = None,
                              expiring_days: int = 7,
                              tz_name: Optional[str] = None,
-                             now: Optional[datetime] = None) -> list[dict]:
+                             now: Optional[datetime] = None,
+                             router_id: Optional[int] = None) -> list[dict]:
     """Return [{customer_id, name, phone}] for a reseller, de-duplicated by phone."""
     stmt = _matching(select(Customer.id, Customer.name, Customer.phone).where(
         Customer.user_id == reseller_id, Customer.phone.isnot(None)),
         filter=filter, plan_id=plan_id, customer_ids=customer_ids,
         exclude_customer_ids=exclude_customer_ids, search=search,
-        expiring_days=expiring_days, tz_name=tz_name, now=now)
+        expiring_days=expiring_days, tz_name=tz_name, now=now, router_id=router_id)
     stmt = stmt.order_by(Customer.id)
     rows = (await db.execute(stmt)).all()
     seen, out = set(), []
@@ -108,8 +109,12 @@ def _matching(stmt, *, filter: str = "all", plan_id: Optional[int] = None,
               customer_ids: Optional[list[int]] = None,
               exclude_customer_ids: Optional[list[int]] = None,
               search: Optional[str] = None, expiring_days: int = 7,
-              tz_name: Optional[str] = None, now: Optional[datetime] = None):
-    """The customers a send picks: by id, plan, status or when their time ends."""
+              tz_name: Optional[str] = None, now: Optional[datetime] = None,
+              router_id: Optional[int] = None):
+    """The customers a send picks: by id, plan, status or when their time ends, and
+    optionally only those on one router (with any filter; picked ids are taken as they are)."""
+    if router_id and not customer_ids:
+        stmt = stmt.where(Customer.router_id == router_id)
     if customer_ids:
         stmt = stmt.where(Customer.id.in_(customer_ids))
     elif filter == "by_plan" and plan_id:

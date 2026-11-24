@@ -106,6 +106,7 @@ async def call_api(app, caller: Caller, method: str, path: str,
     return ApiResult(
         status=response.status_code,
         data={"_file": True, "content_type": ctype or "unknown", "bytes": size,
-              "_note": "This returns a file. Download it from its page on the dashboard."},
+              "_note": "This returns a file, which the chat cannot hand over yet. Read the same "
+                       "figures with a list or summary action and draw them instead."},
         content_type=ctype, elapsed_ms=elapsed,
     )
