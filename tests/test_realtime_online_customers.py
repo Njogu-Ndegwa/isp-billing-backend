@@ -140,3 +140,25 @@ async def test_the_customer_list_keeps_only_who_is_online(db, monkeypatch):
     offline = await customer_routes.get_customers_api(router_id=None, tier=None, online=False, db=db, token="t")
     assert [c["name"] for c in online] == ["Calvins"]
     assert [c["name"] for c in offline] == ["Idle"]
+
+
+@pytest.mark.asyncio
+async def test_each_customer_row_says_whether_its_router_is_up(db, monkeypatch):
+    from app.api import customer_routes
+
+    reseller = await make_reseller(db)
+    router = await make_router(db, reseller)
+    router.last_status, router.last_checked_at = False, datetime.utcnow()
+    router.last_online_at = datetime.utcnow() - timedelta(hours=2)
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
+    await make_customer(db, reseller, plan, router, name="Cut Off", mac_address="AA:00:00:00:00:31",
+                        status=CustomerStatus.ACTIVE, expiry=datetime.utcnow() + timedelta(days=1))
+    await db.commit()
+
+    async def _current_user(_token, _db):
+        return reseller
+
+    monkeypatch.setattr(customer_routes, "get_current_user", _current_user)
+    (row,) = await customer_routes.get_customers_api(router_id=None, tier=None, db=db, token="t")
+    assert row["router"]["status"] == "offline"
+    assert row["router"]["last_online_at"] is not None

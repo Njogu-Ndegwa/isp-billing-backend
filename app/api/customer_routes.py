@@ -1558,6 +1558,16 @@ def _page_envelope(items: list, page: int, per_page: int, total: int) -> dict:
     }
 
 
+def _router_brief(router, now=None) -> dict:
+    """The customer's router as a list shows it: whether it is up, and when it was last
+    seen, so a list can say "router offline" instead of calling its customers offline."""
+    from app.services.router_availability import build_router_status
+
+    state = build_router_status(router, now=now)
+    return {"id": router.id, "name": router.name, "status": state.get("status"),
+            "status_is_stale": state.get("status_is_stale"), "last_online_at": state.get("last_online_at")}
+
+
 async def _online_condition(db: AsyncSession, user, online: bool):
     """Who is connected right now, from the routers' live reports (no RouterOS calls):
     the same answer as the Customers page's Online filter."""
@@ -1745,10 +1755,7 @@ async def get_customers_api(
                     "speed": c.plan.speed,
                     "data_cap_mb": c.plan.data_cap_mb,
                 } if c.plan else None,
-                "router": {
-                    "id": c.router.id,
-                    "name": c.router.name
-                } if c.router else None
+                "router": _router_brief(c.router, now) if c.router else None
             }
             for c, c_has_paid in rows
         ]
@@ -1853,10 +1860,7 @@ async def get_active_customers(
                     "speed": c.plan.speed,
                     "data_cap_mb": c.plan.data_cap_mb,
                 } if c.plan else None,
-                "router": {
-                    "id": c.router.id,
-                    "name": c.router.name
-                } if c.router else None
+                "router": _router_brief(c.router, now) if c.router else None
             }
             for c, c_has_paid in rows
         ]
@@ -1997,10 +2001,7 @@ async def get_customer_detail(
                 "price": customer.plan.price,
                 "connection_type": customer.plan.connection_type.value if customer.plan.connection_type else None,
             } if customer.plan else None,
-            "router": {
-                "id": customer.router.id,
-                "name": customer.router.name,
-            } if customer.router else None,
+            "router": _router_brief(customer.router) if customer.router else None,
         }
     except HTTPException:
         raise
