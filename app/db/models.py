@@ -3192,6 +3192,23 @@ class AppInstanceHeartbeat(Base):
     last_seen_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
 
 
+class AppDeploy(Base):
+    """One row per app process start (a deploy or a restart), kept 180 days.
+
+    ``app_instance_heartbeats`` holds only live processes (the outgoing one
+    deletes its row at shutdown), so it cannot say when earlier releases went
+    out. The admin "CPU by router model" chart marks these on its time axis;
+    with heartbeats alone it showed one deploy of the six on 24 Nov 2026.
+    Written once, on the process's first heartbeat (ops_health.write_heartbeat).
+    """
+    __tablename__ = "app_deploys"
+    instance_id = Column(String(128), primary_key=True)
+    started_at = Column(DateTime, nullable=False, index=True)
+    app_version = Column(String(64), nullable=True)
+    runtime_mode = Column(String(16), nullable=False, default="unknown")
+    hostname = Column(String(255), nullable=True)
+
+
 # ========================================
 # CUSTOMER AUDIT LOG
 # ========================================

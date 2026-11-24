@@ -3338,6 +3338,18 @@ async def run_router_metric_history_migrations():
     logger.info("Migration: router_metric_buckets table ready")
 
 
+async def run_app_deploy_history_migrations():
+    """Every app process start, for the deploy markers on the router CPU chart
+    (ops_health.write_heartbeat writes, router_cpu_history.history reads).
+    A new table only. Idempotent. Non-fatal: the heartbeat writes it in a
+    savepoint and the chart falls back to live heartbeats."""
+    from app.db.models import AppDeploy
+
+    async with async_engine.begin() as conn:
+        await conn.run_sync(lambda c: AppDeploy.__table__.create(c, checkfirst=True))
+    logger.info("Migration: app_deploys table ready")
+
+
 async def run_subscription_reminder_migrations():
     """Create the reseller subscription reminder log / dedupe table. Idempotent."""
     from app.db.models import SubscriptionExpiryReminder
@@ -4106,6 +4118,11 @@ async def startup_event():
         await run_router_metric_history_migrations()
     except Exception as e:
         logger.error(f"Router metric-history migration failed (non-fatal): {e}")
+
+    try:
+        await run_app_deploy_history_migrations()
+    except Exception as e:
+        logger.error(f"App deploy-history migration failed (non-fatal): {e}")
 
     try:
         await run_static_ip_migrations()

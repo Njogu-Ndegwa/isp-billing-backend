@@ -32,6 +32,7 @@ from app.config import settings
 from app.db import database
 from app.db.database import db_pool_snapshot
 from app.db.models import (
+    AppDeploy,
     AppInstanceHeartbeat,
     Customer,
     CustomerStatus,
@@ -65,6 +66,7 @@ ROW_FETCH_LIMIT = 5000
 SNAPSHOT_FETCH_LIMIT = 20000
 SNAPSHOT_RETENTION = timedelta(days=7)
 HEARTBEAT_RETENTION = timedelta(days=7)
+DEPLOY_RETENTION = timedelta(days=180)
 HEARTBEAT_LIVE_WINDOW = timedelta(minutes=3)
 DROP_WINDOW = timedelta(minutes=10)
 ALERT_DEDUPE = timedelta(minutes=30)
@@ -1039,11 +1041,30 @@ async def write_heartbeat(now: Optional[datetime] = None) -> dict:
         if row is None:
             row = AppInstanceHeartbeat(instance_id=_INSTANCE_ID, **fields)
             db.add(row)
+            await _record_deploy(db, fields)
         else:
             for key, value in fields.items():
                 setattr(row, key, value)
         await db.commit()
     return {"instance_id": _INSTANCE_ID, **fields}
+
+
+async def _record_deploy(db, fields: dict) -> None:
+    """Keep this process start in ``app_deploys`` (heartbeat rows are deleted
+    at shutdown, so they cannot serve as deploy history). In a savepoint:
+    a missing table must never cost the heartbeat."""
+    try:
+        async with db.begin_nested():
+            if await db.get(AppDeploy, _INSTANCE_ID) is None:
+                db.add(AppDeploy(
+                    instance_id=_INSTANCE_ID,
+                    started_at=fields["started_at"],
+                    app_version=fields["app_version"],
+                    runtime_mode=fields["runtime_mode"],
+                    hostname=fields["hostname"],
+                ))
+    except Exception:  # noqa: BLE001
+        logger.warning("[OPS-HEALTH] could not record deploy %s", _INSTANCE_ID)
 
 
 async def retire_heartbeat() -> bool:
@@ -1228,6 +1249,7 @@ async def prune(now: datetime) -> None:
         await db.execute(delete(AppInstanceHeartbeat).where(
             AppInstanceHeartbeat.last_seen_at < now - HEARTBEAT_RETENTION
         ))
+        await db.execute(delete(AppDeploy).where(AppDeploy.started_at < now - DEPLOY_RETENTION))
         await db.commit()
 
 
