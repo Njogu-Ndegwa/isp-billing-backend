@@ -64,7 +64,20 @@ async def test_asking_for_the_old_app_gets_examples_and_a_tour(client, owner, db
     await build(db, reseller, routers=["Rongai"], plans=HOTSPOT, sms_credits=200)
     use_real_model(monkeypatch)
     row = await ask(client, token, question, monkeypatch)
-    problems = evaluate(row, [never_says("](/", "one tap away", "/dashboard", "classic dashboard button",
-                                         "menu"), offers_a_tour, gives_examples])
+    problems = evaluate(row, [never_says("](/", "one tap away", "/dashboard"), offers_a_tour, gives_examples])
     report(f"no-dashboard/exit/{question[:24]}", row, problems)
+    assert not problems, problems
+
+
+@pytest.mark.asyncio
+async def test_still_wanting_the_old_app_gets_the_menu_way_back(client, owner, db, monkeypatch):  # noqa: F811
+    reseller, token = owner
+    await build(db, reseller, routers=["Rongai"], plans=HOTSPOT, sms_credits=200)
+    use_real_model(monkeypatch)
+    first = await ask(client, token, "How can I exit AI mode?", monkeypatch)
+    row = await ask(client, token, "No tour, I still want the old dashboard", monkeypatch,
+                    conversation_id=first["conversation_id"])
+    problems = evaluate(row, [never_says("](/", "/dashboard"), lambda r: None if "classic dashboard" in r["said"].lower()
+                              and "menu" in r["said"].lower() else "did not say where the Classic dashboard item is"])
+    report("no-dashboard/exit/still-wants-old", row, problems)
     assert not problems, problems

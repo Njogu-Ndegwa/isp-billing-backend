@@ -12,12 +12,16 @@ The assistant home is rolled out to a share of accounts before everyone:
   is inside. Trial and suspended accounts are not moved;
 * platform admins and View-as sessions are never moved by the percentage;
 * nobody starts there while the assistant is not ready;
-* at 100% ("Everyone") the classic dashboard is closed: every reseller
-  account (paying, trial or suspended, owner and staff) starts on the
-  assistant, a person's own "classic" choice no longer counts, and the
-  dashboard sends them back to the assistant. Platform admins and View-as
-  sessions are untouched. While the assistant is not ready the classic
-  dashboard stays open, so nobody is ever left without a way in.
+* at 100% ("Everyone") every reseller account (paying, trial or suspended,
+  owner and staff) with no choice of its own starts on the assistant. The
+  classic dashboard stays open: someone who picks "classic" under "When I
+  sign in, open" starts there. Platform admins and View-as sessions are
+  untouched.
+
+Nothing closes the classic dashboard any more (it was closed at Everyone from
+2026-11-22 until Dennis asked for the way back on 2026-11-24);
+``classic_closed`` is kept, always False, so the status field and the admin
+report keep their shape and a device that remembered "closed" opens again.
 
 The percentage lives in ``app_settings`` (key ``assistant_home_percent``,
 default 0). Every function is one short DB session.
@@ -147,7 +151,7 @@ async def set_choice(caller: Caller, choice: str) -> Optional[str]:
     return choice
 
 
-CLASSIC_CLOSED_AT = 100
+EVERYONE = 100
 
 
 def _exempt(caller: Caller) -> bool:
@@ -155,10 +159,8 @@ def _exempt(caller: Caller) -> bool:
 
 
 async def classic_closed(caller: Caller, *, ready: bool) -> bool:
-    """Whether this person may no longer use the classic dashboard (the rollout is at Everyone)."""
-    if not ready or _exempt(caller):
-        return False
-    return await get_percent() >= CLASSIC_CLOSED_AT
+    """Whether this person may no longer use the classic dashboard: never (it always has a way back)."""
+    return False
 
 
 async def home_for(caller: Caller, *, ready: bool) -> tuple[bool, Optional[str]]:
@@ -166,8 +168,6 @@ async def home_for(caller: Caller, *, ready: bool) -> tuple[bool, Optional[str]]
     choice = await get_choice(caller)
     if not ready:
         return False, choice
-    if await classic_closed(caller, ready=ready):
-        return True, choice
     if choice == "assistant":
         return True, choice
     if choice == "classic":
@@ -175,6 +175,8 @@ async def home_for(caller: Caller, *, ready: bool) -> tuple[bool, Optional[str]]
     if _exempt(caller):
         return False, None
     percent = await get_percent()
+    if percent >= EVERYONE:
+        return True, None  # the default for every reseller account, paying or not
     if not in_rollout(caller.user_id, percent):
         return False, None
     return await is_paying(caller.user_id), None
@@ -191,7 +193,7 @@ async def rollout_report() -> dict:
             select(User.id).where(User.subscription_status == SubscriptionStatus.ACTIVE, User.role != "admin")
         )).scalars().all()
     counts = {choice: int(n) for choice, n in rows}
-    return {"percent": percent, "classic_closed": percent >= CLASSIC_CLOSED_AT,
+    return {"percent": percent, "classic_closed": False,  # nothing closes it any more
             "chose_assistant": counts.get("assistant", 0),
             "chose_classic": counts.get("classic", 0),
             # the rollout moves paying accounts only: how many there are, and how many are in

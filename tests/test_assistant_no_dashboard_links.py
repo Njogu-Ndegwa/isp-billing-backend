@@ -1,9 +1,9 @@
-"""The assistant is the whole of Bitwave for resellers: it never sends them to a dashboard page.
+"""The assistant does the job in the chat: it never sends a reseller to a dashboard page for it.
 
-With the rollout at Everyone the classic dashboard is closed to reseller accounts, and a
-relative link in a reply opens that old page (alone, with a way back). So for resellers the
-instructions forbid page links and "go to the page" answers and name the in-chat way for each
-thing the bot used to send people off for; platform admins keep their page links.
+The assistant is every reseller's start page (the classic dashboard stays in its menu for those
+who want it). For resellers the instructions forbid page links and "go to the page" answers and
+name the in-chat way for each thing the bot used to send people off for; platform admins keep
+their page links.
 """
 from __future__ import annotations
 
@@ -113,13 +113,17 @@ async def test_asking_for_the_old_app_gets_the_assistant_and_a_tour(client, owne
     text = await _system_text(client, token)
     assert "exit AI mode" in text and "nataka kurudi kwa app ya zamani" in text
     assert "the classic dashboard has been replaced" in text
-    assert "Never say how to reach the classic dashboard, never call it one tap away and never link to it" in text
+    # the examples and the tour come first; the way back only if they still want it
+    exit_rule = text[text.index("Asked how to leave the assistant"):text.index("The tour, once they say yes")]
+    assert exit_rule.index("quick tour") < exit_rule.index("Only if they still want the old one")
+    assert '"Classic dashboard" from this chat' in exit_rule and '"When I sign in, open"' in exit_rule
+    assert "Never link to it" in exit_rule
     assert "quick tour" in text and "Yes, give me a quick tour" in text
     tour = text[text.index("The tour, once they say yes"):]
     order = ["customers", "plans and vouchers", "routers", "payments and earnings", "messaging", "login page look"]
     assert [tour.index(a) for a in order] == sorted(tour.index(a) for a in order)
     assert "Move on only when they ask for the next area" in tour
-    assert "one tap away" not in text.replace("never call it one tap away", "")
+    assert "one tap away" not in text
 
 
 @pytest.mark.asyncio

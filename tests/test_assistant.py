@@ -1084,8 +1084,9 @@ async def test_who_starts_on_the_assistant(client, owner, db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_everyone_closes_the_classic_dashboard(client, owner, db, monkeypatch):
-    """At 100% every reseller account starts on the assistant and cannot choose the classic dashboard."""
+async def test_everyone_starts_on_the_assistant_and_keeps_the_classic_dashboard(client, owner, db, monkeypatch):
+    """At 100% every reseller account with no choice starts on the assistant (trial and staff too);
+    a person who picks the classic dashboard starts there, and nothing is closed."""
     reseller, token = owner                                       # a trial account: not paying
     trial_id = reseller.id
     admin = await make_admin(db, email="everyone-admin@example.com")
@@ -1096,27 +1097,30 @@ async def test_everyone_closes_the_classic_dashboard(client, owner, db, monkeypa
     async def status(tok):
         return (await client.get("/api/assistant/status", headers=auth(tok))).json()
 
-    await client.put("/api/assistant/home", json={"choice": "classic"}, headers=auth(token))
     r = await client.put("/api/admin/assistant/rollout", json={"percent": 100}, headers=auth(admin_token))
-    assert r.json()["classic_closed"] is True
+    assert r.json()["classic_closed"] is False
 
-    for tok in (token, staff_token):                              # trial owner (chose classic) and staff
+    for tok in (token, staff_token):                              # trial owner and staff, no choice
         s = await status(tok)
-        assert s["home"] is True and s["classic_closed"] is True
+        assert s["home"] is True and s["home_choice"] is None and s["classic_closed"] is False
+
+    # Their own choice of the classic dashboard counts, for them alone.
     r = await client.put("/api/assistant/home", json={"choice": "classic"}, headers=auth(token))
-    assert r.json()["home"] is True                                # choosing classic no longer takes them back
+    assert r.json() == {"home": False, "home_choice": "classic"}
+    s = await status(token)
+    assert s["home"] is False and s["classic_closed"] is False
+    assert (await status(staff_token))["home"] is True
+    # and going back to the default puts them on the assistant again
+    r = await client.put("/api/assistant/home", json={"choice": "default"}, headers=auth(token))
+    assert r.json() == {"home": True, "home_choice": None}
+
     admin_status = await status(admin_token)
     assert admin_status["home"] is False and admin_status["classic_closed"] is False
     viewer = _caller(user_id=trial_id, viewer_sid=9, viewer_admin_id=admin_id)
+    assert await home_mod.home_for(viewer, ready=True) == (False, None)
     assert await home_mod.classic_closed(viewer, ready=True) is False
 
-    # Back below Everyone, their own choice counts again.
-    await client.put("/api/admin/assistant/rollout", json={"percent": 99}, headers=auth(admin_token))
-    s = await status(token)
-    assert s["home"] is False and s["classic_closed"] is False
-
-    # An assistant that is not ready never locks anyone out of the dashboard.
-    await client.put("/api/admin/assistant/rollout", json={"percent": 100}, headers=auth(admin_token))
+    # An assistant that is not ready never starts anyone there.
     monkeypatch.setattr(settings, "DEEPSEEK_API_KEY", "")
     s = await status(token)
     assert s["enabled"] is False and s["home"] is False and s["classic_closed"] is False

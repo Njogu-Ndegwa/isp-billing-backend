@@ -262,7 +262,8 @@ async def assistant_status(request: Request):
         "retention_days": settings.ASSISTANT_RETENTION_DAYS,
         "home": is_home,
         "home_choice": choice,
-        # the classic dashboard is closed for this person: the app keeps them on the assistant
+        # always False now (the classic dashboard always has a way back); kept so a device that
+        # remembered "closed" learns it is open again
         "classic_closed": classic_closed,
         "ask_rating": ask_rating,
     }
