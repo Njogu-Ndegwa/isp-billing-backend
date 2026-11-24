@@ -1184,6 +1184,74 @@ async def test_briefing_draws_each_router_with_what_it_last_reported(client, own
     assert all(r["active_customers"] is None for r in s["routers"]["list"])
 
 
+@pytest.mark.asyncio
+async def test_briefing_shows_each_routers_ports_and_what_they_are_set_up_for(client, owner, db):
+    """The home screen draws every socket: its role from the saved settings, its link from the
+    router's own report. A port that had a link and lost it says so; an empty socket does not."""
+    from datetime import datetime
+
+    from app.services import realtime_state
+
+    reseller, token = owner
+    now = datetime.utcnow()
+    site = await make_router(db, reseller, name="Site", last_status=True, last_checked_at=now,
+                             pppoe_ports=["ether4"], dual_ports=["ether3"], plain_ports=["ether5"])
+    lb = await make_router(db, reseller, name="Twin WAN", last_status=True, last_checked_at=now,
+                           lb_enabled=True, lb_config={"wan_ports": ["ether1", "ether2"]})
+    dark = await make_router(db, reseller, name="Dark", last_status=False, last_checked_at=now,
+                             pppoe_ports=["ether2"])
+    site_id, lb_id, dark_id = site.id, lb.id, dark.id
+
+    def port(name, running, last_up="", disabled=False, downs=0):
+        return {"name": name, "running": running, "disabled": disabled, "rx_bytes": 0, "tx_bytes": 0,
+                "link_downs": downs, "last_link_up": last_up}
+
+    bridge = "bridge"
+    realtime_state._routers[site_id] = realtime_state.RouterLive(
+        router_id=site_id, received_at=now, interval_seconds=60,
+        ports=[port("ether1", True, "nov/24 09:00"), port("ether10", False), port("ether2", True, "nov/24 09:00"),
+               port("ether3", True, "x"), port("ether4", True, "x"), port("ether5", True, "x"),
+               port("ether6", False, "nov/24 16:00", downs=3), port("ether7", False, "x", disabled=True),
+               port("ether8", False), port("wlan1", True, "x")],
+        bridge_ports=[{"interface": p, "bridge": bridge} for p in ("ether2", "ether3", "ether4", "ether5", "ether6", "ether7")],
+        bridge_hosts={"AA:00:00:00:00:01": "ether2", "AA:00:00:00:00:02": "ether2", "AA:00:00:00:00:03": "ether1"},
+        bridge_hosts_at=now)
+    # load balanced, and an older report with no bridge list: nothing is called unused
+    realtime_state._routers[lb_id] = realtime_state.RouterLive(
+        router_id=lb_id, received_at=now, interval_seconds=60,
+        ports=[port("ether1", True, "x"), port("ether2", False, "x"), port("ether3", False)])
+    # an offline router's last report is not drawn as its ports now
+    realtime_state._routers[dark_id] = realtime_state.RouterLive(
+        router_id=dark_id, received_at=now, interval_seconds=60, ports=[port("ether1", True, "x")])
+    try:
+        b = (await client.get("/api/assistant/briefing", headers=auth(token))).json()
+    finally:
+        for rid in (site_id, lb_id, dark_id):
+            realtime_state._routers.pop(rid, None)
+
+    by_name = {r["name"]: r for r in b["routers"]["list"]}
+    ports = {p["name"]: p for p in by_name["Site"]["ports"]}
+    assert [p["name"] for p in by_name["Site"]["ports"]] == [f"ether{i}" for i in (1, 2, 3, 4, 5, 6, 7, 8, 10)]
+    assert {n: p["role"] for n, p in ports.items()} == {
+        "ether1": "internet", "ether2": "hotspot", "ether3": "both", "ether4": "pppoe", "ether5": "free",
+        "ether6": "hotspot", "ether7": "hotspot", "ether8": "unused", "ether10": "unused"}
+    assert ports["ether6"] == {"name": "ether6", "role": "hotspot", "up": False, "disabled": False,
+                               "lost_link": True, "link_downs": 3, "devices": 0}
+    assert ports["ether2"]["up"] and ports["ether2"]["devices"] == 2 and not ports["ether2"]["lost_link"]
+    assert ports["ether1"]["devices"] is None                      # the internet line has no customers behind it
+    assert not ports["ether7"]["lost_link"] and ports["ether7"]["disabled"]   # switched off on purpose
+    assert not ports["ether8"]["lost_link"] and not ports["ether10"]["lost_link"]  # empty sockets
+    assert by_name["Site"]["port_setup"] == {"internet": ["ether1"], "pppoe": ["ether4"], "both": ["ether3"], "free": ["ether5"]}
+
+    twin = {p["name"]: p for p in by_name["Twin WAN"]["ports"]}
+    assert twin["ether2"]["role"] == "internet" and twin["ether2"]["lost_link"]
+    assert twin["ether3"]["role"] == "hotspot" and twin["ether3"]["devices"] is None and not twin["ether3"]["lost_link"]
+    assert by_name["Twin WAN"]["port_setup"]["internet"] == ["ether1", "ether2"]
+
+    assert by_name["Dark"]["ports"] is None
+    assert by_name["Dark"]["port_setup"]["pppoe"] == ["ether2"]
+
+
 # ---------------------------------------------------------------------------
 # Forms: a change the person completes before Confirm
 # ---------------------------------------------------------------------------
