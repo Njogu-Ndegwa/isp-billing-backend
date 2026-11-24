@@ -39,3 +39,32 @@ async def test_the_job_is_done_in_the_chat(client, owner, db, monkeypatch, quest
     problems = evaluate(row, [NO_PAGE, *checks])
     report(f"no-dashboard/{question[:30]}", row, problems)
     assert not problems, problems
+
+
+def offers_a_tour(row):
+    said = row["said"].lower()
+    return None if any(w in said for w in ("tour", "ziara", "nikuonyeshe", "visite", "show you around")) \
+        else "did not offer a quick tour"
+
+
+def gives_examples(row):
+    said = row["said"].lower()
+    hits = [w for w in ("sales", "plan", "voucher", "router", "mauzo", "vocha", "mpango") if w in said]
+    return None if len(hits) >= 2 else f"too few examples of what can be done here ({hits})"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("question", [
+    "How can I exit AI mode?",
+    "Nataka kurudi kwa app ya zamani",
+    "Comment revenir à l'ancienne application ?",
+])
+async def test_asking_for_the_old_app_gets_examples_and_a_tour(client, owner, db, monkeypatch, question):  # noqa: F811
+    reseller, token = owner
+    await build(db, reseller, routers=["Rongai"], plans=HOTSPOT, sms_credits=200)
+    use_real_model(monkeypatch)
+    row = await ask(client, token, question, monkeypatch)
+    problems = evaluate(row, [never_says("](/", "one tap away", "/dashboard", "classic dashboard button",
+                                         "menu"), offers_a_tour, gives_examples])
+    report(f"no-dashboard/exit/{question[:24]}", row, problems)
+    assert not problems, problems

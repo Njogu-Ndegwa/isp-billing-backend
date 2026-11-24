@@ -103,3 +103,28 @@ def test_what_the_bot_used_to_send_people_off_for_is_in_its_index():
     # the person's own password is typed into the card, never into the chat
     fields = {f["name"]: f["kind"] for f in form_fields(catalog.get("PUT", "/api/profile/password"), {})}
     assert fields == {"current_password": "password", "new_password": "password"}
+
+
+@pytest.mark.asyncio
+async def test_asking_for_the_old_app_gets_the_assistant_and_a_tour(client, owner):
+    """'How can I exit AI mode?' / 'Nataka kurudi kwa app ya zamani': the classic dashboard is
+    replaced, so the answer is what can be done here, with examples, and an offer of a tour."""
+    _, token = owner
+    text = await _system_text(client, token)
+    assert "exit AI mode" in text and "nataka kurudi kwa app ya zamani" in text
+    assert "the classic dashboard has been replaced" in text
+    assert "Never say how to reach the classic dashboard, never call it one tap away and never link to it" in text
+    assert "quick tour" in text and "Yes, give me a quick tour" in text
+    tour = text[text.index("The tour, once they say yes"):]
+    order = ["customers", "plans and vouchers", "routers", "payments and earnings", "messaging", "login page look"]
+    assert [tour.index(a) for a in order] == sorted(tour.index(a) for a in order)
+    assert "Move on only when they ask for the next area" in tour
+    assert "one tap away" not in text.replace("never call it one tap away", "")
+
+
+@pytest.mark.asyncio
+async def test_a_platform_admin_gets_no_tour_instructions(client, db):
+    admin = await make_admin(db, email="boss2@example.com")
+    token = create_access_token(login_token_claims(admin), timedelta(hours=1))
+    text = await _system_text(client, token)
+    assert "The tour, once they say yes" not in text
