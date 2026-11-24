@@ -2468,6 +2468,34 @@ async def remediate_captive_portal(
                 "previous_html_directory": previous_dir,
             })
 
+            # What the target directory already holds, BEFORE anything changes:
+            # reset-html-directory overwrites a custom login.html, so it only
+            # runs when the default support files are missing, and a failed
+            # fetch must never leave the hotspot on a stock or empty page.
+            dir_files: dict = {}
+            listing = api.send_command("/file/print")
+            for item in (listing.get("data") or []) if listing.get("success") else []:
+                name = str(item.get("name") or "")
+                if name.startswith(f"{target_dir}/"):
+                    try:
+                        dir_files[name[len(target_dir) + 1:]] = int(item.get("size") or 0)
+                    except (TypeError, ValueError):
+                        dir_files[name[len(target_dir) + 1:]] = 0
+            had_login = dir_files.get("login.html", 0) > 0
+            support_missing = [
+                f for f in ("alogin.html", "errors.txt", "redirect.html", "md5.js")
+                if f not in dir_files
+            ]
+
+            def _restore_previous_dir() -> None:
+                if previous_dir in ("(unset)", target_dir):
+                    return
+                api.send_command(
+                    "/ip/hotspot/profile/set",
+                    {"numbers": profile[".id"], "html-directory": previous_dir},
+                )
+                step("profile.restore_html_directory", True, previous_dir)
+
             # 2. Update html-directory if needed.
             if previous_dir == target_dir:
                 step("profile.set_html_directory", True, "already correct, skipped")
@@ -2482,18 +2510,23 @@ async def remediate_captive_portal(
                     return report
                 step("profile.set_html_directory", True, f"{previous_dir} -> {target_dir}")
 
-            # 3. Reset (repopulate) the default HTML file set into the new directory.
+            # 3. Reset (repopulate) the default HTML file set into the new directory,
+            #    only when its support files are missing (the reset also
+            #    overwrites our custom login.html).
             #    NOTE: positional profile name on RouterOS, NOT a `numbers=...` arg.
-            reset = api.send_command(
-                "/ip/hotspot/profile/reset-html-directory",
-                {"numbers": profile[".id"]},
-            )
-            if reset.get("error"):
-                # Non-fatal: some RouterOS builds reject this command. We can
-                # still drop our login.html on top via /tool fetch below.
-                step("profile.reset_html_directory", False, reset["error"])
+            if support_missing:
+                reset = api.send_command(
+                    "/ip/hotspot/profile/reset-html-directory",
+                    {"numbers": profile[".id"]},
+                )
+                if reset.get("error"):
+                    # Non-fatal: some RouterOS builds reject this command. We can
+                    # still drop our login.html on top via /tool fetch below.
+                    step("profile.reset_html_directory", False, reset["error"])
+                else:
+                    step("profile.reset_html_directory", True, {"missing": support_missing})
             else:
-                step("profile.reset_html_directory", True)
+                step("profile.reset_html_directory", True, "skipped: default files present")
 
             # 4. Drive the router itself to /tool/fetch our custom login.html
             #    onto the correct path. send_command blocks until RouterOS
@@ -2518,12 +2551,25 @@ async def remediate_captive_portal(
             if pt.vpn_type == "l2tp" and fetch_mode == "https":
                 fetch_params["check-certificate"] = "no"
             fetch = api.send_command("/tool/fetch", fetch_params)
+            if fetch.get("error") and fetch_mode == "http":
+                # The anti-bypass rule (ISP_BILLING_PROXY_RELAY_BLOCK) rejects the
+                # router's own port-80 connections outside isp_portal_allow, and
+                # the backend sits behind Cloudflare; 443 is not blocked.
+                step("tool.fetch_login_page_http", False, fetch["error"])
+                fetch = api.send_command("/tool/fetch", {
+                    "url": "https://" + login_page_url.split("://", 1)[1],
+                    "dst-path": login_dst,
+                    "mode": "https",
+                    "check-certificate": "no",
+                })
             if fetch.get("error"):
                 step("tool.fetch_login_page", False, {
                     "error": fetch["error"],
                     "url": login_page_url,
                     "dst": login_dst,
                 })
+                if not had_login or support_missing:
+                    _restore_previous_dir()
                 report["success"] = False
                 return report
             step("tool.fetch_login_page", True, {
@@ -2560,6 +2606,7 @@ async def remediate_captive_portal(
                     "size": login_size,
                     "msg": "login.html missing or empty after fetch",
                 })
+                _restore_previous_dir()
                 report["success"] = False
                 return report
             step("file.verify_login_html", True, {"path": login_dst, "size": login_size})
