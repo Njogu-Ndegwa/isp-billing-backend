@@ -44,7 +44,8 @@ async def test_a_reseller_is_never_sent_to_a_dashboard_page(client, owner):
     _, token = owner
     text = await _system_text(client, token)
     assert "relative links" not in text
-    assert "](/" not in text
+    # the only page link in the reseller prompt is the way back to the classic dashboard
+    assert text.replace("[Classic dashboard](/dashboard)", "").count("](/") == 0
     assert "never write links to dashboard paths" in text
     assert "dashboard page to use" not in text
     # the in-chat way for what it used to send people off for
@@ -108,7 +109,8 @@ def test_what_the_bot_used_to_send_people_off_for_is_in_its_index():
 @pytest.mark.asyncio
 async def test_asking_for_the_old_app_gets_the_assistant_and_a_tour(client, owner):
     """'How can I exit AI mode?' / 'Nataka kurudi kwa app ya zamani': the answer is what can be
-    done here, with examples, and an offer of a tour, in the language they wrote in. The classic
+    done here, with examples, and an offer of a tour, in the language they wrote in, after the way back
+    (a link to the classic dashboard and its menu item). The classic
     dashboard still exists, so it is never called gone or replaced."""
     _, token = owner
     text = await _system_text(client, token)
@@ -116,11 +118,12 @@ async def test_asking_for_the_old_app_gets_the_assistant_and_a_tour(client, owne
     assert "can now be done here, just by asking" in text
     assert "has been replaced" not in text
     assert "Kiswahili gets Kiswahili" in text
-    # the examples and the tour come first; the way back only if they still want it
+    # the way back comes first, with its link (the one dashboard link allowed); then the examples and the tour
     exit_rule = text[text.index("Asked how to leave the assistant"):text.index("The tour, once they say yes")]
-    assert exit_rule.index("quick tour") < exit_rule.index("Only if they still want the old one")
-    assert '"Classic dashboard" from this chat' in exit_rule and '"When I sign in, open"' in exit_rule
-    assert "Never link to it" in exit_rule
+    assert "[Classic dashboard](/dashboard)" in exit_rule
+    assert exit_rule.index("[Classic dashboard](/dashboard)") < exit_rule.index("quick tour")
+    assert '"Classic dashboard" in this chat' in exit_rule and '"When I sign in, open"' in exit_rule
+    assert "the one dashboard link you may write" in exit_rule
     assert "quick tour" in text and "Yes, give me a quick tour" in text
     tour = text[text.index("The tour, once they say yes"):]
     order = ["customers", "plans and vouchers", "routers", "payments and earnings", "messaging", "login page look"]
