@@ -243,9 +243,10 @@ async def assistant_status(request: Request):
     ready, reason = assistant_ready()
     try:
         is_home, choice = await home.home_for(caller, ready=ready)
+        classic_closed = await home.classic_closed(caller, ready=ready)
     except Exception:  # the start-page setting must never break the chat
         logger.exception("[assistant] start-page lookup failed")
-        is_home, choice = False, None
+        is_home, choice, classic_closed = False, None, False
     try:
         ask_rating = ready and await ratings.should_ask(caller)
     except Exception:  # nor may the rating ask
@@ -261,6 +262,8 @@ async def assistant_status(request: Request):
         "retention_days": settings.ASSISTANT_RETENTION_DAYS,
         "home": is_home,
         "home_choice": choice,
+        # the classic dashboard is closed for this person: the app keeps them on the assistant
+        "classic_closed": classic_closed,
         "ask_rating": ask_rating,
     }
 
