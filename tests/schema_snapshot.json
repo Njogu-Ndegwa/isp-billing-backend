@@ -1119,6 +1119,18 @@
   "state",
   "updated_at"
  ],
+ "router_cpu_buckets": [
+  "board_name",
+  "bucket_start",
+  "cpu_mean_sum",
+  "cpu_peak",
+  "hist",
+  "ros_major",
+  "routers",
+  "routers_ge80",
+  "routers_peak_ge95",
+  "samples"
+ ],
  "router_health": [
   "board_name",
   "cpu_load",
