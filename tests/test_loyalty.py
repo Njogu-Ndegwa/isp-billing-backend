@@ -468,6 +468,46 @@ async def test_send_code_is_rate_limited_and_silent_for_non_members(db, session_
     assert (await db.execute(select(func.count(SmsMessage.id)))).scalar() == 3
 
 
+async def test_balance_accepts_code_without_using_it(db, session_factory, portal):
+    reseller, router, plan, reward_plan, _ = await _member(db, session_factory)
+    now = datetime.utcnow()
+    db.add(LoyaltyCode(user_id=reseller.id, phone_key="700000001", mac=OTHER_MAC,
+                       code_hash=loyalty._code_hash(reseller.id, "700000001", OTHER_MAC, "246810"),
+                       expires_at=now + timedelta(minutes=10)))
+    await db.commit()
+    body = {"identity": IDENTITY, "phone": PHONE, "mac": OTHER_MAC}
+
+    bad = await portal.post("/api/public/loyalty/balance", json=dict(body, code="135790"))
+    assert bad.status_code == 200 and bad.json() == {"ok": False, "code": "bad_code"}
+
+    for _ in range(2):  # a balance check never uses the code up
+        ok = await portal.post("/api/public/loyalty/balance", json=dict(body, code="246810"))
+        assert ok.status_code == 200 and ok.json()["ok"] is True and ok.json()["balance"] == 20
+    row = (await db.execute(select(LoyaltyCode).execution_options(populate_existing=True))).scalar_one()
+    assert row.used_at is None and row.attempts == 1  # the bad try counted
+
+    # The code is for this phone and this device only.
+    other_device = await portal.post("/api/public/loyalty/balance", json=dict(body, mac="AA:BB:CC:00:00:07", code="246810"))
+    assert other_device.json() == {"ok": False, "code": "bad_code"}
+
+    redeemed = await portal.post("/api/public/loyalty/redeem", json=dict(body, plan_id=reward_plan.id, code="246810"))
+    assert redeemed.status_code == 200 and redeemed.json()["ok"] is True
+    again = await portal.post("/api/public/loyalty/balance", json=dict(body, code="246810"))
+    assert again.json() == {"ok": False, "code": "bad_code"}
+
+
+async def test_balance_code_expires(db, session_factory, portal):
+    reseller, *_ = await _member(db, session_factory)
+    db.add(LoyaltyCode(user_id=reseller.id, phone_key="700000001", mac=OTHER_MAC,
+                       code_hash=loyalty._code_hash(reseller.id, "700000001", OTHER_MAC, "246810"),
+                       expires_at=datetime.utcnow() - timedelta(seconds=1)))
+    await db.commit()
+    r = await portal.post("/api/public/loyalty/balance", json={
+        "identity": IDENTITY, "phone": PHONE, "mac": OTHER_MAC, "code": "246810",
+    })
+    assert r.status_code == 200 and r.json() == {"ok": False, "code": "bad_code"}
+
+
 async def test_code_allows_five_tries(db, session_factory):
     reseller, *_ = await _member(db, session_factory)
     now = datetime.utcnow()
