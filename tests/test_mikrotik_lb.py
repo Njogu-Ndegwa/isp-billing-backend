@@ -304,10 +304,17 @@ def test_reapply_skips_existing_objects():
 # (d) rollback: disable marks FIRST, then routes, guard/bypass only after
 # ---------------------------------------------------------------------------
 
-def _applied_api():
+# WAN1's own dynamic DHCP default (add-default-route=yes), as on most routers.
+WAN1_DHCP_DEFAULT = {".id": "*DD1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.1",
+                     "distance": "1", "active": "true", "dynamic": "true"}
+
+
+def _applied_api(wan1_dhcp_default=True):
     api = FakeLBAPI()
     report = mikrotik_lb.lb_apply(api, ["ether1", "ether2"])
     assert report["success"] is True
+    if wan1_dhcp_default:
+        api.routes.append(dict(WAN1_DHCP_DEFAULT))
     api.commands = []  # keep only rollback traffic
     return api
 
@@ -632,3 +639,34 @@ def test_verify_flags_lb_paid_entry_held_by_unauth_host():
     report = mikrotik_lb.lb_verify(api)
     assert any("DANGER" in w for w in report["warnings"])
     assert report["success"] is False
+
+def test_rollback_keeps_main_routes_when_wan1_adds_no_default():
+    """ZEUS (router 671), 23 Nov 2026: WAN1 DHCP add-default-route=no, so the
+    dashboard disable removed every default route and the router went dark for
+    16 h. With no other default, the main-table routes must stay."""
+    api = _applied_api(wan1_dhcp_default=False)
+    main_before = {r.get("comment") for r in api.routes
+                   if (r.get("comment") or "").startswith("ISP_BILLING")
+                   and (r.get("routing-table") or "main") == "main"
+                   and not r.get("routing-mark")}
+    assert any(r.get("dst-address") == "0.0.0.0/0" for r in api.routes
+               if r.get("comment") in main_before)
+
+    report = mikrotik_lb.lb_rollback(api)
+
+    assert report["success"] is True
+    assert set(report["kept_failover_routes"]) == main_before
+    left = {r.get("comment") for r in api.routes}
+    assert main_before <= left
+    # a default route survives, the per-WAN tables and their routes are gone
+    assert any(r.get("dst-address") == "0.0.0.0/0" for r in api.routes)
+    assert api.routing_tables == []
+    assert not any((r.get("routing-table") or "").startswith("to_wan") for r in api.routes)
+    assert report["warnings"]
+
+
+def test_rollback_removes_main_routes_when_wan1_dhcp_default_exists():
+    api = _applied_api(wan1_dhcp_default=True)
+    report = mikrotik_lb.lb_rollback(api)
+    assert report["kept_failover_routes"] == []
+    assert [r[".id"] for r in api.routes] == ["*DD1"]
