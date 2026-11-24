@@ -1018,6 +1018,8 @@ async def test_who_starts_on_the_assistant(client, owner, db, monkeypatch):
     admin_token = create_access_token(login_token_claims(admin), timedelta(hours=1))
     _, staff_token = await _staff_token(db, reseller, ["customers.view"])
     reseller_id, admin_id = reseller.id, admin.id   # read before expire_all() below
+    # a partial share (below Everyone) that takes this reseller's bucket in
+    monkeypatch.setattr(home_mod, "in_rollout", lambda uid, percent: percent > 0)
 
     async def status(tok):
         return (await client.get("/api/assistant/status", headers=auth(tok))).json()
@@ -1025,16 +1027,18 @@ async def test_who_starts_on_the_assistant(client, owner, db, monkeypatch):
     # Nobody is moved until an admin says so.
     assert (await status(token))["home"] is False and (await status(token))["home_choice"] is None
     assert (await client.get("/api/admin/assistant/rollout", headers=auth(admin_token))).json() == {
-        "percent": 0, "chose_assistant": 0, "chose_classic": 0, "paying_accounts": 1, "paying_inside": 0}
+        "percent": 0, "classic_closed": False, "chose_assistant": 0, "chose_classic": 0,
+        "paying_accounts": 1, "paying_inside": 0}
     assert (await client.put("/api/admin/assistant/rollout", json={"percent": 50},
                              headers=auth(token))).status_code == 403
     assert (await client.put("/api/admin/assistant/rollout", json={"percent": 101},
                              headers=auth(admin_token))).status_code == 422
 
-    r = await client.put("/api/admin/assistant/rollout", json={"percent": 100}, headers=auth(admin_token))
-    assert r.status_code == 200 and r.json()["percent"] == 100
+    r = await client.put("/api/admin/assistant/rollout", json={"percent": 50}, headers=auth(admin_token))
+    assert r.status_code == 200 and r.json()["percent"] == 50
     db.expire_all()
-    assert (await db.get(AppSetting, home_mod.ROLLOUT_KEY)).value == "100"
+    assert (await db.get(AppSetting, home_mod.ROLLOUT_KEY)).value == "50"
+    assert (await status(token))["classic_closed"] is False   # a partial share leaves the dashboard open
     assert (await status(token))["home"] is True              # the account...
     assert (await status(staff_token))["home"] is True        # ...and its staff, together
     assert (await status(admin_token))["home"] is False       # a platform admin is never moved
@@ -1059,7 +1063,8 @@ async def test_who_starts_on_the_assistant(client, owner, db, monkeypatch):
     assert (await client.put("/api/assistant/home", json={"choice": "nope"},
                              headers=auth(token))).status_code == 422
     report = (await client.get("/api/admin/assistant/rollout", headers=auth(admin_token))).json()
-    assert report == {"percent": 0, "chose_assistant": 2, "chose_classic": 0, "paying_accounts": 1, "paying_inside": 0}
+    assert report == {"percent": 0, "classic_closed": False, "chose_assistant": 2, "chose_classic": 0,
+                      "paying_accounts": 1, "paying_inside": 0}
     # The staff member's choice is not an activity-log entry.
     logs = (await db.execute(select(StaffActivityLog))).scalars().all()
     assert not any("/api/assistant/home" in (entry.path or "") for entry in logs)
@@ -1070,11 +1075,51 @@ async def test_who_starts_on_the_assistant(client, owner, db, monkeypatch):
     assert await home_mod.home_for(viewer, ready=True) == (False, None)
     await client.put("/api/admin/assistant/rollout", json={"percent": 100}, headers=auth(admin_token))
     assert await home_mod.home_for(viewer, ready=True) == (False, None)
+    assert await home_mod.classic_closed(viewer, ready=True) is False
 
     # Nobody starts on an assistant that is not ready.
     monkeypatch.setattr(settings, "DEEPSEEK_API_KEY", "")
     off = await status(token)
     assert off["enabled"] is False and off["home"] is False and off["home_choice"] == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_everyone_closes_the_classic_dashboard(client, owner, db, monkeypatch):
+    """At 100% every reseller account starts on the assistant and cannot choose the classic dashboard."""
+    reseller, token = owner                                       # a trial account: not paying
+    trial_id = reseller.id
+    admin = await make_admin(db, email="everyone-admin@example.com")
+    admin_token = create_access_token(login_token_claims(admin), timedelta(hours=1))
+    _, staff_token = await _staff_token(db, reseller, ["customers.view"])
+    admin_id = admin.id
+
+    async def status(tok):
+        return (await client.get("/api/assistant/status", headers=auth(tok))).json()
+
+    await client.put("/api/assistant/home", json={"choice": "classic"}, headers=auth(token))
+    r = await client.put("/api/admin/assistant/rollout", json={"percent": 100}, headers=auth(admin_token))
+    assert r.json()["classic_closed"] is True
+
+    for tok in (token, staff_token):                              # trial owner (chose classic) and staff
+        s = await status(tok)
+        assert s["home"] is True and s["classic_closed"] is True
+    r = await client.put("/api/assistant/home", json={"choice": "classic"}, headers=auth(token))
+    assert r.json()["home"] is True                                # choosing classic no longer takes them back
+    admin_status = await status(admin_token)
+    assert admin_status["home"] is False and admin_status["classic_closed"] is False
+    viewer = _caller(user_id=trial_id, viewer_sid=9, viewer_admin_id=admin_id)
+    assert await home_mod.classic_closed(viewer, ready=True) is False
+
+    # Back below Everyone, their own choice counts again.
+    await client.put("/api/admin/assistant/rollout", json={"percent": 99}, headers=auth(admin_token))
+    s = await status(token)
+    assert s["home"] is False and s["classic_closed"] is False
+
+    # An assistant that is not ready never locks anyone out of the dashboard.
+    await client.put("/api/admin/assistant/rollout", json={"percent": 100}, headers=auth(admin_token))
+    monkeypatch.setattr(settings, "DEEPSEEK_API_KEY", "")
+    s = await status(token)
+    assert s["enabled"] is False and s["home"] is False and s["classic_closed"] is False
 
 
 @pytest.mark.asyncio

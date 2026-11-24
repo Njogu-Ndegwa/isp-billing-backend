@@ -11,7 +11,13 @@ The assistant home is rolled out to a share of accounts before everyone:
   ever adds accounts, and an account that starts paying joins if its bucket
   is inside. Trial and suspended accounts are not moved;
 * platform admins and View-as sessions are never moved by the percentage;
-* nobody starts there while the assistant is not ready.
+* nobody starts there while the assistant is not ready;
+* at 100% ("Everyone") the classic dashboard is closed: every reseller
+  account (paying, trial or suspended, owner and staff) starts on the
+  assistant, a person's own "classic" choice no longer counts, and the
+  dashboard sends them back to the assistant. Platform admins and View-as
+  sessions are untouched. While the assistant is not ready the classic
+  dashboard stays open, so nobody is ever left without a way in.
 
 The percentage lives in ``app_settings`` (key ``assistant_home_percent``,
 default 0). Every function is one short DB session.
@@ -141,16 +147,32 @@ async def set_choice(caller: Caller, choice: str) -> Optional[str]:
     return choice
 
 
+CLASSIC_CLOSED_AT = 100
+
+
+def _exempt(caller: Caller) -> bool:
+    return caller.role == "admin" or caller.viewer_sid is not None
+
+
+async def classic_closed(caller: Caller, *, ready: bool) -> bool:
+    """Whether this person may no longer use the classic dashboard (the rollout is at Everyone)."""
+    if not ready or _exempt(caller):
+        return False
+    return await get_percent() >= CLASSIC_CLOSED_AT
+
+
 async def home_for(caller: Caller, *, ready: bool) -> tuple[bool, Optional[str]]:
     """(the assistant is this person's start page, their own choice)."""
     choice = await get_choice(caller)
     if not ready:
         return False, choice
+    if await classic_closed(caller, ready=ready):
+        return True, choice
     if choice == "assistant":
         return True, choice
     if choice == "classic":
         return False, choice
-    if caller.role == "admin" or caller.viewer_sid is not None:
+    if _exempt(caller):
         return False, None
     percent = await get_percent()
     if not in_rollout(caller.user_id, percent):
@@ -169,7 +191,8 @@ async def rollout_report() -> dict:
             select(User.id).where(User.subscription_status == SubscriptionStatus.ACTIVE, User.role != "admin")
         )).scalars().all()
     counts = {choice: int(n) for choice, n in rows}
-    return {"percent": percent, "chose_assistant": counts.get("assistant", 0),
+    return {"percent": percent, "classic_closed": percent >= CLASSIC_CLOSED_AT,
+            "chose_assistant": counts.get("assistant", 0),
             "chose_classic": counts.get("classic", 0),
             # the rollout moves paying accounts only: how many there are, and how many are in
             "paying_accounts": len(paying_ids),
