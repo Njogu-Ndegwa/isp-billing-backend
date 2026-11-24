@@ -5,6 +5,7 @@ from sqlalchemy.orm import selectinload
 from typing import Optional
 from datetime import datetime, timedelta
 
+from app.services.hotspot_block import is_reseller_block
 from app.db.database import get_db
 from app.db.models import Router, Customer, Plan, CustomerStatus
 from app.services.auth import verify_token, get_current_user
@@ -90,6 +91,8 @@ async def cleanup_all_inactive_users(
                 bindings = api.send_command("/ip/hotspot/ip-binding/print")
                 if bindings.get("success") and bindings.get("data"):
                     for b in bindings["data"]:
+                        if is_reseller_block(b):
+                            continue
                         if b.get("mac-address", "").upper() == normalized_mac.upper():
                             api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
                             removed["bindings"] += 1
@@ -393,6 +396,8 @@ def _cleanup_recently_expired_sync(customers_data: list, delay_ms: int = 200) ->
                 
                 # 1. Remove IP bindings
                 for b in bindings_data:
+                    if is_reseller_block(b):
+                        continue
                     binding_mac = normalize_mac_address(b.get("mac-address", ""))
                     if binding_mac == normalized_mac:
                         api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})

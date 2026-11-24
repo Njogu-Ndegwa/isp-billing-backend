@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import AccessCredential, Router, RouterAuthMethod
 from app.services.mikrotik_api import MikroTikAPI, _whole_rate, normalize_mac_address
+from app.services.hotspot_block import is_reseller_block
 
 logger = logging.getLogger(__name__)
 
@@ -508,6 +509,10 @@ def _deprovision_direct_api_sync(router_info: dict, payload: dict) -> dict:
             if bindings.get("success") and bindings.get("data"):
                 for b in bindings["data"]:
                     bm = b.get("mac-address", "")
+                    if is_reseller_block(b):
+                        if bm:
+                            other_macs.add(normalize_mac_address(bm))
+                        continue
                     if (payload.get("all_bindings") and b.get("comment", "").startswith(prefix)) or (
                         not payload.get("all_bindings") and bm and normalize_mac_address(bm) == wanted
                     ):
@@ -596,6 +601,10 @@ def _bind_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
                 if not bm_raw:
                     continue
                 bm = normalize_mac_address(bm_raw)
+                if bm == mac_address and is_reseller_block(b):
+                    return {"error": "device_blocked", "message": "This device is blocked on this router"}
+                if bm == wanted_old and is_reseller_block(b):
+                    continue  # never lift a reseller's block on the previous device
                 if bm == mac_address and existing_id is None:
                     if payload.get("owned_only") and b.get("comment") != comment:
                         return {"error": "binding_conflict", "message": "The device has a different router binding"}
@@ -802,6 +811,9 @@ def _release_mac_direct_api_sync(router_info: dict, payload: dict) -> dict:
             for b in bindings["data"]:
                 bm = b.get("mac-address", "")
                 if bm and normalize_mac_address(bm) == mac_address:
+                    if is_reseller_block(b):
+                        other_binding = True
+                        continue
                     if payload.get("owned_only") and not b.get("comment", "").startswith(
                         f"{USER_COMMENT_PREFIX}|cred:{cred_id}|"
                     ):

@@ -46,6 +46,7 @@ from app.services.mikrotik_api import (
 )
 from app.services.subscription_sharing import max_devices_for_customer
 from app.services.customer_grace import has_access_time
+from app.services.hotspot_block import is_reseller_block
 from app.services.usage_tracking import fup_cap_mb, fup_usage_bytes, fup_window_start, get_open_period
 from app.services.hotspot_mac_login import (
     block_customer as mac_login_block_customer,
@@ -371,6 +372,8 @@ def _block_hotspot_sync(router_info: dict, mac_address: str) -> dict:
             return {"error": bindings.get("error", "ip_binding_print_failed")}
 
         binding = _find_hotspot_binding(bindings.get("data", []), normalized_mac)
+        if is_reseller_block(binding):
+            return {"success": True, "skipped": "blocked_by_reseller"}
         comment = f"FUP_BLOCKED|USER:{username}|{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"
         if binding and binding.get(".id"):
             binding_result = api.send_command("/ip/hotspot/ip-binding/set", {
@@ -433,6 +436,9 @@ def _restore_hotspot_sync(router_info: dict, mac_address: str, normal_rate_limit
             return {"error": bindings.get("error", "ip_binding_print_failed")}
 
         binding = _find_hotspot_binding(bindings.get("data", []), normalized_mac)
+        if is_reseller_block(binding):
+            # Restoring speed must not lift a reseller's block.
+            return {"success": True, "skipped": "blocked_by_reseller"}
         comment = f"USER:{username}|EXPIRES:DB_MANAGED|FUP_RESTORED:{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"
         if binding and binding.get(".id"):
             binding_result = api.send_command("/ip/hotspot/ip-binding/set", {

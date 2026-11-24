@@ -63,6 +63,7 @@ from app.services.customer_grace import (
     has_access_time,
 )
 from app.core.protected_devices import is_protected_device
+from app.services.hotspot_block import is_reseller_block
 from app.config import settings
 from app.services.realtime_state import host_metering_active, is_pilot_router, pushed_bindings, reports_metrics
 from app.services.hotspot_mac_login import (
@@ -611,6 +612,8 @@ def _remove_user_from_mikrotik_sync(router_info: dict, normalized_mac: str, user
         bindings = api.send_command("/ip/hotspot/ip-binding/print")
         if bindings.get("success") and bindings.get("data"):
             for b in bindings["data"]:
+                if is_reseller_block(b):
+                    continue
                 binding_mac = b.get("mac-address", "").upper()
                 binding_name = b.get("name", "").upper()
                 if binding_mac == normalized_mac.upper() or binding_name == username.upper():
@@ -870,6 +873,8 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
                             removed["hosts"] += 1
 
                 for b in snapshot["bindings"]:
+                    if is_reseller_block(b):
+                        continue
                     mac_match = _mac_of(b) == normalized_mac
                     username_match = f"USER:{username}" in b.get("comment", "").upper()
                     if mac_match or username_match:
@@ -916,7 +921,9 @@ def _cleanup_single_router_hotspot_sync(router_info: dict, customers_data: list)
             cust, removed = o["cust"], o["removed"]
             mac = o["mac"]
             compact = mac.replace(":", "")
-            bound = any(_mac_of(b) == mac or f"USER:{compact}" in b.get("comment", "").upper()
+            # A reseller's block is not access: it stays, and does not count.
+            bound = any((_mac_of(b) == mac or f"USER:{compact}" in b.get("comment", "").upper())
+                        and not is_reseller_block(b)
                         for b in verified["bindings"])
             user = any(hotspot_user_is_for_mac(u, mac) for u in verified["users"])
             active = any(_mac_of(s) == mac or s.get("user", "").upper() in (mac, compact)
@@ -1090,7 +1097,7 @@ def _remove_router_bindings_sync(router_info: dict, orphan_macs: set[str]) -> in
             binding_mac = binding.get("mac-address", "")
             binding_type = binding.get("type", "")
             binding_id = binding.get(".id", "")
-            if not binding_mac or binding_type != "bypassed":
+            if not binding_mac or binding_type != "bypassed" or is_reseller_block(binding):
                 continue
             if not _is_our_binding(binding.get("comment")):
                 continue

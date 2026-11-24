@@ -400,13 +400,14 @@ def test_reaper_blocks_relogin_and_reports_only_after_verified_disconnect():
     disable = src.index('/ip hotspot user set [find where name=$m] disabled=yes')
     kick = src.index('/ip hotspot active remove [find where mac-address=$m]')
     delete_user = src.index('/ip hotspot user remove [find where name=$m]')
-    delete_binding = src.index('/ip hotspot ip-binding remove [find where mac-address=$m]')
+    # a reseller's block (BW-RESELLER-BLOCK) is never removed by the reaper
+    delete_binding = src.index('/ip hotspot ip-binding remove [find where mac-address=$m && !(comment~"BW-RESELLER-BLOCK")]')
     report = src.index(':set bwExpDone ($bwExpDone . $m . "@" . $nows . ",")')
     assert disable < kick < delete_user < delete_binding < report
     assert '[:len [/ip hotspot active find where mac-address=$m]] = 0' in src
     assert '[:len [/ip hotspot host find where mac-address=$m and authorized]] = 0' in src
     assert '[:len [/ip hotspot host find where mac-address=$m and bypassed]] = 0' in src
-    assert '[:len [/ip hotspot ip-binding find where mac-address=$m]] = 0' in src
+    assert '[:len [/ip hotspot ip-binding find where mac-address=$m && !(comment~"BW-RESELLER-BLOCK")]] = 0' in src
 
 
 def test_parse_request_reads_the_script_version():

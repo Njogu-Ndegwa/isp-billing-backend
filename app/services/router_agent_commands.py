@@ -152,7 +152,7 @@ def render_hotspot_remove_action(
 :if ([:len $bwHost] > 0) do={{ :set bwClientIp [/ip hotspot host get [:pick $bwHost 0] address] }}
 :do {{ /ip hotspot active remove [find mac-address=\"{mac}\"] }} on-error={{}}
 :do {{ /ip hotspot active remove [find user=\"{user}\"] }} on-error={{}}
-:do {{ /ip hotspot ip-binding remove [find mac-address=\"{mac}\"] }} on-error={{}}
+:do {{ /ip hotspot ip-binding remove [find where mac-address=\"{mac}\" && !(comment~\"BW-RESELLER-BLOCK\")] }} on-error={{}}
 :do {{ /ip hotspot user remove [find name=\"{user}\"] }} on-error={{}}
 :do {{ /ip hotspot user remove [find name=\"{mac}\"] }} on-error={{}}
 :do {{ /ip hotspot host remove [find mac-address=\"{mac}\"] }} on-error={{}}
@@ -161,7 +161,7 @@ def render_hotspot_remove_action(
 :do {{ /queue simple remove [find name=\"queue_{user}\"] }} on-error={{}}
 {f':do {{ /ip firewall address-list remove [find list="LB_PAID" comment="PAID:{mac}"] }} on-error={{}}' if lb_enabled else ''}
 {f':if ([:len $bwClientIp] > 0) do={{ :do {{ /ip firewall address-list remove [find list="LB_PAID" address=$bwClientIp] }} on-error={{}} }}' if lb_enabled else ''}
-:if ([:len [/ip hotspot ip-binding find mac-address=\"{mac}\"]] > 0) do={{ :error \"binding remains\" }}
+:if ([:len [/ip hotspot ip-binding find where mac-address=\"{mac}\" && !(comment~\"BW-RESELLER-BLOCK\")]] > 0) do={{ :error \"binding remains\" }}
 :if ([:len [/ip hotspot active find mac-address=\"{mac}\"]] > 0) do={{ :error \"session remains\" }}
 :if ([:len [/ip hotspot user find name=\"{user}\"]] > 0) do={{ :error \"user remains\" }}
 :if ([:len [/ip hotspot user find name=\"{mac}\"]] > 0) do={{ :error \"MAC-login user remains\" }}

@@ -32,6 +32,7 @@ from app.db.models import (
     RouterAuthMethod,
 )
 from app.services.mikrotik_api import LANE_PAYMENT, MikroTikAPI, normalize_mac_address
+from app.services.hotspot_block import BLOCKED_DELIVERY_ERROR, is_reseller_block
 from app.services.customer_grace import effective_expiry, has_access_time
 from app.services.hotspot_mac_login import (
     mac_login_enabled,
@@ -531,6 +532,14 @@ def _call_mikrotik_bypass_sync(hotspot_payload: dict, verify_only: bool = False)
                     else ProvisioningOnlineState.OFFLINE.value
                 ),
             }
+
+        # A device the reseller blocked stays blocked when it pays: no user,
+        # no bypass. Retries are capped, and last_error says why.
+        existing_binding = api.get_ip_binding_by_mac(hotspot_payload["mac_address"])
+        if is_reseller_block(existing_binding.get("data")):
+            logger.warning("[PROVISION] %s is blocked by the reseller on %s; not delivering",
+                           hotspot_payload["mac_address"], router_ip)
+            return {"success": False, "error": BLOCKED_DELIVERY_ERROR}
 
         if hotspot_payload.get("mac_login"):
             provision_result = provision_mac_login_customer(
