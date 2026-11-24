@@ -61,6 +61,7 @@ class ProvisioningAttemptEntrypoint(str, enum.Enum):
     SUBSCRIPTION_SHARE = "subscription_share"
     OUTAGE_COMPENSATION = "outage_compensation"
     FREE_TRIAL = "free_trial"
+    LOYALTY_REDEMPTION = "loyalty_redemption"
 
 
 class ProvisioningState(str, enum.Enum):
@@ -420,6 +421,81 @@ class FreeTrialClaim(Base):
     # Match key, not a dialable number: the last 9 digits (see free_trial.py).
     phone = Column(String(32), nullable=True, index=True)
     claimed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class LoyaltySettings(Base):
+    """A reseller's loyalty points programme (app/services/loyalty.py).
+
+    Off by default. Only payments made after ``enabled_at`` earn, and a
+    settings change only affects future earning.
+    """
+    __tablename__ = "loyalty_settings"
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    enabled = Column(Boolean, nullable=False, default=False, server_default="false")
+    enabled_at = Column(DateTime, nullable=True)
+    # "per_kes" (floor(amount / kes_per_point)) or "per_purchase".
+    earn_mode = Column(String(16), nullable=False, default="per_kes", server_default="per_kes")
+    kes_per_point = Column(Integer, nullable=False, default=10, server_default="10")
+    points_per_purchase = Column(Integer, nullable=False, default=1, server_default="1")
+    # {"<plan_id>": points}; replaces the mode's points for that plan, 0 = earns nothing.
+    plan_points = Column(JSON, nullable=True)
+    # [{"plan_id": int, "points_cost": int}], 1 to 3 rows.
+    rewards = Column(JSON, nullable=True)
+    expiry_days = Column(Integer, nullable=False, default=90, server_default="90")
+    min_paid_amount = Column(Float, nullable=False, default=0, server_default="0")
+    max_redemptions_per_day = Column(Integer, nullable=False, default=1, server_default="1")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class LoyaltyLedger(Base):
+    """Every points movement for one (reseller, phone key).
+
+    kind: earn | redeem | expire | adjust. ``points`` is signed. Rows that add
+    points (earn, positive adjust) carry ``remaining`` and ``expires_at`` so
+    spending and expiry take the oldest points first. The balance is the sum
+    of ``remaining`` over rows that have not expired.
+    """
+    __tablename__ = "loyalty_ledger"
+    __table_args__ = (
+        Index("ix_loyalty_ledger_user_phone", "user_id", "phone_key"),
+        Index("ix_loyalty_ledger_expires_at", "expires_at"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    # Match key, not a dialable number: the last 9 digits (free_trial._phone_match_key).
+    phone_key = Column(String(16), nullable=False)
+    kind = Column(String(16), nullable=False)
+    points = Column(Integer, nullable=False)
+    remaining = Column(Integer, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    # Exactly-once: one earn per payment (and the redemption's own payment).
+    customer_payment_id = Column(
+        Integer, ForeignKey("customer_payments.id", ondelete="SET NULL"),
+        nullable=True, unique=True,
+    )
+    customer_id = Column(Integer, ForeignKey("customers.id", ondelete="SET NULL"), nullable=True)
+    plan_id = Column(Integer, ForeignKey("plans.id", ondelete="SET NULL"), nullable=True)
+    note = Column(String(255), nullable=True)
+    created_by = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class LoyaltyCode(Base):
+    """One-time SMS code that lets a device that never paid see and spend points."""
+    __tablename__ = "loyalty_codes"
+    __table_args__ = (
+        Index("ix_loyalty_codes_user_phone", "user_id", "phone_key"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    phone_key = Column(String(16), nullable=False)
+    mac = Column(String(50), nullable=False)
+    code_hash = Column(String(64), nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    used_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 class Payment(Base):
     __tablename__ = "payments"

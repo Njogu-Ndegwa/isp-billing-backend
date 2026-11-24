@@ -159,6 +159,7 @@ from app.api.access_credential_routes import router as access_credential_router
 from app.api.shop_routes import router as shop_router
 from app.api.portal_routes import router as portal_router
 from app.api.messaging_routes import router as messaging_router
+from app.api.loyalty_routes import router as loyalty_router
 from app.api.admin_messaging_routes import router as admin_messaging_router
 from app.api.messaging_provider_routes import router as messaging_provider_router
 from app.api.admin_subscription_reminder_routes import router as admin_subscription_reminder_router
@@ -223,6 +224,7 @@ app.include_router(access_credential_router)
 app.include_router(shop_router)
 app.include_router(portal_router)
 app.include_router(messaging_router)
+app.include_router(loyalty_router)
 app.include_router(admin_messaging_router)
 app.include_router(messaging_provider_router)
 app.include_router(admin_subscription_reminder_router)
@@ -2668,6 +2670,35 @@ async def run_free_trial_migrations():
     logger.info("Free trial migrations complete")
 
 
+async def run_loyalty_migrations():
+    """Loyalty points (app/services/loyalty.py): three new tables and the
+    provisioning entrypoint label a redemption is delivered under. New tables
+    only, created with the checkfirst create_all pattern. Idempotent: safe to
+    run on every startup."""
+    from sqlalchemy import inspect
+
+    async with async_engine.begin() as conn:
+        await conn.execute(sa_text(
+            "ALTER TYPE provisioningattemptentrypoint "
+            "ADD VALUE IF NOT EXISTS 'loyalty_redemption'"
+        ))
+
+        def existing_tables(connection):
+            return set(inspect(connection).get_table_names())
+
+        tables = await conn.run_sync(existing_tables)
+        from app.db.models import LoyaltyCode, LoyaltyLedger, LoyaltySettings
+        targets = [LoyaltySettings, LoyaltyLedger, LoyaltyCode]
+        to_create = [m.__table__ for m in targets if m.__tablename__ not in tables]
+        if to_create:
+            await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=to_create))
+            logger.info(
+                "Loyalty migration: created %s",
+                ", ".join(t.name for t in to_create),
+            )
+    logger.info("Loyalty migrations complete")
+
+
 async def run_payment_history_retention_migrations():
     """Keep payment history intact even if a deletion path misses a guard."""
     if async_engine.dialect.name != "postgresql":
@@ -4194,6 +4225,11 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Free trial migration failed (non-fatal): {e}")
 
+    try:
+        await run_loyalty_migrations()
+    except Exception as e:
+        logger.error(f"Loyalty migration failed (non-fatal): {e}")
+
     await run_payment_history_retention_migrations()
 
     try:
@@ -4542,6 +4578,35 @@ async def startup_event():
         replace_existing=True,
         max_instances=1,
         misfire_grace_time=120,
+    )
+    # Loyalty points for recent payments. The receipt SMS awards the payments
+    # it texts about itself (same exactly-once function), so this only covers
+    # everything else.
+    from app.services.loyalty import (
+        AWARD_SWEEP_SECONDS as LOYALTY_AWARD_SWEEP_SECONDS,
+        award_points_background as loyalty_award_points_background,
+        expire_points_background as loyalty_expire_points_background,
+    )
+    scheduler.add_job(
+        loyalty_award_points_background,
+        trigger=IntervalTrigger(seconds=LOYALTY_AWARD_SWEEP_SECONDS),
+        id='loyalty_award_points',
+        name='Award loyalty points for recent payments',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
+    # 22:10 UTC = 01:10 EAT, outside the 02:30-03:30 EAT window.
+    scheduler.add_job(
+        loyalty_expire_points_background,
+        trigger=CronTrigger(hour=22, minute=10),
+        id='loyalty_expire_points',
+        name='Expire loyalty points past their expiry',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
     )
     scheduler.add_job(
         send_payment_receipts_background,

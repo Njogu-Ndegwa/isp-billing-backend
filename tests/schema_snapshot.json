@@ -693,6 +693,47 @@
   "updated_at",
   "user_id"
  ],
+ "loyalty_codes": [
+  "attempts",
+  "code_hash",
+  "created_at",
+  "expires_at",
+  "id",
+  "mac",
+  "phone_key",
+  "used_at",
+  "user_id"
+ ],
+ "loyalty_ledger": [
+  "created_at",
+  "created_by",
+  "customer_id",
+  "customer_payment_id",
+  "expires_at",
+  "id",
+  "kind",
+  "note",
+  "phone_key",
+  "plan_id",
+  "points",
+  "remaining",
+  "user_id"
+ ],
+ "loyalty_settings": [
+  "created_at",
+  "earn_mode",
+  "enabled",
+  "enabled_at",
+  "expiry_days",
+  "kes_per_point",
+  "max_redemptions_per_day",
+  "min_paid_amount",
+  "plan_points",
+  "points_per_purchase",
+  "rewards",
+  "updated_at",
+  "user_id"
+ ],
  "message_templates": [
   "body",
   "created_at",

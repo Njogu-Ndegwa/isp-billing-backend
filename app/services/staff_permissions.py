@@ -511,6 +511,13 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     (("POST",), "/api/messaging/credits/purchase", "subscription.manage",
      "Bought SMS credits"),
 
+    # --- loyalty points (app/api/loyalty_routes.py) ---------------------------
+    ((R,), "/api/loyalty/settings", "customers.view", None),
+    (("PUT",), "/api/loyalty/settings", "customers.manage", "Changed loyalty points settings"),
+    ((R,), "/api/loyalty/members", "customers.view", None),
+    (("POST",), "/api/loyalty/adjust", "customers.manage", "Adjusted a customer's loyalty points"),
+    ((R,), "/api/loyalty/summary", "customers.view", None),
+
     # --- messaging ----------------------------------------------------------
     ((R,), "/api/messaging/campaigns", "messaging.send", None),
     ((R,), "/api/messaging/campaigns/{campaign_id}", "messaging.send", None),

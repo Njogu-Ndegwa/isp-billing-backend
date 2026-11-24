@@ -1229,11 +1229,14 @@ async def get_payment_status(
 
         access_code = None
         max_devices = None
-        if (
+        paying_device = bool(
             mac
             and customer.mac_address
             and validate_mac_address(mac)
             and normalize_mac_address(mac) == normalize_mac_address(customer.mac_address)
+        )
+        if (
+            paying_device
             and customer.status == CustomerStatus.ACTIVE
             and customer.subscription_owner_id is None
             and customer.router_id
@@ -1255,6 +1258,17 @@ async def get_payment_status(
         from app.api.fapshi_routes import customer_payment_flags
         confirmation = await customer_payment_flags(db, customer.id)
         mpesa_failure = await _portal_mpesa_failure(db, customer)
+
+        # {earned, balance} once this payment's loyalty award exists, for the
+        # paying device only (same gate as access_code: ids are sequential).
+        loyalty_award = None
+        if paying_device and customer.status == CustomerStatus.ACTIVE:
+            from app.services.loyalty import award_for_latest_payment
+
+            try:
+                loyalty_award = await award_for_latest_payment(customer)
+            except Exception as loyalty_err:
+                logger.warning("Loyalty award lookup failed for customer %s: %s", customer.id, loyalty_err)
         return {
             "customer_id": customer.id,
             "status": customer.status.value,
@@ -1267,6 +1281,7 @@ async def get_payment_status(
             "max_devices": max_devices,
             # {reason_key, reason, next_step} once M-Pesa confirmed the prompt failed
             "mpesa_failure": mpesa_failure,
+            "loyalty": loyalty_award,
         }
     except HTTPException:
         raise
@@ -1283,6 +1298,7 @@ GATEWAY_REFERENCE_PREFIXES = ("ZENO-", "MTN-", "FAPSHI-")
 _CP_SOURCE_BY_PREFIX = (
     ("VOUCHER-", "voucher"),
     ("FREE-TRIAL-", "free_trial"),
+    ("LOYALTY-", "loyalty"),
     ("ZENO-", "zenopay"),
     ("MTN-", "mtn_momo"),
     ("FAPSHI-", "fapshi"),
