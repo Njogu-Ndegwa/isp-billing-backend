@@ -422,12 +422,18 @@ async def receive_usage_push(
         # Health goes to its own table in its own short session, after the
         # usage ingest has committed; failures never affect the push response.
         r = payload.router
+        wan_link_downs = r.wan_link_downs
+        if wan_link_downs is None and payload.ports:
+            # The installed v3 reporter sends the WAN's counter only as a row
+            # of the ports list (graph history: WAN link drops).
+            wan_link_downs = router_health.wan_link_downs_from_ports(
+                payload.ports, r.iface_rx_bytes, r.iface_tx_bytes)
         sample = router_health.HealthSample(
             cpu_load=r.cpu_load, memory_free_bytes=r.free_memory,
             memory_total_bytes=r.total_memory, storage_free_bytes=r.free_hdd,
             storage_total_bytes=r.total_hdd, uptime_seconds=r.uptime,
             routeros_version=r.version, board_name=r.board,
-            wan_link_downs=r.wan_link_downs,
+            wan_link_downs=wan_link_downs,
         )
         if not sample.is_empty():
             # ``now`` above is a monotonic clock for rate limiting; health rows

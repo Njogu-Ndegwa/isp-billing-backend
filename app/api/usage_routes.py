@@ -679,13 +679,22 @@ async def get_router_live(
 
 
 class HealthHistorySummaryOut(BaseModel):
+    """Range totals. p95/p99 are over the range's bucket averages (5-minute for
+    24h, hourly for 7d); max is the highest single reading."""
     cpu_avg: Optional[float]
+    cpu_p95: Optional[float]
+    cpu_p99: Optional[float]
     cpu_max: Optional[int]
     mem_avg: Optional[float]
+    mem_p95: Optional[float]
+    mem_p99: Optional[float]
     mem_max: Optional[int]
     reboots: int
     link_drops: int
     buckets_with_data: int
+    last_report_at: Optional[datetime]
+    reporting: bool
+    link_drops_reported: bool
 
 
 class HealthHistoryOut(BaseModel):
@@ -721,6 +730,54 @@ async def get_router_health_history(
     if (await db.execute(stmt)).scalar_one_or_none() is None:
         raise HTTPException(status_code=404, detail="Router not found or not accessible")
     return await router_metric_history.history(db, router_id, range_key)
+
+
+class RouterHealthRankOut(BaseModel):
+    router_id: int
+    name: str
+    owner_id: int
+    owner_name: Optional[str]
+    online: bool
+    board: Optional[str]
+    last_report_at: Optional[datetime]
+    reporting: bool
+    link_drops_reported: bool
+    cpu_avg: Optional[float] = None
+    cpu_p95: Optional[float] = None
+    cpu_p99: Optional[float] = None
+    cpu_max: Optional[int] = None
+    mem_avg: Optional[float] = None
+    mem_p95: Optional[float] = None
+    mem_p99: Optional[float] = None
+    mem_max: Optional[int] = None
+    reboots: int = 0
+    link_drops: int = 0
+    buckets_with_data: int = 0
+
+
+class RouterHealthRankingOut(BaseModel):
+    range: str
+    step_seconds: int
+    start: datetime
+    routers: list[RouterHealthRankOut]
+    not_reporting: list[RouterHealthRankOut]
+
+
+@router.get("/api/router-health/ranking", response_model=RouterHealthRankingOut)
+async def get_router_health_ranking(
+    range_key: str = Query("24h", alias="range", pattern="^(24h|7d)$"),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Which routers are most loaded: every router of the caller (all routers
+    for an admin) with CPU and memory average, p95, p99 and peak over the last
+    24 hours or 7 days, plus reboots and WAN link drops, busiest (CPU p95)
+    first. ``not_reporting`` lists online routers that sent no health reading
+    in the range, so they have no graph. p95/p99 are over 5-minute averages for
+    24h and hourly averages for 7d."""
+    user = await get_current_user(token, db)
+    owner_id = None if user.role == UserRole.ADMIN else user.id
+    return await router_metric_history.ranking(db, range_key, owner_id=owner_id)
 
 
 async def _live_router_ids_for(db: AsyncSession, user) -> list[int]:
