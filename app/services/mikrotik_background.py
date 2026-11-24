@@ -1099,9 +1099,14 @@ def _remove_router_bindings_sync(router_info: dict, orphan_macs: set[str]) -> in
 async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
     total_removed = 0
     try:
-        stmt = select(Router)
-        result = await db.execute(stmt)
-        routers = result.scalars().all()
+        from app.db.models import User
+        from app.services.ops_health import is_owner_cut_off
+
+        result = await db.execute(
+            select(Router, User.subscription_status)
+            .outerjoin(User, User.id == Router.user_id)
+        )
+        rows = result.all()
 
         now = datetime.utcnow()
         active_macs = await _load_authorized_bypass_macs(
@@ -1151,15 +1156,32 @@ async def _cleanup_bypassing_for_all_routers(db: AsyncSession) -> int:
 
         eligible = []
         skipped_offline = 0
-        for r in routers:
+        skipped_cut_off = 0
+        for r, owner_status in rows:
             if getattr(r, "auth_method", None) == "RADIUS":
+                continue
+            if is_owner_cut_off(owner_status):
+                # A suspended/inactive reseller's routers are not probed by the
+                # reachability job, so last_checked_at freezes and
+                # _router_recently_offline() stops skipping them. On 2026-11-23
+                # that was 238 dead routers, each a 5 s connect timeout, pushed
+                # through the 3 shared fleet slots on every run. The scan never
+                # finished inside its 73 s interval, so the bandwidth poller
+                # waited 150-330 s for a slot before every router read and
+                # poll-only routers (hAP lites, router 750 TOLE #1) went
+                # unread for a day: their customers showed 0 MB.
+                skipped_cut_off += 1
                 continue
             if _router_recently_offline(r, now):
                 skipped_offline += 1
                 continue
             eligible.append(r)
-        if skipped_offline:
-            logger.info("[SAFETY-NET] Skipping %d recently-offline router(s)", skipped_offline)
+        if skipped_offline or skipped_cut_off:
+            logger.info(
+                "[SAFETY-NET] Skipping %d recently-offline router(s), %d of cut-off owners",
+                skipped_offline,
+                skipped_cut_off,
+            )
         candidate_outcomes = await asyncio.gather(
             *[_find_candidates_task(r) for r in eligible],
             return_exceptions=True,
