@@ -64,6 +64,10 @@ the old script is the opt-out. No redeploy per batch.
   - First real auto-install: 542 Gnet #7 on 2026-09-28.
 - Each app start re-queues it once (3 min after start) for routers added in the last 24 h that aren't pushing. A deploy used to lose the pending in-memory install.
 - Kill switch: `REALTIME_PUSH_INSTALL_AT_SETUP=false`.
+- Rule (Dennis, 2026-11-24): every new router gets the same health monitoring, including
+  graphs, p95/p99, the Router load ranking and WAN drops, with hAP lites protected from
+  overload. See AGENTS.md "Router Health Monitoring (every router, new ones too)". It is
+  enforced by `tests/test_new_router_health_contract.py`.
 - Dennis (2026-09-27): no scheduled sweep. Existing routers that missed it are covered by re-running the script over online, non-pushing routers.
 
 ## Tools
