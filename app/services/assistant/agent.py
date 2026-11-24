@@ -1545,6 +1545,15 @@ class Turn:
                         # after a typed go-ahead or a tap, "tap Confirm" points at a card already on
                         # screen: never make it again
                         return
+                    if self._streamed:
+                        # The words sent back were a finished answer (NEXT line and all). Take them
+                        # off the screen and the transcript, as for words next to a lookup, so the
+                        # answer that follows is the only one; keep them only if nothing follows.
+                        await self.queue.put({"type": "retract", "chars": len(self._streamed)})
+                        if self.transcript and self.transcript[-1].get("type") == "assistant":
+                            self.transcript.pop()
+                        self._aside = said.strip() or self._aside
+                        self._spoke = spoke_before
                     self.messages.append({"role": "user", "content": [{"type": "text", "text": (
                         "[Check] You told the person a form or change is ready, but you did not call "
                         "call_api for it in this answer, so nothing is on their screen. Call "

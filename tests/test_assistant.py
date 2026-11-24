@@ -1346,6 +1346,39 @@ async def test_saying_a_form_is_ready_without_one_is_sent_back_once(client, owne
 
 
 @pytest.mark.asyncio
+async def test_an_answer_sent_back_by_the_check_is_taken_off_the_screen(client, owner, db):
+    """CR-1124-T3: a finished answer (with its NEXT line) said "tap Confirm" with nothing proposed;
+    the check sent it back, a card was made and a second answer followed. The person must see one
+    answer, with one NEXT line at its end, not both with the first NEXT line in the middle."""
+    _, token = owner
+    use_model([
+        text_reply("The plan is already on screen; tap Confirm on that card.\n\nNEXT: Show my plans | Who is online?"),
+        tool_reply("describe_action", {"method": "POST", "path": "/api/plans/create"}, "tu_d"),
+        tool_reply("call_api", {"method": "POST", "path": "/api/plans/create", "form": True, "body": {}}),
+        text_reply("The plan form is below. It runs when you tap Confirm.\n\nNEXT: Show my plans | Who expires today?"),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "Add a daily plan"},
+                                           headers=auth(token))).text)
+    assert any(e["type"] == "action" and e.get("form") for e in events)
+    assert any(e["type"] == "retract" for e in events)
+    shown = visible_text(events)
+    assert shown == "The plan form is below. It runs when you tap Confirm.\n\nNEXT: Show my plans | Who expires today?"
+    assert shown.count("NEXT:") == 1
+    stored = (await client.get(f"/api/assistant/conversations/{events[0]['id']}", headers=auth(token))).json()
+    said = [t["text"] for t in stored["transcript"] if t["type"] == "assistant"]
+    assert said == [shown]
+
+    # sent back, and the model then adds nothing: the first answer is all there is, so it stays
+    use_model([
+        text_reply("Fill it in and tap Confirm.\n\nNEXT: Show my plans"),
+        text_reply(""),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "Add a weekly plan"},
+                                           headers=auth(token))).text)
+    assert visible_text(events) == "Fill it in and tap Confirm.\n\nNEXT: Show my plans"
+
+
+@pytest.mark.asyncio
 async def test_only_what_answers_the_question_is_drawn(client, owner, db):
     reseller, token = owner
     await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
