@@ -56,6 +56,8 @@ def purpose_problem(field: dict, typed: Optional[dict], body: Any) -> Optional[s
         now = body.get(name) if isinstance(body, dict) else None
     label = str(field.get("label") or name)
     now_plain = _plain(now, field)
+    if now_plain in ("", []) and field.get("clears") and _plain(field.get("original"), field) not in ("", []):
+        return None  # emptied to remove it (a plan's badge): the API clears it
     if now_plain in ("", []) and field.get("kind") != "boolean":
         return (f"Not run yet: this form was opened to set {label}, and {label} is still empty. "
                 f"Type it on the card, then tap Confirm.")
