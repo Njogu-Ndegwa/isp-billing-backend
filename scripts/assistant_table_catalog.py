@@ -1,7 +1,7 @@
-"""Write the list of GET routes a reseller's assistant can draw as a table, for the admin
+"""Write the list of read routes (GET and read-only POST) a reseller's assistant can draw as a table, for the admin
 frontend's table-spec test (isp-billing-admin app/lib/__tests__/fixtures/assistantCatalogGets.json).
 
-Every GET route the assistant's catalog shows a reseller is listed with its template and,
+Every read route the assistant's catalog shows a reseller is listed with its template and,
 when the route declares a response model, one sample row built from that schema (field
 names with typed placeholder values; no real data). The frontend test checks that each
 route either has a table spec or that the generic fallback hides ids, MACs, raw RouterOS
@@ -21,7 +21,7 @@ warnings.filterwarnings("ignore")
 
 from main import app  # noqa: E402
 from app.services.assistant.caller import Caller  # noqa: E402
-from app.services.assistant.catalog import Catalog  # noqa: E402
+from app.services.assistant.catalog import READ_ONLY_POSTS, Catalog  # noqa: E402
 
 SPEC = app.openapi()
 SCHEMAS = SPEC.get("components", {}).get("schemas", {})
@@ -86,10 +86,12 @@ def main(out_path: str) -> None:
     reseller = Caller(user_id=1, role="reseller", authorization="Bearer x")
     rows = []
     for action in catalog.for_caller(reseller):
-        if action.method != "GET":
+        # every read the assistant can draw: GETs, and the POSTs that only read
+        if action.method != "GET" and not (action.method == "POST" and action.template in READ_ONLY_POSTS):
             continue
-        op = SPEC["paths"].get(action.template, {}).get("get", {})
-        rows.append({"template": action.template, "title": action.title, "sample": _sample_row(op)})
+        op = SPEC["paths"].get(action.template, {}).get(action.method.lower(), {})
+        rows.append({"template": action.template, "method": action.method, "title": action.title,
+                     "sample": _sample_row(op)})
     rows.sort(key=lambda r: r["template"])
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(rows, fh, indent=1, ensure_ascii=False)
