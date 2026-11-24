@@ -735,6 +735,18 @@ def _ago(seconds: int) -> str:
     return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
 
 
+def _local_zone(user):
+    """The time zone of the reader's market, or None if it cannot be had (then no clock time is shown)."""
+    from zoneinfo import ZoneInfo
+
+    from app.services.markets import reseller_market
+
+    try:
+        return ZoneInfo(reseller_market(user).timezone)
+    except Exception:  # missing tzdata or a bad zone name: "N minutes ago" alone still reads right
+        return None
+
+
 def _reset_pppoe_session_sync(router_info: dict, username: str, keep_fresh: bool) -> dict:
     """Read the live session, then drop it unless it just started and ``keep_fresh``."""
     from app.services.mikrotik_api import MikroTikAPI
@@ -800,6 +812,7 @@ async def reset_customer_session(
     info = router_info_of(router_obj)
     username = customer.pppoe_username
     owner_id = customer.user_id
+    local_zone = _local_zone(user)  # read before the commit expires `user`
     # Only a paying customer's new session is a connection worth keeping: an expired
     # one's can be the walled payment-page session.
     keep_fresh = not force and customer.status == CustomerStatus.ACTIVE
@@ -836,11 +849,12 @@ async def reset_customer_session(
         _last_reset.pop(customer_id, None)  # nothing happened: "Do it anyway" must not wait
         uptime = int(fresh["uptime_seconds"])
         since = datetime.now(timezone.utc) - timedelta(seconds=uptime)
+        clock = f" (at {since.astimezone(local_zone):%H:%M %Z})" if local_zone else ""
         raise HTTPException(status_code=409, detail={
             "code": "customer_already_online",
             "message": (
                 f"The customer is already back online: their router reconnected by itself "
-                f"{_ago(uptime)} (at {since:%H:%M} UTC)"
+                f"{_ago(uptime)}{clock}"
                 + (f" and has IP {fresh['ip']}" if fresh.get("ip") else "")
                 + ". Resetting now would drop that working connection."
             ),

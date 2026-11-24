@@ -8,6 +8,7 @@ sessions each test puts there.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import pytest
 from fastapi import HTTPException
@@ -130,6 +131,30 @@ async def test_a_customer_who_just_came_back_online_is_not_dropped(db, ppp):
     assert out["disconnected"] == 1 and ppp.sessions == []
     event = (await db.execute(select(CustomerEvent))).scalar_one()
     assert event.event_type == "session_reset" and event.details == {"disconnected": 1, "forced": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("market_code, zone, label", [
+    ("KE", "Africa/Nairobi", "EAT"),
+    ("ZM", "Africa/Lusaka", "CAT"),
+    ("HT", "America/Port-au-Prince", None),  # EST or EDT, depending on the day
+])
+async def test_the_refusal_gives_the_reconnect_time_in_the_resellers_local_time(
+        db, ppp, market_code, zone, label):
+    from zoneinfo import ZoneInfo
+
+    reseller, customer = await _pppoe_customer(db)
+    reseller.market_code = market_code
+    await db.commit()
+    ppp.sessions = [_session("acc_0043", "1m12s")]
+
+    with pytest.raises(HTTPException) as exc:
+        await customer_audit_routes.reset_customer_session(customer.id, db, _token(reseller))
+    detail = exc.value.detail
+    local = datetime.fromisoformat(detail["connected_at"]).astimezone(ZoneInfo(zone))
+    assert f"1 minute ago (at {local:%H:%M} {label or local.tzname()})" in detail["message"]
+    assert "UTC" not in detail["message"]
+    assert exc.value.status_code == 409 and detail["code"] == "customer_already_online"
 
 
 @pytest.mark.asyncio
