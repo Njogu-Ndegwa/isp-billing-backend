@@ -1506,6 +1506,15 @@ async def configure_router_insurance_wireguard(
     token_obj = await _latest_router_provisioning_token(db, router_obj.id)
     token_tunnel_type = _token_tunnel_type(token_obj)
 
+    from app.services.insurance_tunnel_batch import HETZNER_MANAGEMENT_TUNNELS
+    if request.apply and getattr(router_obj, "management_tunnel", None) in HETZNER_MANAGEMENT_TUNNELS:
+        # Same rule as the batch: its only management tunnel already ends on
+        # Hetzner at 10.251.X.Y, and the insurance tunnel derives that same
+        # address, server and port, so it would fight the live tunnel.
+        raise HTTPException(status_code=409, detail=(
+            f"Router already manages over Hetzner ({router_obj.management_tunnel}); "
+            "a backup tunnel would duplicate it"))
+
     try:
         backup_ip = request.backup_ip or derive_insurance_ip(router_obj.ip_address)
     except InsuranceWireGuardError as exc:
