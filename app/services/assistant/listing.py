@@ -13,6 +13,7 @@ customers" once came back with the inactive ones too.
 from __future__ import annotations
 
 from contextvars import ContextVar
+import json
 from datetime import datetime, timedelta, timezone
 import re
 from typing import Any, Optional
@@ -282,17 +283,33 @@ def _fields_of(rows: list) -> list[str]:
 
 
 def narrow(data: Any, where: Any = None, sort: Any = None, limit: Any = None,
-           tz_name: Optional[str] = None) -> tuple[Any, Optional[dict]]:
+           tz_name: Optional[str] = None, params: Optional[list] = None) -> tuple[Any, Optional[dict]]:
     """``data`` with its list narrowed, and a note for the model (None when nothing was asked).
-    Calendar moments in rules (today_end, month_start) are days in ``tz_name``."""
+    Calendar moments in rules (today_end, month_start) are days in ``tz_name``. ``params`` are
+    the names of the action's query parameters: a rule on a field the rows lack but the action
+    takes as a query parameter is answered with how to send it."""
     token = _TIMES.set({})
     try:
-        return _narrow(data, where, sort, limit, tz_name)
+        return _narrow(data, where, sort, limit, tz_name, params or [])
     finally:
         _TIMES.reset(token)
 
 
-def _narrow(data: Any, where: Any, sort: Any, limit: Any, tz_name: Optional[str]) -> tuple[Any, Optional[dict]]:
+def _missing_field(name: str, known: list[str], rules: list[dict], params: list) -> str:
+    """Why a rule's field is not there, and what to send instead when it is a query parameter."""
+    if name in params:
+        rule = next((r for r in rules if r["field"] == name), None)
+        value = rule.get("value") if rule and rule.get("op") in ("eq", None) and "value" in rule else None
+        shown = json.dumps({name: value if value is not None else "..."}, ensure_ascii=False)
+        # OPIC's "who is online" (2026-11-24): where online=true failed, and the model fell
+        # back to the router's raw hotspot list instead of the customers' own online filter
+        return (f"'{name}' is a query parameter of this endpoint, not a row field: call it again "
+                f"with query {shown} and leave it out of where/sort.")
+    return f"No row has a field '{name}'. The rows' fields are: {', '.join(known[:40])}."
+
+
+def _narrow(data: Any, where: Any, sort: Any, limit: Any, tz_name: Optional[str],
+            params: list) -> tuple[Any, Optional[dict]]:
     if where is None and sort is None and limit is None:
         return data, None
     rows, key = find_list(data)
@@ -302,8 +319,7 @@ def _narrow(data: Any, where: Any, sort: Any, limit: Any, tz_name: Optional[str]
     known = _fields_of(rows)
     for name in [r["field"] for r in rules] + ([sort["field"]] if isinstance(sort, dict) and sort.get("field") else []):
         if rows and all(_get(r, name) is _MISSING for r in rows):
-            raise ListingError(
-                f"No row has a field '{name}'. The rows' fields are: {', '.join(known[:40])}.")
+            raise ListingError(_missing_field(name, known, rules, params))
     kept = [r for r in rows if all(_holds(r, rule, tz_name) for rule in rules)]
     if isinstance(sort, dict) and sort.get("field"):
         field, desc = sort["field"], bool(sort.get("desc"))

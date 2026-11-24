@@ -1019,7 +1019,14 @@ async def get_router_users(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token)
 ):
-    """Get all hotspot users for a specific router. Runs in thread pool."""
+    """The router's raw hotspot user list (RouterOS /ip/hotspot/user, technical).
+
+    Each user is a router account (usually named after a device's MAC) with its profile,
+    comment and live session counters; ``customer`` is the billing customer with that MAC
+    on this router, when there is one. To answer "who is online" read
+    GET /api/customers?online=true; for a router's hotspot clients with names and live
+    speed read GET /api/hotspot/{router_id}/users. Runs in thread pool.
+    """
     user = await get_current_user(token, db)
     router_obj = await get_router_by_id(db, router_id, user.id, user.role.value)
     if not router_obj:
@@ -1041,13 +1048,40 @@ async def get_router_users(
         logger.error(f"Failed to connect to router {router_obj.name} at {router_obj.ip_address}")
         raise HTTPException(status_code=500, detail="Failed to connect to router")
 
+    users = result["users"]
+    await _attach_router_user_customers(db, router_id, users)
     return {
         "router_id": router_id,
         "router_name": router_obj.name,
-        "users": result["users"],
-        "total_users": len(result["users"]),
+        "users": users,
+        "total_users": len(users),
         "active_sessions": result["active_sessions_count"]
     }
+
+
+async def _attach_router_user_customers(db: AsyncSession, router_id: int, users: list) -> None:
+    """Put the billing customer (by MAC, on this router) on each hotspot user, so a list of
+    router accounts reads as people. One short query after the router call; no router I/O."""
+    macs = {_normalize_mac_safe(u.get("username")) for u in users if u.get("username")}
+    macs.discard("")
+    if not macs:
+        return
+    rows = (await db.execute(
+        select(Customer).options(selectinload(Customer.plan))
+        .where(Customer.router_id == router_id, func.upper(Customer.mac_address).in_(macs))
+    )).scalars().all()
+    await db.commit()
+    by_mac = {_normalize_mac_safe(c.mac_address): c for c in rows}
+    for u in users:
+        c = by_mac.get(_normalize_mac_safe(u.get("username")))
+        if c is not None:
+            u["customer"] = {
+                "id": c.id,
+                "name": c.name,
+                "plan": c.plan.name if c.plan else None,
+                "status": c.status.value if c.status else None,
+                "expiry": c.expiry.isoformat() if c.expiry else None,
+            }
 
 
 @router.delete("/api/routers/{router_id}/users/{username}")

@@ -1555,6 +1555,48 @@ async def test_any_list_is_narrowed_by_its_rows_before_it_is_drawn(client, owner
 
 
 @pytest.mark.asyncio
+async def test_a_rule_on_a_query_parameter_says_to_send_it_as_one(client, owner, db):
+    """OPIC 2026-11-24: where online=true on the customer list failed with a bare "no such
+    field", and the model fell back to the router's raw hotspot accounts. The error now says
+    online is a query parameter of that endpoint, and how to send it."""
+    reseller, token = owner
+    plan = await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    await make_customer(db, reseller, plan, name="On Daily", phone="254700000012")
+    await db.commit()
+    model = use_model([
+        tool_reply("call_api", {"method": "GET", "path": "/api/customers", "show": "table",
+                                "where": [{"field": "online", "op": "eq", "value": True}]}, "tu_1"),
+        text_reply("Done."),
+    ])
+    await client.post("/api/assistant/chat", json={"message": "who is online?"}, headers=auth(token))
+    told = [res for req in model.requests for res in tool_results(req)]
+    assert "'online' is a query parameter of this endpoint" in told[0]["error"]
+    assert '{"online": true}' in told[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_path_value_sent_in_query_goes_into_the_path(client, owner, db):
+    """"/api/customers/{customer_id}" with customer_id in query reads that customer instead
+    of failing with "A path value is missing"; with no value anywhere, the error shows where it goes."""
+    reseller, token = owner
+    plan = await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
+    c = await make_customer(db, reseller, plan, name="Wanjiru", phone="254700000013")
+    await db.commit()
+    model = use_model([
+        tool_reply("call_api", {"method": "GET", "path": "/api/customers/{customer_id}", "show": "card",
+                                "query": {"customer_id": c.id}}, "tu_1"),
+        tool_reply("call_api", {"method": "GET", "path": "/api/customers/{customer_id}"}, "tu_2"),
+        text_reply("Done."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "show Wanjiru"},
+                                           headers=auth(token))).text)
+    drawn = [e for e in events if e["type"] == "data"]
+    assert drawn and drawn[0]["path"] == f"/api/customers/{c.id}" and drawn[0]["payload"]["name"] == "Wanjiru"
+    told = [res for req in model.requests for res in tool_results(req)]
+    assert "GET /api/customers/<customer_id>" in told[1]["error"]
+
+
+@pytest.mark.asyncio
 async def test_a_narrowed_list_reads_every_page_first(client, owner, db):
     """"Whose time ends today" read from page one of many would quietly miss the rest."""
     from datetime import datetime, timedelta as td
