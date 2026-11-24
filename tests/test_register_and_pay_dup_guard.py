@@ -176,3 +176,27 @@ async def test_new_customer_with_no_record_is_unaffected(engine, db, client):
 
     assert resp.status_code == 200, resp.text
     assert stk.await_count == 1
+
+
+@pytest.mark.parametrize("method", ["cash", "CASH", "card", "bank_transfer", "other"])
+async def test_public_register_and_pay_refuses_anything_but_mobile_money(client, session_factory, method):
+    """The portal endpoint has no login: a cash "payment" there would switch the customer on for
+    free and count as revenue. It must refuse before writing anything."""
+    async with session_factory() as s:
+        reseller = await make_reseller(s)
+        router = await make_router(s, reseller)
+        plan = await make_plan(s, reseller)
+        await s.commit()
+        plan_id, router_id = plan.id, router.id
+
+    class _P:  # the body helper only reads .id
+        def __init__(self, i): self.id = i
+    body = dict(_pay_body(_P(plan_id), _P(router_id)), payment_method=method)
+    resp = await client.post("/api/hotspot/register-and-pay", json=body)
+    assert resp.status_code == 400, resp.text
+
+    from sqlalchemy import func, select
+    from app.db.models import Customer, CustomerPayment
+    async with session_factory() as s:
+        assert await s.scalar(select(func.count(CustomerPayment.id))) == 0
+        assert await s.scalar(select(func.count(Customer.id)).where(Customer.mac_address == MAC)) == 0

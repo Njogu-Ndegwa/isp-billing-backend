@@ -846,6 +846,15 @@ async def register_hotspot_and_pay_api(
                 status_code=400,
                 detail=f"Invalid payment method. Must be one of: {', '.join(valid_methods)}"
             )
+        # This endpoint is public (the captive portal calls it with no login), so it
+        # only starts a mobile-money payment. Anything else (cash, card, voucher...)
+        # would be recorded as paid and switch the customer on without any money:
+        # those are recorded by the reseller's own signed-in routes.
+        if payment_method_enum != PaymentMethod.MOBILE_MONEY:
+            raise HTTPException(
+                status_code=400,
+                detail="Only mobile money can be paid here. Ask your WiFi provider for other ways to pay.",
+            )
         
         # Validate router exists and get user_id
         router_stmt = select(Router).where(Router.id == request.router_id)
