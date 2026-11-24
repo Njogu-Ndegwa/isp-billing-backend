@@ -45,6 +45,7 @@ from app.services.expiry_reaper_script import (
 )
 from app.services.mikrotik_api import LANE_BACKGROUND, MikroTikAPI
 from app.services.router_expiry import expiry_second, normalize_mac, with_exp_tag
+from app.services.hotspot_block import is_reseller_block
 
 logger = logging.getLogger(__name__)
 
@@ -257,7 +258,7 @@ def _tag_bindings(api, paid: dict[str, datetime]) -> int:
     changed = 0
     for b in api.send_command("/ip/hotspot/ip-binding/print").get("data") or []:
         mac = normalize_mac(b.get("mac-address", ""))
-        if not mac or mac not in paid:
+        if not mac or mac not in paid or is_reseller_block(b):
             continue
         comment = b.get("comment", "")
         new = with_exp_tag(comment, expiry_second(paid[mac]))

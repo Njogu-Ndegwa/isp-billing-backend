@@ -19,6 +19,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.services.hotspot_block import is_reseller_block
 from app.db.database import get_db
 from app.db.models import (
     CollectionMode,
@@ -2101,6 +2102,8 @@ async def unpair_device(
                     if bindings.get("success") and bindings.get("data"):
                         mac_normalized = device_mac.upper()
                         for b in bindings["data"]:
+                            if is_reseller_block(b):
+                                continue
                             binding_mac = b.get("mac-address", "").upper()
                             if binding_mac == mac_normalized:
                                 api.send_command("/ip/hotspot/ip-binding/remove", {".id": b[".id"]})

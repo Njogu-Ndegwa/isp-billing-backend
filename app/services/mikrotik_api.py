@@ -1719,6 +1719,9 @@ class MikroTikAPI:
                         return {"error": existing_binding["error"]}
                     if not existing_binding.get("found") or not existing_binding.get("data"):
                         return {"error": f"IP binding for {mac_address} already existed but could not be found for update"}
+                    from app.services.hotspot_block import BLOCKED_DELIVERY_ERROR, is_reseller_block
+                    if is_reseller_block(existing_binding["data"]):
+                        return {"error": BLOCKED_DELIVERY_ERROR}
 
                     time.sleep(CMD_DELAY)
                     binding_result = self.send_command("/ip/hotspot/ip-binding/set", {
@@ -1916,7 +1919,10 @@ class MikroTikAPI:
             bindings = self.send_command("/ip/hotspot/ip-binding/print")
             results["ip_binding_removed"] = 0
             if bindings.get("success") and bindings.get("data"):
+                from app.services.hotspot_block import is_reseller_block
                 for binding in bindings["data"]:
+                    if is_reseller_block(binding):
+                        continue
                     binding_mac = binding.get("mac-address", "").upper()
                     binding_name = binding.get("name", "").upper()
                     # Match by MAC address OR by name field

@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 
+from app.services.hotspot_block import is_reseller_block
 from app.db.database import get_db
 from app.db.models import (
     Router, Customer, Plan, Ad, CustomerStatus, PlanType,
@@ -117,6 +118,8 @@ def _register_mac_on_mikrotik_sync(router_info: dict, registration_data: dict) -
             if bindings.get("success") and bindings.get("data"):
                 for b in bindings["data"]:
                     if normalize_mac_address(b.get("mac-address", "")) == normalized_mac:
+                        if is_reseller_block(b):
+                            break  # blocked by the reseller: stays blocked
                         api.send_command("/ip/hotspot/ip-binding/set", {
                             "numbers": b[".id"],
                             "type": "bypassed"
@@ -579,8 +582,9 @@ async def cleanup_blocked_bindings_public():
             if bindings.get("success") and bindings.get("data"):
                 for b in bindings["data"]:
                     binding_type = b.get("type", "")
-                    # Remove blocked bindings (type=blocked shows as "B" in Winbox)
-                    if binding_type == "blocked":
+                    # Remove blocked bindings (type=blocked shows as "B" in Winbox),
+                    # never a block a reseller added on purpose.
+                    if binding_type == "blocked" and not is_reseller_block(b):
                         mac = b.get("mac-address", "unknown")
                         api.send_command("/ip/hotspot/ip-binding/remove", {"numbers": b[".id"]})
                         removed_count += 1
@@ -1235,7 +1239,8 @@ def _cleanup_old_mac_from_router_sync(router_info: dict, old_mac: str) -> dict:
         # makes the old device pass through the captive portal again.
         _remove(
             "/ip/hotspot/ip-binding", _print("/ip/hotspot/ip-binding"),
-            lambda row: normalize_mac_address(row.get("mac-address", "")) == normalized,
+            lambda row: (normalize_mac_address(row.get("mac-address", "")) == normalized
+                         and not is_reseller_block(row)),
             "bindings",
         )
         _remove(
@@ -1294,7 +1299,8 @@ def _cleanup_old_mac_from_router_sync(router_info: dict, old_mac: str) -> dict:
 
         _verify(
             "/ip/hotspot/ip-binding", "bindings",
-            lambda row: normalize_mac_address(row.get("mac-address", "")) == normalized,
+            lambda row: (normalize_mac_address(row.get("mac-address", "")) == normalized
+                         and not is_reseller_block(row)),
         )
         _verify(
             "/ip/hotspot/active", "sessions",

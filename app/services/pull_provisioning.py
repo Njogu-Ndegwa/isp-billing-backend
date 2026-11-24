@@ -16,6 +16,7 @@ import re
 import logging
 from datetime import datetime
 
+from app.services.hotspot_block import BLOCK_TAG
 from app.services.router_expiry import binding_comment
 
 logger = logging.getLogger(__name__)
@@ -119,6 +120,9 @@ def render_hotspot_provision_rsc(
          f'profile="{profile}" limit-uptime="{uptime}" comment="{cm}" }} '
          f'else={{ set [find name="{user}"] password="{pw}" profile="{profile}" '
          f'limit-uptime="{uptime}" comment="{cm}" }}'),
+        # A reseller's block (BLOCK_TAG) is never turned back into a bypass.
+        (f':if ([:len [/ip hotspot ip-binding find where mac-address="{mac}" && comment~"{BLOCK_TAG}"]] > 0) '
+         'do={ :error "device blocked by reseller" }'),
         "/ip hotspot ip-binding",
         (f':if ([:len [find mac-address="{mac}"]] = 0) do={{ add mac-address="{mac}" '
          f'type=bypassed comment="{bcm}" }} else={{ set [find mac-address="{mac}"] '

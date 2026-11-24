@@ -29,6 +29,13 @@ from app.services.mikrotik_api import (
 from app.services.router_helpers import get_router_by_id, get_router_by_identity, connect_to_router
 from app.services.device_classifier import classify_device, infer_hotspot_subnets
 from app.core.protected_devices import is_protected_device
+from app.services.hotspot_block import (
+    block_mac_sync,
+    is_blockable_mac,
+    is_reseller_block,
+    list_blocks_sync,
+    unblock_mac_sync,
+)
 from app.services.router_availability import record_router_availability
 from app.services.router_concurrency import run_with_guard
 from app.services.router_time import read_router_clock, stamp_router_times
@@ -183,6 +190,8 @@ def _remove_router_user_sync(router_info: dict, username: str) -> dict:
             bindings_result = api.send_command("/ip/hotspot/ip-binding/print")
             if bindings_result.get("success") and bindings_result.get("data"):
                 for binding in bindings_result["data"]:
+                    if is_reseller_block(binding):
+                        continue
                     if binding.get("mac-address", "").upper() == mac_address.upper():
                         binding_id = binding.get(".id")
                         if binding_id:
@@ -402,6 +411,8 @@ def _remove_illegal_user_with_cache(
         # STEP 1: Remove IP binding (CRITICAL - bypassed bindings allow access without auth)
         binding_found = False
         for b in cached_data.get("bindings", []):
+            if is_reseller_block(b):
+                continue  # a reseller's block stays until they unblock
             binding_mac = b.get("mac-address", "").upper()
             binding_comment = b.get("comment", "")
             binding_id = b.get(".id")
@@ -495,6 +506,8 @@ def _remove_illegal_user_with_cache(
         verify_bindings = api.send_command("/ip/hotspot/ip-binding/print")
         if verify_bindings.get("success") and verify_bindings.get("data"):
             for b in verify_bindings["data"]:
+                if is_reseller_block(b):
+                    continue
                 if normalize_mac_address(b.get("mac-address", "")) == normalized_mac:
                     logger.error(f"[REMOVE-ILLEGAL] ⚠️ VERIFICATION: IP binding STILL EXISTS for {normalized_mac}!")
                     # Try one more time with fresh lookup
@@ -741,6 +754,8 @@ def _force_remove_mac_sync(router_info: dict, normalized_mac: str, username: str
         bindings = api.send_command("/ip/hotspot/ip-binding/print")
         if bindings.get("success"):
             for b in bindings.get("data", []):
+                if is_reseller_block(b):
+                    continue  # force-remove kicks a device; unblocking is separate
                 b_mac = normalize_mac_address(b.get("mac-address", "")) if b.get("mac-address") else ""
                 b_comment = b.get("comment", "")
                 if b_mac == normalized_mac or username in b_comment.upper() or normalized_mac.upper() in b_comment.upper():
@@ -2371,6 +2386,127 @@ async def force_remove_mac_address(
         "total_removed": total_removed,
         "details": removed,
         "message": f"Force removed {total_removed} entries for {mac_address}"
+    }
+
+
+class BlockDeviceRequest(BaseModel):
+    mac_address: str = Field(..., description="Device MAC address, e.g. 86:1A:C4:23:61:0F")
+    reason: Optional[str] = Field(None, max_length=200, description="Optional note, e.g. 'not a customer'")
+
+
+async def _blockable_router(db: AsyncSession, token: str, router_id: int) -> dict:
+    """Owner/staff check, then the router's login details. Closes the DB
+    transaction before the caller talks to the router."""
+    current_user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, current_user.id, current_user.role.value)
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found or not accessible")
+    info = {
+        "ip": router_obj.ip_address,
+        "username": router_obj.username,
+        "password": router_obj.password,
+        "port": router_obj.port,
+        "name": router_obj.name,
+    }
+    await db.commit()
+    return info
+
+
+def _block_result_or_raise(result: dict) -> dict:
+    error = result.get("error")
+    if error == "connect_failed":
+        raise HTTPException(status_code=503, detail="Failed to connect to router")
+    if error == "protected_device":
+        raise HTTPException(status_code=403, detail=result.get("detail"))
+    if error == "not_blocked":
+        raise HTTPException(status_code=404, detail="That device is not on this router's block list")
+    if error:
+        raise HTTPException(status_code=502, detail=result.get("detail") or "Router refused the change")
+    return result
+
+
+def _checked_mac(mac_address: str) -> str:
+    if not validate_mac_address(mac_address or "") or not is_blockable_mac(mac_address):
+        raise HTTPException(status_code=400, detail="Invalid MAC address format")
+    return normalize_mac_address(mac_address)
+
+
+@router.post("/api/routers/{router_id}/blocked-devices")
+async def block_hotspot_device(
+    router_id: int,
+    payload: BlockDeviceRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Block a device from the hotspot on this router.
+
+    The device (by MAC address) can no longer open the login page, buy a plan
+    or use the internet on this router, and is disconnected now. It stays
+    blocked even if it pays, until you unblock it. The router's own ports and
+    management devices cannot be blocked.
+    """
+    mac = _checked_mac(payload.mac_address)
+    router_info = await _blockable_router(db, token, router_id)
+    result = _block_result_or_raise(
+        await asyncio.to_thread(block_mac_sync, router_info, mac, payload.reason)
+    )
+    return {
+        "success": True,
+        "router_id": router_id,
+        "router_name": router_info["name"],
+        "mac_address": mac,
+        "reason": result.get("reason"),
+        "action": result.get("action"),
+        "sessions_ended": result.get("sessions_ended", 0),
+        "message": f"{mac} is blocked on {router_info['name']} until you unblock it",
+    }
+
+
+@router.delete("/api/routers/{router_id}/blocked-devices/{mac_address}")
+async def unblock_hotspot_device(
+    router_id: int,
+    mac_address: str,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    Unblock a device on this router.
+
+    Removes the block so the device sees the hotspot login page again and can
+    buy or log in. Only removes a block added with "Block a device".
+    """
+    mac = _checked_mac(mac_address)
+    router_info = await _blockable_router(db, token, router_id)
+    _block_result_or_raise(await asyncio.to_thread(unblock_mac_sync, router_info, mac))
+    return {
+        "success": True,
+        "router_id": router_id,
+        "router_name": router_info["name"],
+        "mac_address": mac,
+        "message": f"{mac} is unblocked on {router_info['name']}",
+    }
+
+
+@router.get("/api/routers/{router_id}/blocked-devices")
+async def list_blocked_hotspot_devices(
+    router_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """
+    List the devices blocked from the hotspot on this router.
+
+    Each entry has the MAC address, the reason given when it was blocked and
+    when it was blocked. Read live from the router.
+    """
+    router_info = await _blockable_router(db, token, router_id)
+    result = _block_result_or_raise(await asyncio.to_thread(list_blocks_sync, router_info))
+    return {
+        "router_id": router_id,
+        "router_name": router_info["name"],
+        "count": len(result["blocked"]),
+        "blocked": result["blocked"],
     }
 
 
