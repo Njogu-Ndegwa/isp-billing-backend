@@ -115,15 +115,15 @@ class PortalSettingsUpdate(BaseModel):
     # Footer
     footer_text: Optional[str] = None
     # Support
-    portal_support_phone: Optional[str] = None
-    portal_support_whatsapp: Optional[str] = None
+    portal_support_phone: Optional[str] = Field(None, description="The number behind the Call Support button on the login page (when empty, the router's support phone is used).")
+    portal_support_whatsapp: Optional[str] = Field(None, description="Saved only: not shown on the login page. Customers who have not paid have no internet, so WhatsApp cannot open there; they get Call Support with portal_support_phone instead.")
     # Toggles
     show_ratings: Optional[bool] = None
     show_reconnect_button: Optional[bool] = None
     show_social_links: Optional[bool] = None
     # Social links
     facebook_url: Optional[str] = None
-    whatsapp_group_url: Optional[str] = None
+    whatsapp_group_url: Optional[str] = Field(None, description="WhatsApp link in the row of social links at the bottom of the login page, shown only when show_social_links is on.")
     instagram_url: Optional[str] = None
     # Announcement
     show_announcement: Optional[bool] = Field(None, description="A notice banner on the hotspot login page (maintenance, a price change); not an ad.")

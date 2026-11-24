@@ -1886,6 +1886,23 @@ def test_the_portal_form_offers_hero_photos_with_the_hero_header():
     assert photo["when"] == {"header_style": ["hero"]} and fields["company_logo_url"]["when"] == {"header_style": ["hero"]}
 
 
+def test_the_portal_form_says_what_each_support_number_does_on_the_login_page():
+    """SKYLINK was told both "the WhatsApp button shows with social links" and "there is
+    no WhatsApp option". The catalog now says what the portal really does with each field."""
+    import main
+    from app.services.assistant.catalog import form_fields, get_catalog
+
+    catalog = get_catalog(main.app)
+    edit = next(a for a in catalog.actions if a.method == "PUT" and a.template == "/api/portal/settings")
+    props = catalog.describe(edit)["body"]["properties"]
+    whatsapp = props["portal_support_whatsapp"]["description"]
+    assert "not shown" in whatsapp and "portal_support_phone" in whatsapp
+    assert "Call Support" in props["portal_support_phone"]["description"]
+    assert "show_social_links" in props["whatsapp_group_url"]["description"]
+    fields = {f["name"]: f for f in form_fields(edit, {}, {})}
+    assert fields["portal_support_whatsapp"]["hint"] == whatsapp[:160]
+
+
 @pytest.mark.asyncio
 async def test_an_mpesa_payment_waits_for_the_pin_instead_of_saying_done(client, owner, db, monkeypatch):
     """Buying SMS credits only sends a PIN prompt: the card waits on the order's status,
