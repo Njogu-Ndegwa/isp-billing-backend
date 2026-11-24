@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import select, delete
+from sqlalchemy import delete, func, or_, select
 
 from app.config import settings
 from app.db.database import async_session
@@ -78,26 +78,11 @@ async def resolve_recipients(db, reseller_id: int, *, filter: str = "all",
                              tz_name: Optional[str] = None,
                              now: Optional[datetime] = None) -> list[dict]:
     """Return [{customer_id, name, phone}] for a reseller, de-duplicated by phone."""
-    stmt = select(Customer.id, Customer.name, Customer.phone).where(
-        Customer.user_id == reseller_id, Customer.phone.isnot(None))
-    if customer_ids:
-        stmt = stmt.where(Customer.id.in_(customer_ids))
-    elif filter == "by_plan" and plan_id:
-        stmt = stmt.where(Customer.plan_id == plan_id)
-    elif filter == "active":
-        stmt = stmt.where(Customer.status == CustomerStatus.ACTIVE)
-    elif filter == "expiring":
-        cutoff = datetime.utcnow() + timedelta(days=expiring_days)
-        # Paused customers are not expiring: their expiry is frozen at the pause.
-        stmt = stmt.where(Customer.expiry.isnot(None), Customer.expiry <= cutoff,
-                          Customer.paused_at.is_(None))
-    elif filter in _FILTER_WINDOWS:
-        stmt = stmt.where(*expiry_between(*expiry_window(_FILTER_WINDOWS[filter], now, tz_name)))
-    if exclude_customer_ids and not customer_ids:
-        stmt = stmt.where(Customer.id.notin_(exclude_customer_ids))
-    if search:
-        like = f"%{search.strip()}%"
-        stmt = stmt.where((Customer.name.ilike(like)) | (Customer.phone.ilike(like)))
+    stmt = _matching(select(Customer.id, Customer.name, Customer.phone).where(
+        Customer.user_id == reseller_id, Customer.phone.isnot(None)),
+        filter=filter, plan_id=plan_id, customer_ids=customer_ids,
+        exclude_customer_ids=exclude_customer_ids, search=search,
+        expiring_days=expiring_days, tz_name=tz_name, now=now)
     stmt = stmt.order_by(Customer.id)
     rows = (await db.execute(stmt)).all()
     seen, out = set(), []
@@ -108,6 +93,45 @@ async def resolve_recipients(db, reseller_id: int, *, filter: str = "all",
         seen.add(phone)
         out.append({"customer_id": cid, "name": name, "phone": phone})
     return out
+
+
+async def count_without_phone(db, reseller_id: int, **picked) -> int:
+    """How many of the customers a send picks have no phone number, so get nothing.
+    Takes the same choice of customers as resolve_recipients."""
+    stmt = _matching(select(func.count(Customer.id)).where(
+        Customer.user_id == reseller_id,
+        or_(Customer.phone.is_(None), func.trim(Customer.phone) == "")), **picked)
+    return int((await db.execute(stmt)).scalar() or 0)
+
+
+def _matching(stmt, *, filter: str = "all", plan_id: Optional[int] = None,
+              customer_ids: Optional[list[int]] = None,
+              exclude_customer_ids: Optional[list[int]] = None,
+              search: Optional[str] = None, expiring_days: int = 7,
+              tz_name: Optional[str] = None, now: Optional[datetime] = None):
+    """The customers a send picks: by id, plan, status or when their time ends."""
+    if customer_ids:
+        stmt = stmt.where(Customer.id.in_(customer_ids))
+    elif filter == "by_plan" and plan_id:
+        stmt = stmt.where(Customer.plan_id == plan_id)
+    elif filter == "active":
+        stmt = stmt.where(Customer.status == CustomerStatus.ACTIVE)
+    elif filter == "expiring":
+        # Time still running and ending within the window: someone whose time already ran
+        # out is not "expiring" (that is expired_recently). Paused customers are not
+        # expiring either: their expiry is frozen at the pause.
+        moment = now or datetime.utcnow()
+        cutoff = moment + timedelta(days=expiring_days)
+        stmt = stmt.where(Customer.expiry.isnot(None), Customer.expiry > moment,
+                          Customer.expiry <= cutoff, Customer.paused_at.is_(None))
+    elif filter in _FILTER_WINDOWS:
+        stmt = stmt.where(*expiry_between(*expiry_window(_FILTER_WINDOWS[filter], now, tz_name)))
+    if exclude_customer_ids and not customer_ids:
+        stmt = stmt.where(Customer.id.notin_(exclude_customer_ids))
+    if search:
+        like = f"%{search.strip()}%"
+        stmt = stmt.where((Customer.name.ilike(like)) | (Customer.phone.ilike(like)))
+    return stmt
 
 
 def _chunks(seq, size):

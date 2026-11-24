@@ -40,6 +40,30 @@ async def _require_admin(token: str, db: AsyncSession) -> User:
     return user
 
 
+@router.get("/api/admin/router-cpu/by-model")
+async def admin_router_cpu_by_model(
+    hours: int = Query(24, ge=1, le=24 * 90, description="How far back to chart."),
+    step: Optional[int] = Query(None, description="Seconds per point: 300, 900, 3600, 21600 or 86400. Default depends on hours."),
+    split_version: bool = Query(False, description="One series per (model, RouterOS major) instead of per model."),
+    board: Optional[str] = Query(None, max_length=60, description="Only this board model, e.g. RB951Ui-2HnD."),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Fleet CPU per router model over time, with app deploys as markers.
+
+    Each point is over routers, not samples: ``avg`` is the mean of each
+    router's mean in the interval, ``p50``/``p90`` are upper bin edges of that
+    distribution (10% bins), ``max`` is the highest single sample, and
+    ``pct_over_80`` is the share of routers averaging 80% or more. Use it to
+    check a release or a fleet-wide router change for CPU regressions.
+    """
+    await _require_admin(token, db)
+    from app.services import router_cpu_history
+
+    return await router_cpu_history.history(
+        db, hours=hours, step=step, split_version=split_version, board=board)
+
+
 @router.get("/api/admin/router-agent/metrics")
 async def admin_router_agent_metrics(
     db: AsyncSession = Depends(get_db),

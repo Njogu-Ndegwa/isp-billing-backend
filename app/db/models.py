@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, Enum, Date, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint, CheckConstraint, text
+from sqlalchemy import Column, Integer, SmallInteger, String, Text, Enum, Date, DateTime, ForeignKey, Float, Boolean, BigInteger, DECIMAL, Index, UniqueConstraint, CheckConstraint, text
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import Session, relationship
 from sqlalchemy import event
@@ -1013,6 +1013,66 @@ class RouterHealth(Base):
     routeros_version = Column(String(40), nullable=True)
     board_name = Column(String(60), nullable=True)
     wan_link_downs = Column(BigInteger, nullable=True)
+
+
+class RouterMetricBucket(Base):
+    """Bounded history of router health for graphs (router_metric_history.py).
+
+    ``router_health`` keeps only the latest reading, so the dashboard could show
+    a CPU number but never a curve. Each health sample is folded into two tiers
+    of buckets — 5-minute (kept ~1 day) and 1-hour (kept ~1 week) — so a router
+    costs at most a few hundred narrow rows, whatever its push cadence. Sums
+    and counts (not averages) are stored so that folding is a plain increment.
+
+    Written in the same short session as ``router_health`` (inside a savepoint,
+    so a history failure never loses the latest reading). Pruned with the
+    bandwidth history. No surrogate id: the primary key is the only index.
+    """
+    __tablename__ = "router_metric_buckets"
+
+    router_id = Column(Integer, ForeignKey("routers.id", ondelete="CASCADE"),
+                       primary_key=True, autoincrement=False)
+    step_seconds = Column(SmallInteger, primary_key=True, autoincrement=False)
+    bucket_start = Column(DateTime, primary_key=True)
+    cpu_samples = Column(SmallInteger, nullable=False, default=0, server_default="0")
+    cpu_sum = Column(Integer, nullable=False, default=0, server_default="0")
+    cpu_max = Column(SmallInteger, nullable=True)
+    # Memory in use, percent of total (0-100), from free/total in the sample.
+    mem_samples = Column(SmallInteger, nullable=False, default=0, server_default="0")
+    mem_sum = Column(Integer, nullable=False, default=0, server_default="0")
+    mem_max = Column(SmallInteger, nullable=True)
+    # Reboots are placed in the bucket the router booted in (now - uptime);
+    # WAN link drops in the bucket of the report that counted them.
+    reboots = Column(SmallInteger, nullable=False, default=0, server_default="0")
+    link_drops = Column(Integer, nullable=False, default=0, server_default="0")
+
+
+class RouterCpuBucket(Base):
+    """Fleet CPU per router model, one row per 5-minute bucket per
+    (board_name, RouterOS major) (app/services/router_cpu_history.py).
+
+    Built from the samples that already reach ``router_health``; each router
+    counts once per bucket (its mean over the bucket), so a router that pushes
+    every minute weighs the same as one that pushes every two. Feeds the admin
+    "CPU by router model" chart, which is how a release or a fleet-wide router
+    script change is checked for CPU regressions.
+    """
+    __tablename__ = "router_cpu_buckets"
+
+    bucket_start = Column(DateTime, primary_key=True)
+    board_name = Column(String(60), primary_key=True)
+    ros_major = Column(String(4), primary_key=True)
+    routers = Column(Integer, nullable=False, default=0)
+    samples = Column(Integer, nullable=False, default=0)
+    # Sum of per-router means; mean CPU = cpu_mean_sum / routers.
+    cpu_mean_sum = Column(Float, nullable=False, default=0.0)
+    # Highest single sample seen in the bucket.
+    cpu_peak = Column(Integer, nullable=False, default=0)
+    # Routers whose bucket mean was >= 80%, and routers with any sample >= 95%.
+    routers_ge80 = Column(Integer, nullable=False, default=0)
+    routers_peak_ge95 = Column(Integer, nullable=False, default=0)
+    # Per-router means in ten 10%-wide bins ([0,10) ... [90,100]), for percentiles.
+    hist = Column(JSON, nullable=False, default=list)
 
 
 class RouterUsageBucket(Base):

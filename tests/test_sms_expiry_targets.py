@@ -51,3 +51,36 @@ async def test_send_filters_pick_only_that_day(db):
     assert await names("expiring_today") == ["ran_out_this_morning", "tonight"]
     assert await names("expiring_tomorrow") == ["after_midnight"]
     assert await names("expired_recently") == ["last_week", "ran_out_this_morning"]
+
+
+@pytest.mark.asyncio
+async def test_expiring_is_time_still_running_never_time_that_ran_out(db):
+    """"Expiring (7d)" on the messaging page and the assistant's "expiring" filter: 29 ending
+    later today and 5 in 3 days are 34 people, not the 1,200 whose time ran out weeks ago."""
+    from app.db.models import Customer, CustomerStatus
+
+    r = await make_reseller(db)
+    plan = await make_plan(db, r)
+    n = 0
+
+    def customer(name, expiry, status):
+        nonlocal n
+        n += 1
+        return Customer(name=name, phone=f"2547{n:08d}", mac_address=f"AA:BB:{n // 65536 % 256:02X}:"
+                        f"{n // 256 % 256:02X}:{n % 256:02X}:01", status=status, expiry=expiry,
+                        plan_id=plan.id, user_id=r.id)
+
+    db.add_all([customer(f"today {i}", NOW + timedelta(minutes=10 + 15 * i), CustomerStatus.ACTIVE)
+                for i in range(29)])                                    # 08:10 to 15:10 UTC, still today in EAT
+    db.add_all([customer(f"in 3 days {i}", NOW + timedelta(days=3, hours=i), CustomerStatus.ACTIVE)
+                for i in range(5)])
+    db.add_all([customer(f"lapsed {i}", NOW - timedelta(days=14 + i % 30), CustomerStatus.INACTIVE)
+                for i in range(1200)])
+    await db.commit()
+
+    expiring = await sms_dispatch.resolve_recipients(db, r.id, filter="expiring", now=NOW)
+    assert len(expiring) == 34
+    assert not any(x["name"].startswith("lapsed") for x in expiring)
+    today = await sms_dispatch.resolve_recipients(db, r.id, filter="expiring_today", now=NOW,
+                                                  tz_name="Africa/Nairobi")
+    assert len(today) == 29

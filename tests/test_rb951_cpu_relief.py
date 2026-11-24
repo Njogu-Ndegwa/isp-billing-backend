@@ -7,7 +7,7 @@
    wg-aws peer no longer forces the slow path every minute.
 3. ``CHECKIN_TUNNEL_ROUTER_IDS=ros7`` gives every RouterOS 7 router the
    tunnel-first check-in (no TLS handshake per check-in).
-4. A PPPoE pool range is matched by one covering network instead of 13 blocks.
+(The PPPoE bypass compaction found in the same pass landed in #439.)
 """
 import re
 
@@ -225,57 +225,3 @@ def test_ros7_setting_installs_the_tunnel_transport(monkeypatch):
     result = enrol._checkin_sync(api, candidate, candidate.identity, api.board, api.arch, api.version)
     assert result.installed
     assert BEGIN in api.named("/system/script", applier.SCRIPT_NAME)["source"]
-
-
-# --- 4. one PPPoE bypass network per pool range -------------------------------------
-
-def _api():
-    api = MikroTikAPI("10.0.0.1", "admin", "secret")
-    api.connected = True
-    return api
-
-
-@pytest.mark.parametrize("ranges,expected", [
-    ("192.168.89.2-192.168.89.254", ["192.168.89.0/24"]),
-    ("192.168.89.254-192.168.89.254", ["192.168.89.254/32"]),
-    ("192.168.89.2-192.168.89.254,192.168.189.2-192.168.189.254", ["192.168.89.0/24", "192.168.189.0/24"]),
-    ("172.16.88.2-172.16.89.254", ["172.16.88.0/23"]),
-])
-def test_bypass_cidrs_cover_a_tight_range_with_one_network(ranges, expected):
-    assert _api()._pool_ranges_to_bypass_cidrs(ranges) == expected
-
-
-def test_bypass_cidrs_keep_the_exact_split_for_a_loose_range():
-    api = _api()
-    # .10-.200 in a /24 would accept 65 extra addresses: keep the exact blocks.
-    assert api._pool_ranges_to_bypass_cidrs("192.168.89.10-192.168.89.200") == \
-        api._pool_ranges_to_cidrs("192.168.89.10-192.168.89.200")
-
-
-def test_ensure_replaces_the_13_block_rules_with_one_pair_after_adding_it():
-    api = _api()
-    old_cidrs = api._pool_ranges_to_cidrs("192.168.89.2-192.168.89.254")
-    assert len(old_cidrs) == 13
-    rules = []
-    for n, cidr in enumerate(old_cidrs):
-        for side, field in (("src", "src-address"), ("dst", "dst-address")):
-            rules.append({".id": f"*{n}{side}", "chain": "forward", "action": "accept", field: cidr,
-                          "comment": f"PPPoE bypass FastTrack ({side}) {cidr}", "disabled": "false"})
-    rules.append({".id": "*keep", "chain": "forward", "action": "accept",
-                  "comment": "PPPoE bypass FastTrack (src) 10.10.0.0/24", "src-address": "10.10.0.0/24"})
-    rules.append({".id": "*ft", "chain": "forward", "action": "fasttrack-connection", "disabled": "false"})
-    commands = []
-    api.get_ip_pool_status = lambda name: {"success": True, "pools": [{"name": name, "ranges": "192.168.89.2-192.168.89.254"}]}
-    api.send_command_optimized = lambda command, proplist=None, query=None: {"success": True, "data": rules}
-    api.send_command = lambda command, args=None: commands.append((command, dict(args or {}))) or {"success": True}
-
-    result = api.ensure_pppoe_fasttrack_bypass(pool_name="pppoe-pool")
-
-    assert result["success"] is True and result["cidrs"] == ["192.168.89.0/24"]
-    assert result["rules_added"] == 2 and result["rules_removed"] == 26
-    adds = [i for i, (c, _) in enumerate(commands) if c == "/ip/firewall/filter/add"]
-    removes = [i for i, (c, _) in enumerate(commands) if c == "/ip/firewall/filter/remove"]
-    assert max(adds) < min(removes)                                   # never a moment without bypass
-    assert {a["numbers"] for c, a in commands if c.endswith("/remove")} == {r[".id"] for r in rules[:26]}
-    assert commands[adds[0]][1]["src-address"] == "192.168.89.0/24"
-    assert commands[adds[0]][1]["place-before"] == "*ft"

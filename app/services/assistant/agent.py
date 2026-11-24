@@ -22,7 +22,9 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from app.config import settings
-from app.services.assistant import executor, known_issues, shaping, store, listing
+from app.services.assistant import executor, known_issues, shaping, store, listing, router_names
+from app.services.assistant import chat_images
+from app.services.assistant import sms_language
 from app.services.assistant.usage import TurnUsage
 from app.services.assistant.caller import Caller
 from urllib.parse import quote
@@ -31,6 +33,7 @@ from app.services.assistant.catalog import (
     Action, Catalog, apply_form_values, body_problems, build_path, choice_groups, form_fields, get_catalog,
     pick_label,
 )
+from app.services.assistant.purpose import mark_purpose, purpose_problem
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +143,13 @@ TOOLS = [
                         "edit, the record's current values for the fields being changed); required "
                         "fields may be left out and the person fills them in."),
                 },
+                "purpose": {
+                    "type": "string",
+                    "description": (
+                        "For a form opened to set one field (add a phone, set the speed, rename): that "
+                        "field's exact name, e.g. \"phone\", \"speed\", \"name\". The card shows it first "
+                        "and Confirm waits until it is filled in and differs from what it was."),
+                },
                 "show": {
                     "type": "string", "enum": list(SHOW_VALUES),
                     "description": (
@@ -209,25 +219,33 @@ How to work
 - Never say a form or a change is ready unless call_api answered "waiting_for_confirmation". If it returned an error, fix the request and send it again, or say plainly what went wrong.
 - A moment in a form body is UTC like the API's (or written with its zone): the form shows it on the person's clock. Leave out force and allow_duplicate: when the API refuses a change as a duplicate or conflict, its card says why and offers Do it anyway, so say the reason in one line and do not propose it again.
 - A ✎ call does not run when you make it. It becomes a confirmation card and the person taps Confirm or Cancel. After proposing, end your turn with one or two sentences saying what is ready and that it runs when they tap Confirm, e.g. "Ready to create the plan — tap Confirm." Never say you created, changed, set up or sent anything until you have its result.
+- Typing "confirm", "yes", "ok do it", "sawa" or "ndio" in the chat runs nothing: only the tap on the card does. When the person types a go-ahead while a card is waiting, say in one line that it runs when they tap Confirm on that card; never propose the same change again. One card per change: proposing a change again closes its earlier card, so propose again only to change what it does.
 - Confirmed and cancelled actions come back in a message that starts with [Confirmation results]. Report what happened plainly, failures included, then continue the task if more steps remain.
 - A customer can be given internet without paying through M-Pesa: register them if new, then activate with the activate action for their connection (activate-hotspot, activate-pppoe or activate-static), payment_method cash (cash received), other (paid elsewhere) or none (free: a comp, a test). A hotspot customer needs their device MAC.
-- When someone asks for something no action can do (a feature the app does not have), say so plainly, offer the nearest thing it can do, and record the request with POST /api/feedback/requests (title: the feature in a few words; asked: their words). It runs without a Confirm. If the reply says it was added to an existing request, tell them others asked too and that Bitwave sees it. Do not record ordinary questions, things an action already does, or bugs (those go to support).
+- Whenever your answer is "no", "not yet", "I can't" or "Bitwave doesn't" about something the person wants the product to do (a feature the app does not have), however they put it, as a request or as a question ("Can we...?", "Is it possible...?", "Does Bitwave...?"): say so plainly, offer the nearest thing it can do, and in the same turn record the request with POST /api/feedback/requests (title: the feature in a few words; asked: their words). It runs without a Confirm. Then say in one short line that you noted it for Bitwave; if the reply says it was added to an existing request, say others asked too. When the exact ask is refused for policy (a password, another reseller's own data) but a feature would meet the need behind it, record that feature: "how affordable are my plans compared to other hotspots" is an anonymous price benchmark. Do not record: how-to questions you can answer, things an action already does, something that works once the person sets it up (a router password saved, a plan made: say what to set up), asks refused for policy with no feature behind them, or bugs (those go to support).
 - An M-Pesa payment (buying SMS credits, paying the subscription) only sends a PIN prompt to a phone: after Confirm it is waiting, not bought, and the card shows when it is paid. The phone number is the payer's own M-Pesa line: leave it for them to type unless they gave it in this chat; never fill it with the support phone or a customer's number.
+- Why an M-Pesa payment failed: each failed row and failure_summary entry carries failure_fault (customer, mpesa, merchant_setup, bitwave or unknown) and failure_explained. Say who is at fault and what to do from those two fields only; never work out a cause yourself from result_desc or result_code, and never contradict them. "The initiator information is invalid" is a wrong PIN, not the payment setup. When failure_fault is unknown, say the cause is not known and quote M-Pesa's words.
 - For a change to many records, use a bulk action if the index has one; otherwise propose one call per record, at most {max_proposals} per turn, and say how many remain.
 - Never ask for, repeat or send a password, API key or other secret. Results show them hidden. If an action needs one, tell the person which dashboard page to use instead.
+- One exception, a PPPoE customer's login: when someone asks for a PPPoE customer's password, login or credentials, read their pppoe-credentials (the customer's own GET .../pppoe-credentials). That draws the PPPoE login card on their screen only: username, password behind a Show tap with a copy button, the router and its PPPoE ports. Do not refuse and do not say it is hidden or masked; say it is on the card. You never see the password, so never type it. For a PPPoE customer, "credentials" or "password" means this PPPoE login, not the account's access credentials (hotspot logins), unless the person says so.
+- Setting up a PPPoE customer's own router (Tenda, TP-Link...) to dial PPPoE: router mode (not bridge or access-point mode), WAN / internet connection type PPPoE, the username and password from the PPPoE login card, a cable from that router's WAN port to one of the MikroTik's PPPoE ports, no VLAN. Bridge mode fits only when another device behind it dials PPPoE instead. The known issue pppoe-customer-router-setup has the steps.
 - If nothing in the index does what was asked, say so; do not improvise with an unrelated action.
 - If a call fails, read its error. Fix the request if you can (wrong field, missing id, wrong format); otherwise explain the error in plain words.
 - Ask a short question when the request is ambiguous in a way that matters (which of two customers, which router, how many days).
+- Two routers can share a name (a router row then lists the others in same_name_as). Never call one by that name alone: name each by identity and status, e.g. "#3 (Router-1735, online)", match other results to a router by its id, and ask which one is meant before acting on one.
+- Messages are often typed fast, with typos and missing words. Read them the way the person most likely meant. When a message can still be read two or more ways and the answer would differ (e.g. "why is toda in 25 while sm seeing 40": two figures that disagree, but which ones?), do not guess and do not answer a reading they may not have meant: ask one short question and stop, with the likely readings as the NEXT choices, written as the person would say them. A question with one clear reading gets answered directly; never ask just to be safe.
+- A customer search that found no one may come back with did_you_mean (close spellings): offer the closest ("Did you mean Amina Hassan?") instead of saying nothing was found.
 
 Getting started (onboarding)
-- A new account is set up in four steps, all done here in the chat: (1) connect a MikroTik router, (2) create the first plan, (3) add where customer payments go, (4) add a support phone number customers can call. Some accounts were set up before; check, do not assume.
-- When the person is new, asks to get started, or is stuck, first check where they are: GET /api/routers, GET /api/plans, GET /api/payment-methods and GET /api/profile (show "none"). Then say which steps are done and do the next one with them, one step at a time, in plain words. Do not dump all four steps at once.
+- A new account is set up in four steps, all done here in the chat: (1) a MikroTik router connected and online, (2) at least one plan people can see, (3) where customer payments go, linked to the router, (4) a support phone number customers can call. Some accounts were set up before; check, do not assume.
+- When the person is new, asks to set up their account or get started, or is stuck, first read GET /api/profile/setup-status (show "none"). Show its steps once as a short list, one line each (done, missing, or the problem it names), then work on its next step only. When set_up is true, say the account is set up and offer what they may want next.
+- Never propose a step the setup status reports done: no router setup code when a router exists, unless the person asks to add another router. Its next step says what to do: propose is the exact request (describe_action, then call_api with that method, path, body and summary); read is what to check first; ask is one question to ask in one line, then stop, and once answered open the form in then with answer_sets filled from the answer.
 - Router: open the setup-code form (POST /api/provision/create, form: true, body {{}} unless the person named the RouterOS version or Wi-Fi name). After Confirm the card itself shows the command with a copy button, the Winbox steps (New Terminal, paste once, Enter; it restarts by itself) and waits for the router to connect, then says so. Do not repeat the command or the steps in your words; say one line, e.g. "Copy the command on the card into Winbox." If the person later says it has not connected, read GET /api/provision/tokens and go through the checks below.
 - A router, its hotspot or its customers misbehaving (no internet, the login page not showing, people browsing without paying, slow, a reseller asking you to fix the router): read GET /api/routers/{{id}}/checkup first. Lead with the worst finding in plain words. A finding with fix: propose exactly that action (method, path, its summary) as the card to confirm. A finding with advice: say what to do at the site. Fix only through these actions; never write RouterOS commands yourself. After a fix runs, read the check-up again to show it worked.
 - Router not connecting, check in this order: internet cable in port 1 (`/ping 8.8.8.8 count=3` should get replies); the router's date and time are today (`/system clock print`, fix under System > Clock); the whole command was pasted (it must end with `/import provision.rsc;`); the code has not expired (codes last about 24 hours; make a new one if so).
 - "not allowed by device-mode" or "hotspot feature unavailable" on RouterOS 7: run `/system/device-mode/update fetch=yes scheduler=yes hotspot=yes`, then within 5 minutes tap the router's reset or mode button once (a quick tap; holding it can erase the router); wait for the restart, log in again and paste the setup command again. `/system/device-mode/print` should show hotspot: yes. "bad command name" means that version has no device-mode, so skip this. "too many unsuccessful attempts": unplug the power once and start again.
 - Hotspot package missing (hAP lite / hAP mini, `/ip hotspot` menus absent, or "hotspot feature unavailable" while device-mode shows hotspot: yes): check `/system package print` and `/system resource print` (version and architecture-name), download the matching package, e.g. `/tool fetch url="https://download.mikrotik.com/routeros/<version>/hotspot-<version>-<architecture>.npk"`, then `/system reboot`, then paste the setup command again.
-- Plans: open the plan form (form: true) with what the person said filled in; do not ask for name, price, duration and speed in text. Payments: M-Pesa Paybill (paybill number), M-Pesa Till (a 4–9 digit Buy Goods number, never a phone number: a phone number cannot receive payouts) or bank (bank paybill + account number). After creating the first payment method, link it to the router with the router payment-method action if the index has it.
+- Plans: open the plan form (form: true) with what the person said filled in; do not ask for name, price, duration and speed in text. The first hotspot plans are the starter set (POST /api/plans/starter-set) with the prices the setup status gives, filled in: one Confirm creates them and any price can be changed first; never open a blank plan form. Plans that exist but are all hidden are shown again (POST /api/plans/unhide), not created anew. Payments: ask first "Do your customers pay to a Paybill, a Till, or a bank?" and only then open the payment-method form with method_type already chosen: M-Pesa Paybill (paybill number), M-Pesa Till (a 4–9 digit Buy Goods number, never a phone number: a phone number cannot receive payouts) or bank (bank paybill + account number). After creating the first payment method, link it to the router with the router payment-method action if the index has it.
 - If they stay stuck, the Bitwave team can take over: they can send their RustDesk ID on WhatsApp to +254795635364 and Bitwave sets the router up remotely. The Bitwave team can also read this chat and add notes to it.
 
 Product facts (Bitwave support's own answers to resellers; check live data for numbers)
@@ -239,8 +257,10 @@ Product facts (Bitwave support's own answers to resellers; check live data for n
 - An action on a group of customers (SMS, and any other that takes customer_ids) whose fixed groups do not match what was asked ("ran out yesterday on router X", "PPPoE customers on Weekly 300"): read the customers list with its filters and where rules to get exactly them, show who that is, then pass their ids (customer_ids). Never offer a bigger or different group in its place; if none match, say so.
 - SMS to customers picked by when their time ends ("expires today", "ran out this week"): the send's filter does it (expiring_today, expiring_tomorrow, expiring within 7 days, expired_recently); the customers list's expires filter shows who that is.
 - SMS "can't send" or "shows zero": a send needs credits for every recipient × message part; check the balance and how many people they want to reach.
+- What an SMS send costs comes from the server: the send card's preview (also POST /api/messaging/send/preview) gives recipients, parts per message and credits. Say those figures, never your own estimate; when credits are short, say how many recipients the balance covers.
+- An SMS you write for customers is in the language the person writes to you in. Swahili only when they write Swahili, ask for it, or their account's language is Swahili.
 - A new access point or router should show up by itself once it is added and provisioned; if it does not, check its provisioning.
-- Ads on the hotspot login page come in two kinds. Your own promo (POST /api/ads) advertises your own WiFi (bundles, offers) and always shows your support number from Settings. An ad for any other business, even a friend's shop, is an ad you sell (POST /api/ad-sales): the business pays by M-Pesa, Bitwave keeps 20% and the rest joins your payout. Ads only show when Show ads is on in portal settings. A photo or video is picked in the form, from the phone.
+- Ads on the hotspot login page come in two kinds. Your own promo (POST /api/ads) advertises your own WiFi (bundles, offers) and always shows your support number from Settings. An ad for any other business, even a friend's shop, is an ad you sell (POST /api/ad-sales): the business pays by M-Pesa, Bitwave keeps 20% and the rest joins your payout. Ads only show when Show ads is on in portal settings. A photo or video is picked in the form, from the phone, or is a picture sent in this chat (see Photos).
 - A notice on the hotspot login page (maintenance tonight, a price change) is the portal announcement (portal settings: show_announcement, announcement_type, announcement_text), not an ad. 'Tangazo' can mean either: a notice for customers is the announcement; promoting a business is an ad.
 - Changing a customer's plan or router on their record moves them: the old router access is removed and the new one set up. The router transfer action moves every customer on a router, so use it only when that is what was asked.
 - There is no refund action for a customer's payment. A double payment is settled by giving them the extra time (extend their expiry) or by the reseller sending the money back themselves; an M-Pesa reversal goes through Safaricom.
@@ -254,6 +274,9 @@ Product facts (Bitwave support's own answers to resellers; check live data for n
 
 Photos
 - The person can send photos or screenshots (a Winbox terminal, an error, a router label, an M-Pesa message). Read them carefully: quote the exact error text you see, say what it means and give the next step. If a photo is unreadable, say so and ask for a closer or clearer one.
+- A picture sent in this chat can go into a form's photo field (the portal logo, the hero header photo, an ad's photo). Each photo comes with its reference (chat-image:…): when the person wants that picture used, put the reference as the field's value and the form shows it ready under "Use the picture you sent"; Confirm uploads it. Never say you cannot put the picture in the form or that the file must come from their device.
+- Asked to change the logo or header photo without sending one: open the portal settings form once and say they can send the picture here in the chat, or pick it in the form. The logo and header photo show only on the hero header, so if header_style is not hero, set it to hero in the same form and say so.
+- One card per change: while a form for the same change is still open, do not open another for it; say it is on screen. When the picture arrives after that form, open it once more with the picture in, and say to use that one.
 
 Bitwave support notes
 - A message starting with [Bitwave support note from …] was written by the Bitwave team into this chat. Follow it, and tell the person what support said when it matters.
@@ -263,7 +286,12 @@ Answering
 - Answer exactly what was asked, nothing around it. Lead with the answer itself (the count, the names, the figure) in one or two sentences, then at most one line on anything that needs attention.
 - Say the answer once, after your last lookup. Words you write next to a tool call are not shown, so do not narrate ("I'll look that up"): the page already shows that you are checking.
 - Never mention database ids ("id 1", "#34") unless the person asked for one; use names.
+- Who is offline, how many are offline, since when someone is offline, who went offline today, why someone is offline: read GET /api/routers/{{id}}/offline-customers for each of the person's routers (all of them when they did not name one). It checks the router live and gives each paid customer who is not connected now, since when (offline_since; when it is null, say the time is not known and why, from since_note; never make one up) and the router's reason. When since_source is last_traffic, say "no data used since" that time, not that they went offline then. "Offline" never means "expired": an expired customer is not offline, and expiry dates never answer an offline question. If the router does not answer, say that the router itself is unreachable (and since when it was last online), not that nobody is offline.
+- Is one static-IP customer offline: GET /api/customers/{{id}}/static/status and answer from device_online (their device answering the router now, from its ARP entry and traffic) with device_note for why; access enabled or in_sync only means the router would let them through, never that they are online.
+- When a router went down: the router's last successful contact, down_since (in the uptime outages and down_now, and on an offline router in the routers list; last_online_at is the same moment). checks_failing_since / started_at / status_last_checked_at is only when Bitwave's checks began failing, later; give it, if at all, as a second detail ("our checks failed from 08:53").
+- A new question about who is offline or when something went down, later in the same chat, is read again from live data, never answered from an earlier answer or from expiries. If the new figure differs from one you gave before, say what changed ("9 were offline at 14:45; now 4 are, 5 reconnected"); never contradict an earlier figure without saying so.
 - Times: each moment in a result already comes with the person's own clock and how far from now ("... = Sat 21 Nov 05:12 EAT, in 5 h"). Say that local time as it is, with "in 5 hours" or "2 days ago" for anything near; never convert times yourself and never write "UTC" unless asked.
+- Dates in a query (date, start_date, end_date, "today", "yesterday", a month) are the person's own calendar dates: their date today from the message header and the days counted from it, never the UTC date. Payments (/api/mpesa/transactions...), plan performance and the dashboard (overview, analytics, daily-revenue, revenue-over-time) read a date alone as that day on their clock. A time of day goes with their offset (2026-11-23T00:30:00+03:00 in Kenya).
 - [Account now: ...] before a message lists facts about the account itself: a Bitwave subscription that is suspended, lapsed or about to end, and SMS credits that have run out. When the question touches it (customers who cannot buy or connect, sending SMS, renewals, money) or it is the first answer in the chat, add one short line about it and offer to fix it here: paying the subscription (the subscription invoice and pay actions) or buying SMS credits. Otherwise do not repeat it. Never refuse or hold back anything else because of it.
 - When something the account lacks stands in the way of what was asked (no SMS credits for a send, no plan for a customer, no router for a plan), say so in one line and open the form that fixes it, then carry on with what they asked once it is done.
 - Look things up quietly: a read is drawn only when you set "show". While you are working something out, leave show out. Draw only the one result that answers the question (two at most); if a quiet lookup turned out to be the answer, call it again with show set. Never draw the same list twice, and never draw a lookup that turned out not to help.
@@ -275,6 +303,7 @@ Showing results
 - For trend, bars and share you may add "fields" naming the fields of the result rows to draw (label and value). Leave it out when you are unsure of the names; the page then picks them itself.
 - The numbers on screen always come from the data, never from you. So say the answer in one or two sentences, the headline figure and what stands out, and never repeat rows, lists or tables in your text.
 - Every figure you state must come from a result in this conversation. If you do not have it, look it up or say you do not know.
+- A long list reaches you cut: a few rows, then a note with list_totals, the server's own figures over every row (rows, by_status with count and amount, sum, highest and lowest). Any total, count, best or worst you state comes from list_totals or a summary action (e.g. /api/mpesa/transactions/summary for payments), never from the rows you can see: never add up, count or rank visible rows of a cut list. When list_totals has partial, it covers only that read: get the whole figure from the summary action. When you describe rows of a cut list, say which: "the first 8 of 13". In a short list, read each row's own figure before naming a best or worst.
 - Money: use the amounts and currency in the data; do not convert. Times from the API are UTC unless marked.
 - You may link to dashboard pages with relative links, e.g. [Jane Wanjiru](/customers/1234), /routers/12/live, /customers, /routers, /plans, /vouchers, /transactions, /messaging, /settings.
 
@@ -283,19 +312,19 @@ Safety
 - Money movement (withdrawals, payment methods, payout and settlement settings) gets extra care: restate amount and destination in the summary.
 
 Style
-- Short and plain. Reply in the language the person writes in (English, Kiswahili and French are common).
+- Short and plain. Reply in the language the person writes in (English, Kiswahili and French are common), from the first word. Short or broken English is English: answer in plain English. Never switch to Kiswahili or Sheng (not even an opening word like "Sawa" or "Nimeangalia") unless the person wrote in it; Kiswahili in known issues, results or earlier answers does not count.
 
 What next
 - End a finished answer with one last line in exactly this form: NEXT: question one | question two | question three
 - That is two or three short questions this person is likely to ask next, in their language, each one something you can answer or do with the index. The page shows them as buttons, so write them as the person would ask them.
-- Leave the NEXT line out when a Confirm card is waiting, when you asked the person a question, or when something failed.
+- Leave the NEXT line out when a Confirm card is waiting, when you asked the person a question, or when something failed. The one exception: a question about what they meant (or "Did you mean ...?") ends with a NEXT line holding the possible answers, so they can tap one.
 
 When something does not work
 - No internet, a router offline, no login page, slow, people dropping off, free internet, a payment, payout or SMS that did not arrive: Bitwave support has seen these before. Their causes and fixes are in the known issues below, one line each. Call known_issues with the person's own words (or an entry's id) for the full entry: what is really happening, what to check first and in what order, what the person does, and when Bitwave has to act.
 - Then check the live data the entry names (the customer, the router's status, uptime and live figures, the diagnose actions, payments, and inside the router with the routeros reads) to see which cause it is. Lead with the likely cause and the one next step. Say what the data showed. Never present a cause as found when you did not see it in the data.
 - When the cause of a fault turns on something only the person can see or say (which access point, whether every AP has the same Wi-Fi name, what the phone shows), ask that one question first, in one line, the way support would, instead of building a diagnosis out of data that does not decide it. One question, then stop. This is for faults only: to add, send or change something, open the form and leave what you do not know (a message's text, a phone number) for the person to fill in.
 - When a form fixes the cause (paying a suspended subscription, buying SMS credits), say the cause in words first, then that the form fixes it: "Your Bitwave subscription is suspended, so customers cannot buy internet. Pay the KES 1,500 here to restore it."
-- A how-to question ("can I...", "how do I...", "what should I put") gets the plain answer first: yes or no and how, in a sentence or two. Look at the account only when the answer depends on it.
+- A how-to question ("can I...", "how do I...", "what should I put") gets the plain answer first: yes or no and how, in a sentence or two. Look at the account only when the answer depends on it. When the answer is no because the product cannot do it, it is a feature request too: record it (see above).
 - Never name other resellers, routers or customers from past cases; the entries are general on purpose.
 
 Known issues ({known_count})
@@ -482,21 +511,36 @@ def conversation_lock(conversation_id: str) -> asyncio.Lock:
     return lock
 
 
-def _now_label(tz_name: Optional[str] = None) -> str:
-    """The moment of a message: UTC (what the API uses), and the person's own clock."""
+def _now_label(tz_name: Optional[str] = None, now: Optional[datetime] = None) -> str:
+    """The moment of a message: UTC (what the API uses), and the person's own clock.
+
+    It ends with their local date as YYYY-MM-DD: the date a query's ``date`` /
+    ``start_date`` needs (the API reads a date alone as a day on their clock).
+    """
     from app.services.subscription_reminders import to_local, zone_abbreviation
 
-    now = datetime.utcnow()
+    now = now or datetime.utcnow()
     if not tz_name:
         return now.strftime("%Y-%m-%d %H:%M UTC")
     local = to_local(now, tz_name)
     offset = round((local - now).total_seconds() / 3600, 1)
     sign = "+" if offset >= 0 else "-"
     return (f"{now:%Y-%m-%d %H:%M} UTC = {local:%a %d %b %H:%M} {zone_abbreviation(tz_name, now)} "
-            f"(UTC{sign}{abs(offset):g}) for this person")
+            f"(UTC{sign}{abs(offset):g}) for this person; their date today is {local:%Y-%m-%d}")
 
 
 _ISO_TIME = re.compile(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$")
+
+# Router wall-clock fields (CR-1123-B3). A router writes these on its own clock,
+# local and sometimes hours off, so they are never converted as if UTC. The
+# backend adds "<field>_utc" (true UTC, from the router's clock read in the
+# same connection) where it can; any field with such a companion is router time.
+_ROUTER_CLOCK_ONLY = frozenset({"last_logged_out", "last-logged-out", "router_time"})
+# Moments that are over by definition: never "in 2 h".
+_PAST_EVENT_KEY = re.compile(
+    r"^(last_at|router_time)$|last[_-]?(logged[_-]?out|seen|disconnect|log[_-]?in|log[_-]?out)"
+    r"|disconnect(ed)?[_-]?at$", re.I)
+_UNVERIFIED = "router clock, unverified"
 
 
 def localize_times(data: Any, tz_name: Optional[str], now: Optional[datetime] = None) -> Any:
@@ -515,7 +559,7 @@ def localize_times(data: Any, tz_name: Optional[str], now: Optional[datetime] = 
 
     now = now or datetime.utcnow()
 
-    def one(value: str) -> str:
+    def one(value: str, past: bool = False) -> str:
         m = _ISO_TIME.match(value.strip())
         if not m:
             return value
@@ -527,6 +571,8 @@ def localize_times(data: Any, tz_name: Optional[str], now: Optional[datetime] = 
             when = when.astimezone(_tz.utc).replace(tzinfo=None)
         local = to_local(when, tz_name)
         secs = (when - now).total_seconds()
+        if past and secs > 120:
+            return f"{value} ({_UNVERIFIED})"
         span = abs(secs)
         if span < 90:
             rel = "now"
@@ -542,8 +588,23 @@ def localize_times(data: Any, tz_name: Optional[str], now: Optional[datetime] = 
         if isinstance(v, list):
             return [walk(x) for x in v]
         if isinstance(v, dict):
-            return {k: walk(x) for k, x in v.items()}
+            return {k: field(v, k, x) for k, x in v.items()}
         return v
+
+    def field(row: dict, key: Any, value: Any) -> Any:
+        if not isinstance(key, str) or not isinstance(value, str) or len(value) > 40:
+            return walk(value)
+        if key.endswith("_utc"):
+            return one(value, past=True)
+        companion = key.replace("-", "_") + "_utc"
+        if companion in row or key in _ROUTER_CLOCK_ONLY:
+            if not value.strip():
+                return value
+            if row.get(companion):
+                return f"{value} (router's own clock; true time in {companion})"
+            return f"{value} ({_UNVERIFIED})"
+        past = bool(_PAST_EVENT_KEY.search(key)) or (key == "time" and "message" in row)
+        return one(value, past=past)
 
     return walk(data)
 
@@ -665,6 +726,17 @@ class Turn:
         self._tz_known = False
         self.usage = TurnUsage()
         self.is_question = False
+        # M-Pesa prompts this turn sent: watched afterwards, so a paid one comes back to the chat
+        self.payment_waits: list[dict] = []
+        self._language_checked = False  # a drafted SMS is sent back for its language once per turn
+        self.waiting_card: Optional[dict] = None  # the one card a typed "confirm" pointed at
+
+    def _card_name(self, action: dict) -> str:
+        """What the card says on screen: the summary it was drawn with, else its title."""
+        for item in reversed(self.transcript):
+            if item.get("type") == "action" and item.get("action_id") == action["id"]:
+                return str(item.get("summary") or item.get("title") or action["title"])
+        return action["title"]
 
     def reload(self, conversation: dict) -> None:
         """Start from the stored history (taken under the conversation lock)."""
@@ -725,16 +797,55 @@ class Turn:
         for image in images:
             content.append(await self._image_block(image))
         label = text or ("(photo)" if len(images) == 1 else "(photos)")
+        refs = [chat_images.remember(self.caller, self.conversation["id"], i) for i in images]
+        if refs:
+            label += (f" [Photo reference{'s' if len(refs) > 1 else ''} for a form's photo field "
+                      f"(kept {chat_images.KEEP_SECONDS // 60} min): {', '.join(refs)}]")
         tz_name, notes = await account_state(self.caller)
         self._tz, self._tz_known = tz_name, True
         account = f"\n[Account now: {' '.join(notes)}]" if notes else ""
-        content.append({"type": "text", "text": f"[{_now_label(tz_name)}]{account} {label}"})
+        waiting = ""
+        if not images and is_go_ahead(text):
+            pending = await store.pending_actions(self.caller, self.conversation["id"])
+            if len(pending) == 1:
+                self.waiting_card = pending[0]
+                waiting = (f"\n[A card is waiting: \"{self._card_name(pending[0])}\". Typed words never run it; "
+                           "only a tap on its Confirm button does. Say in one line that it runs when they tap "
+                           "Confirm on that card. Do not propose it or any other change again.]")
+        content.append({"type": "text", "text": f"[{_now_label(tz_name)}]{account}{waiting} {label}"})
         self.transcript.append({
             "type": "user", "at": datetime.utcnow().isoformat() + "Z", "text": text,
             **({"images": [i.get("thumbnail") for i in images if i.get("thumbnail")]} if images else {}),
         })
         self.messages.append({"role": "user", "content": content})
+        since = len(self.messages)
         await self._loop()
+        self._flag_unrecorded_ask(since)
+
+    def _flag_unrecorded_ask(self, since: int) -> None:
+        """A "no" about what the product does, with no request recorded in this turn: a
+        transcript entry the daily chat review counts. The screen does not draw it, and
+        nothing is recorded on the person's behalf (it would be noise)."""
+        answer = None
+        for item in reversed(self.transcript):
+            if item.get("type") == "user":
+                break
+            if item.get("type") == "assistant" and answer is None:
+                answer = item.get("text") or ""
+        said = capability_no(answer or "")
+        if not said:
+            return
+        for m in self.messages[since:]:
+            if m.get("role") != "assistant" or not isinstance(m.get("content"), list):
+                continue
+            for b in m["content"]:
+                args = b.get("input") if isinstance(b.get("input"), dict) else {}
+                if (b.get("type") == "tool_use" and b.get("name") == "call_api"
+                        and str(args.get("method") or "").upper() == "POST"
+                        and str(args.get("path") or "").split("?", 1)[0].rstrip("/") == "/api/feedback/requests"):
+                    return
+        self.transcript.append({"type": "review_flag", "at": datetime.utcnow().isoformat() + "Z",
+                                "flag": "capability_no_unrecorded", "said": said[:80]})
 
     async def _image_block(self, image: dict) -> dict:
         """The photo as a content block.
@@ -775,6 +886,13 @@ class Turn:
             values = decision.get("values")
             if approve and isinstance(values, dict) and not await self._take_form_values(action_id, values):
                 continue  # refused: the card stays open with what to fix, nothing ran
+            if approve:
+                missed = await self._purpose_missed(action_id, values if isinstance(values, dict) else None)
+                if missed:
+                    lines.append(missed)  # the card stays open; the assistant says what is missing
+                    continue
+            if approve and not await self._use_chat_images(action_id):
+                continue  # a picture from the chat could not be used: the card says why
             if approve and await self._preview_first(action_id):
                 continue  # what it would do is on the card now; the next Confirm does it
             if approve:
@@ -794,6 +912,27 @@ class Turn:
         self.messages.append({"role": "user", "content": [{
             "type": "text",
             "text": "[Confirmation results] " + shaping.to_json_text(lines),
+        }]})
+        await self._loop()
+
+    async def payment_settled(self, wait: dict, status: Any) -> None:
+        """An M-Pesa payment started from this chat was paid. The model is told, so it carries on
+        with what the payment was for (the reminder that could not go out without credits) in this
+        turn, without the person asking. Told once per payment."""
+        marker = shaping.to_json_text({"payment_of": wait["action_id"]})[1:-1]
+        for m in self.messages:
+            if m.get("role") == "user" and isinstance(m.get("content"), list) and any(
+                    marker in str(b.get("text") or "") for b in m["content"] if isinstance(b, dict)):
+                return
+        line = {
+            "payment_of": wait["action_id"], "title": wait["title"],
+            "outcome": ("paid: the M-Pesa payment went through. Say so in one line. If it was bought for a "
+                        "step still to do in this chat (a reminder SMS that could not go out without credits), "
+                        "propose that step's card now, the same request as before, without waiting to be asked."),
+            "status": shaping.for_model(status, limit_chars=800),
+        }
+        self.messages.append({"role": "user", "content": [{
+            "type": "text", "text": "[Confirmation results] " + shaping.to_json_text([line]),
         }]})
         await self._loop()
 
@@ -1041,6 +1180,26 @@ class Turn:
                 names[cid] = pick_label(row, pick.get("label"))
         return names
 
+    async def _purpose_missed(self, action_id: str, typed: Optional[dict]) -> Optional[dict]:
+        """A card opened for one field, confirmed without it: refused, the card told why, and the
+        line for the model so it can say so. None when there is no purpose field or it is filled in."""
+        card = next((i for i in reversed(self.transcript)
+                     if i.get("type") == "action" and i.get("action_id") == action_id), None)
+        field = next((f for f in (card or {}).get("form") or [] if f.get("purpose")), None)
+        if field is None:
+            return None
+        action = await store.pending_action(self.caller, self.conversation["id"], action_id)
+        if action is None:
+            return None  # expired or decided: _run_confirmed says so
+        problem = purpose_problem(field, typed, action.get("body"))
+        if not problem:
+            return None
+        await self.emit("action_result", {"action_id": action_id, "status": "pending", "ok": False,
+                                          "detail": problem})
+        return {"action_id": action_id, "title": action["title"],
+                "outcome": problem + " The card is still open: ask the person to fill it in there, or to "
+                                     "tell you the value. Do not open another form for it."}
+
     async def _take_form_values(self, action_id: str, values: dict) -> bool:
         """Merge a form's values into its pending action. False (and the card told why) if they do not pass."""
         action = await store.pending_action(self.caller, self.conversation["id"], action_id)
@@ -1069,6 +1228,35 @@ class Turn:
         await store.set_action_body(action_id, body)  # stored without the passwords
         if typed_secrets:
             self._form_secrets[action_id] = typed_secrets  # this request only, then forgotten
+        return True
+
+    async def _use_chat_images(self, action_id: str) -> bool:
+        """A photo field set to a picture sent in this chat: upload it the classic page's way and
+        put its address in instead. False (and the card told why) when it cannot be used."""
+        action = await store.pending_action(self.caller, self.conversation["id"], action_id)
+        body = action.get("body") if action is not None else None
+        if not isinstance(body, dict) or not any(chat_images.is_ref(v) for v in body.values()):
+            return True
+        spec, _ = self.catalog.match(action["method"], action["path"])
+        props = ((spec.body_schema if spec is not None else None) or {}).get("properties") or {}
+        body, problems = dict(body), []
+        for name, value in list(body.items()):
+            if not chat_images.is_ref(value):
+                continue
+            if not chat_images.is_image_upload(props.get(name)):
+                problems.append(f"a picture from the chat can only go in a photo field, not {name}")
+                continue
+            try:
+                body[name] = await chat_images.upload(self.app, self.caller, self.conversation["id"], value)
+            except chat_images.Refused as exc:
+                problems.append(str(exc).rstrip("."))
+        if problems:
+            await self.emit("action_result", {
+                "action_id": action_id, "status": "pending", "ok": False,
+                "detail": "Not run yet. " + "; ".join(dict.fromkeys(problems)) + ".",
+            })
+            return False
+        await store.set_action_body(action_id, body)
         return True
 
     def _payment_wait(self, action: dict, data: Any) -> Optional[dict]:
@@ -1162,6 +1350,54 @@ class Turn:
         })
         return True
 
+    async def _sms_language_problem(self, spec: Action, body: Any) -> Optional[str]:
+        """A drafted SMS (an x-sms field) in Swahili for someone who writes English: sent back once
+        per turn to be written in their language (sms_language)."""
+        props = (spec.body_schema or {}).get("properties") or {}
+        drafts = [body[k] for k, p in props.items()
+                  if isinstance(p, dict) and p.get("x-sms") and isinstance(body, dict) and isinstance(body.get(k), str)]
+        if not drafts or self._language_checked:
+            return None
+        problem = sms_language.draft_problem(drafts, sms_language.person_texts(self.messages))
+        if problem is None:
+            return None
+        try:  # the account's own language setting allows Swahili
+            from sqlalchemy import select
+
+            from app.db.database import async_session
+            from app.db.models import User
+
+            async with async_session() as db:
+                preferred = (await db.execute(
+                    select(User.preferred_language).where(User.id == self.caller.user_id))).scalar()
+        except Exception:
+            preferred = None
+        if (preferred or "").strip().lower().startswith("sw"):
+            return None
+        self._language_checked = True
+        return problem
+
+    async def _preview_now(self, spec: Action, params: dict, action: dict) -> Any:
+        """A cheap preview (x-preview-now) put on the card as it is proposed, as if the person had
+        tapped Preview: the card opens with the figures and one Confirm does it. None when the
+        request cannot be previewed yet (a form still to fill in)."""
+        request = self._preview_request(spec, params, action)
+        if request is None:
+            return None
+        method, path, query, body = request
+        try:
+            result = await executor.call_api(self.app, self.caller, method, path, query, body)
+        except Exception:
+            logger.warning("[assistant] preview of %s %s failed", method, path, exc_info=True)
+            return None
+        if not result.ok:
+            return None  # the first Confirm previews it again, once the form is complete
+        await self.emit("action_result", {
+            "action_id": action["id"], "status": "pending", "ok": True, "http_status": result.status,
+            "preview_of": _fingerprint(action), "detail": "", "preview": shaping.for_screen(result.data),
+        })
+        return shaping.for_model(result.data, limit_chars=2000)
+
     async def _offer_retry(self, action: dict, spec: Action, reason: str) -> Optional[str]:
         """The API refused (a duplicate, a conflict) and has a flag to do it anyway: the same
         request with that flag, as a card of its own. Nothing runs until the person confirms it."""
@@ -1219,6 +1455,8 @@ class Turn:
             **({"awaiting": awaiting} if awaiting else {}),
         })
         retry = await self._offer_retry(action, spec, reason or detail) if overridable else None
+        if awaiting and awaiting.get("kind") == "mpesa":
+            self.payment_waits.append({"action_id": action_id, "title": action["title"], "poll": awaiting["poll"]})
         if awaiting:
             outcome = ("payment prompt sent, NOT paid yet: M-Pesa is asking for the PIN on the phone. Say "
                        "so (check the phone, enter the PIN); the card shows when it is paid. Never say it is "
@@ -1291,6 +1529,11 @@ class Turn:
                 said = " ".join(b.get("text", "") for b in content if b.get("type") == "text")
                 if not checked_claim and self.proposals == 0 and _CLAIMS_A_CARD.search(said):
                     checked_claim = True
+                    if self.waiting_card or (not self.is_question and await store.pending_actions(
+                            self.caller, self.conversation["id"])):
+                        # after a typed go-ahead or a tap, "tap Confirm" points at a card already on
+                        # screen: never make it again
+                        return
                     self.messages.append({"role": "user", "content": [{"type": "text", "text": (
                         "[Check] You told the person a form or change is ready, but you did not call "
                         "call_api for it in this answer, so nothing is on their screen. Call "
@@ -1486,6 +1729,14 @@ class Turn:
         if action.is_read(query, body):
             return await self._read(tool_use_id, action, method, path, query, body, show, dropped, fields,
                                     narrowing)
+        if self.waiting_card is not None:
+            # The person typed "confirm" / "sawa" at the one card on screen: another card would
+            # only be a second copy to tap (OPIC router 487 ran its anti-bypass twice this way).
+            return self._tool_result(tool_use_id, {
+                "status": "already_waiting", "action_id": self.waiting_card["id"],
+                "note": (f"Not proposed. The card \"{self._card_name(self.waiting_card)}\" is still on the "
+                         "person's screen and runs only when they tap Confirm on it. Say that in one line."),
+            })
         if action.key not in self._described():
             return self._tool_result(tool_use_id, {
                 "error": f"Before proposing a change, call describe_action for {action.method} "
@@ -1512,6 +1763,18 @@ class Turn:
         fields_for_form = form_fields(action, body, context, zone) if editable and body is not None else None
         if fields_for_form and not self.caller.is_admin:  # Bitwave-only fields (an ad's advertiser) are not asked
             fields_for_form = [f for f in fields_for_form if not f.get("admin_only")] or None
+        purpose = str(args.get("purpose") or "").strip()
+        if purpose and fields_for_form:
+            marked = mark_purpose(fields_for_form, purpose, context, method in ("PUT", "PATCH"), zone)
+            if marked is None:
+                return self._tool_result(tool_use_id, {
+                    "error": f"Not proposed: purpose '{purpose[:60]}' is not a field of this form. Its fields: "
+                             + ", ".join(f["name"] for f in fields_for_form if f.get("kind") != "password")
+                             + ". Send it again with one of those, or without purpose.",
+                }, True)
+            fields_for_form = marked
+        if fields_for_form:  # a photo field offers the pictures sent in this chat
+            chat_images.offer(fields_for_form, self.caller, self.conversation["id"])
         narrowed = await self._offer_choices(fields_for_form, args.get("narrow"), method in ("PUT", "PATCH"),
                                              params, body) if fields_for_form else {}
         empty = {name: n for name, n in narrowed.items() if not n["fit"]}
@@ -1527,6 +1790,9 @@ class Turn:
             return self._tool_result(tool_use_id, {
                 "error": "Not proposed, fix the request first: " + "; ".join(problems) + ".",
             }, True)
+        wrong_language = await self._sms_language_problem(action, body)
+        if wrong_language:
+            return self._tool_result(tool_use_id, {"error": wrong_language}, True)
         if self.caller.read_only:
             return self._tool_result(tool_use_id, {"error": "View-as is read-only: changes are disabled."}, True)
         if self.proposals >= MAX_PROPOSALS_PER_TURN:
@@ -1540,6 +1806,11 @@ class Turn:
             query=query or None, body=body, title=action.title, permission=permission,
             tool_use_id=tool_use_id,
         )
+        # The same change proposed again: only the newest card can be confirmed.
+        replaced = await store.retire_superseded(self.caller, self.conversation["id"], pending)
+        for old in replaced:
+            await self.emit("action_result", {"action_id": old["id"], "status": "expired", "ok": False,
+                                              "detail": "Replaced by a newer card for the same change."})
         await self.emit("action", {
             "action_id": pending["id"], "title": action.title, "summary": summary,
             "method": method, "path": path, "query": shaping.mask(query) if query else None,
@@ -1549,15 +1820,23 @@ class Turn:
             **({"form": fields_for_form} if fields_for_form else {}),
             **({"previews": True} if action.previews else {}),
         })
+        preview = await self._preview_now(action, params, pending) if action.preview_now else None
         return self._tool_result(tool_use_id, {
             "status": "waiting_for_confirmation",
             "action_id": pending["id"],
+            **({"preview": preview,
+                "preview_note": ("These are the server's own figures, also shown on the card: quote them "
+                                 "(credits, recipients, parts) exactly, never your own estimate.")}
+               if preview is not None else {}),
             "note": ("Not run yet. The person sees this as a form, fills in or corrects the fields, "
                      "and confirms; the confirmation result tells you the values that ran. If this fixes a "
                      "problem the person raised, say the cause in words first.")
                     if fields_for_form else "Not run yet. The person sees a confirm card with this exact request.",
             **({"pickers": {name: n["fit"] for name, n in narrowed.items()}} if narrowed else {}),
             **({"ignored_query_params": dropped} if dropped else {}),
+            **({"replaced": [old["id"] for old in replaced],
+                "replaced_note": "This card replaces the earlier card for the same change; that one is "
+                                 "closed and cannot run."} if replaced else {}),
         })
 
     async def _all_pages(self, action: Action, path: str, query: Optional[dict], first: Any) -> tuple[Any, Optional[str]]:
@@ -1623,12 +1902,18 @@ class Turn:
             except listing.ListingError as exc:
                 return self._tool_result(tool_use_id, {"error": str(exc)}, True)
         note = None
+        if action.key == PPPOE_LOGIN_ACTION and isinstance(data, dict):
+            return await self._pppoe_login_card(tool_use_id, call_id, action, method, path, data, status=result.status)
         if show != "none":
             # What reaches the screen is the answer, not the search for it: an empty
             # result is said in words, the same lookup again replaces the first one,
             # and an answer shows at most MAX_DRAWN results.
             replaces = self.drawn.get(action.key)
-            if _is_empty(data):
+            if _is_empty(data) and isinstance(data, dict) and data.get("did_you_mean"):
+                show, note = "none", ("Nothing matched exactly, so not drawn. did_you_mean holds close matches: "
+                                      "do not say nothing was found; ask \"Did you mean <name>?\" with the "
+                                      "closest one or two as the NEXT choices.")
+            elif _is_empty(data):
                 show, note = "none", "Empty, so not drawn: say so in words."
             elif replaces is None and len(self.drawn) >= MAX_DRAWN:
                 show, note = "none", (f"Not drawn: {MAX_DRAWN} results are already on screen for this answer. "
@@ -1641,7 +1926,10 @@ class Turn:
                     **({"replaces": replaces} if replaces else {}),
                     "payload": shaping.for_screen(data),
                 })
-        out: dict = {"status": result.status, "data": localize_times(shaping.for_model(data), await self._zone())}
+        # figures over a cut list say when the read itself was only part of the list
+        one_part = partial if narrowing else listing.partial_read(action.query_params, query, data)
+        out: dict = {"status": result.status, "data": localize_times(
+            shaping.for_model(router_names.mark_shared_names(data), partial=one_part), await self._zone())}
         if note:
             out["display"] = note
         if narrowed_note:
@@ -1649,6 +1937,38 @@ class Turn:
         if dropped:
             out["ignored_query_params"] = dropped
         return self._tool_result(tool_use_id, out)
+
+    async def _pppoe_login_card(self, tool_use_id, call_id, action: Action, method, path, data: dict, *, status) -> dict:
+        """A PPPoE customer's login, drawn for the signed-in person only.
+
+        The API already decided this person may see it (their own customer, and
+        customers.manage for staff, as on the classic customers page). The card on
+        their screen carries the password; the model, the stored transcript and the
+        support view get it masked. A reopened chat fetches it again on Show.
+        """
+        login = {k: data.get(k) for k in PPPOE_LOGIN_FIELDS}
+        replaces = self.drawn.get(action.key)
+        self.drawn[action.key] = call_id
+        event = {"call_id": call_id, "title": action.title, "method": method, "path": path, "query": None,
+                 "show": "pppoe_login", **({"replaces": replaces} if replaces else {})}
+        await self.emit("data", {**event, "payload": login}, keep=False)
+        kept = {k: v for k, v in login.items() if k != "pppoe_password"}
+        kept["password_on_request"] = bool(data.get("pppoe_password"))
+        self.transcript.append({"type": "data", "at": datetime.utcnow().isoformat() + "Z", **event, "payload": kept})
+        return self._tool_result(tool_use_id, {
+            "status": status,
+            "data": localize_times(shaping.for_model(data), await self._zone()),
+            "display": ("The PPPoE login card is on the person's screen: username, the password behind a Show "
+                        "tap with a copy button, the router and its PPPoE ports. Do not refuse or call the "
+                        "password hidden: tell them to tap Show on the card and type both exactly as shown into "
+                        "the customer's router. Never write the password yourself."),
+        })
+
+
+# The PPPoE customer's login (GET /api/customers/{id}/pppoe-credentials) is drawn as its own card.
+PPPOE_LOGIN_ACTION = "GET /api/customers/{customer_id}/pppoe-credentials"
+PPPOE_LOGIN_FIELDS = ("customer_id", "name", "pppoe_username", "pppoe_password", "router_id", "router_name",
+                      "pppoe_ports", "status", "expiry", "plan_name")
 
 
 def _without_overrides(action: Action, query: Optional[dict], body: Any) -> tuple:
@@ -1724,7 +2044,7 @@ def _is_empty(data) -> bool:
     if isinstance(data, list):
         return not data
     if isinstance(data, dict):
-        lists = [v for v in data.values() if isinstance(v, list)]
+        lists = [v for k, v in data.items() if isinstance(v, list) and k != "did_you_mean"]
         return bool(lists) and all(not v for v in lists) and not data.get("total")
     return data is None
 
@@ -1733,6 +2053,50 @@ def _is_empty(data) -> bool:
 _CLAIMS_A_CARD = re.compile(
     r"(tap confirm|bonyeza confirm|fill (it|them|this|the form|in the form)? ?in|form is ready|"
     r"fomu iko tayari|jaza fomu)", re.I)
+
+# A typed go-ahead and nothing else ("confirm", "ok do it", "sawa"). Words never run a card.
+_GO_AHEAD = frozenset({
+    "confirm", "confirmed", "i confirm", "confirm it", "yes", "yes confirm", "yes do it", "yes go ahead",
+    "yes proceed", "yep", "yeah", "yah", "sure", "ok", "okay", "ok confirm", "ok do it", "okay do it",
+    "ok go ahead", "do it", "go ahead", "go on", "proceed", "run it", "approve", "approved",
+    "sawa", "sawa sawa", "sawa fanya", "fanya", "endelea", "ndio", "ndiyo", "ndio fanya", "thibitisha",
+})
+_GO_AHEAD_FILLER = frozenset({"please", "pls", "plz", "now", "thanks", "thank you", "asante", "tafadhali"})
+
+
+def is_go_ahead(text: str) -> bool:
+    words = re.sub(r"[^\w\s]", " ", str(text or "").lower()).split()
+    phrase = " ".join(words)
+    for filler in sorted(_GO_AHEAD_FILLER, key=len, reverse=True):
+        if phrase.endswith(" " + filler):
+            phrase = phrase[: -len(filler) - 1]
+        if phrase.startswith(filler + " "):
+            phrase = phrase[len(filler) + 1:]
+    return phrase in _GO_AHEAD
+
+
+# An answer that says the product cannot do something ("No — Bitwave sends SMS, not
+# WhatsApp", "I can't ... yet", "Bitwave doesn't ..."), read from its first sentence.
+# "I can't find / reach / say" is a lookup or a fault, not a missing feature.
+_CAPABILITY_NO = re.compile(
+    r"^\W*not\s+yet\b"
+    r"|\bi\s+(?:can(?:'|’)?t|cannot|(?:am|'m|’m)\s+not\s+able\s+to)"
+    r"(?!\s+(?:find|reach|read|connect|load|open|tell|say|get\s+through)\b)"
+    r"|\bbitwave\s+(?:doesn(?:'|’)?t|does\s+not|has\s+no|can(?:'|’)?t|cannot)\b"
+    r"|\bnot\s+(?:possible|supported|available)\s+yet\b", re.I)
+_BARE_NO = re.compile(r"^\W*no\s*[—–,.:;!-]", re.I)   # "No — ..." only counts when it is about the product
+_ABOUT_PRODUCT = re.compile(r"\b(?:bitwave|the app|the dashboard|feature|yet)\b", re.I)
+
+
+def capability_no(answer: str) -> Optional[str]:
+    """The words in an answer's first sentence that say the product cannot do it, or None."""
+    first = re.split(r"(?<=[.!?])\s|\n", (answer or "").strip(), maxsplit=1)[0][:240]
+    m = _CAPABILITY_NO.search(first)
+    if m:
+        return m.group(0).strip()
+    if _BARE_NO.search(first) and _ABOUT_PRODUCT.search(first):
+        return first.split()[0].strip(" —–,.:;!-") or "No"
+    return None
 
 # A state read from a live thing, as people say it ("ether2 · PPPoE").
 _STATE_WORDS = {"pppoe": "PPPoE", "plain": "Plain (no login)", "dual": "PPPoE + hotspot", "hotspot": "Hotspot",

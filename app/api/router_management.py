@@ -43,9 +43,10 @@ from app.services.router_availability import (
     uptime_outages,
     time_based_uptime,
     uptime_timeline,
+    with_down_since,
     ROUTER_AVAILABILITY_RETENTION_DAYS,
 )
-from app.services.provisioning import provision_base_url_for_vpn
+from app.services.provisioning import provision_base_url_for_vpn, router_name_taken
 from app.services.router_helpers import connect_to_router
 from app.services.router_remote_access import (
     RouterRemoteAccessError,
@@ -1721,7 +1722,12 @@ async def get_router_uptime(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Get availability and uptime statistics for a router."""
+    """Get availability and uptime statistics for a router.
+
+    Each outage has down_since (the last successful contact: when it went down) and
+    checks_failing_since (when Bitwave's checks began failing, later). down_now is the
+    current outage, or null when the router is up.
+    """
     user = await get_current_user(token, db)
     stmt = select(Router).where(Router.id == router_id, Router.user_id == user.id)
     result = await db.execute(stmt)
@@ -1788,7 +1794,11 @@ async def get_router_uptime(
             if (datetime.fromisoformat(o["ended_at"]) if o.get("ended_at") else now) > since
         ]
 
-    window_outages = in_window(outages)
+    # "When did it go down" is the last successful contact before each outage,
+    # not the first failed check (CR-1123-B4: 08:42, not 08:53).
+    contact_times = [c["checked_at"] for c in all_checks if c["is_online"]] + list(contacts)
+    window_outages = with_down_since(in_window(outages), contact_times)
+    ongoing = next((o for o in reversed(window_outages) if not o.get("ended_at")), None)
     flap_summary = summarize_router_flaps(window_checks, now=now)
 
     return {
@@ -1814,6 +1824,13 @@ async def get_router_uptime(
             "online_checks": sum(1 for c in window_checks if c["is_online"]),
             **window_stats,
         },
+        "down_now": None if ongoing is None else {
+            "down_since": ongoing["down_since"],
+            "checks_failing_since": ongoing["checks_failing_since"],
+        },
+        "outage_times_note": ("down_since is the router's last successful contact: the answer to "
+                              "'when did it go down'. checks_failing_since (= started_at) is only "
+                              "when Bitwave's checks began failing, a later second detail."),
         "outages": window_outages[-50:],
         "tunnel_outages": in_window(tunnel_outages)[-50:],
         "timeline": uptime_timeline(
@@ -1839,6 +1856,9 @@ async def get_router_uptime(
     }
 
 
+ROUTER_NAME_TAKEN = "Another of your routers already has this name. Pick a different name."
+
+
 @router.post("/api/routers/create")
 async def create_router_api(
     request: RouterCreateRequest,
@@ -1856,8 +1876,9 @@ async def create_router_api(
         existing_result = await db.execute(existing_router_stmt)
         if existing_result.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="Router with this IP address already exists")
-        
-        
+        if await router_name_taken(db, user.id, request.name):
+            raise HTTPException(status_code=409, detail=ROUTER_NAME_TAKEN)
+
         router_obj = Router(
             user_id=user.id,
             name=request.name,
@@ -2019,7 +2040,11 @@ async def update_router(
         
         if not router_obj:
             raise HTTPException(status_code=404, detail="Router not found")
-        
+        if request.name != router_obj.name and await router_name_taken(
+            db, user.id, request.name, exclude_router_id=router_obj.id
+        ):
+            raise HTTPException(status_code=409, detail=ROUTER_NAME_TAKEN)
+
         router_obj.name = request.name
         router_obj.ip_address = request.ip_address
         router_obj.port = request.port
@@ -2857,3 +2882,117 @@ async def close_hotspot_proxy_bypass(
     if not result.get("success"):
         raise HTTPException(status_code=502, detail={"message": "The router refused part of the change", **result})
     return {"success": True, "message": "The hotspot proxy can no longer be used to browse without paying.", **result}
+
+
+# ---- Fleet: routers missing the anti-bypass rule (admin only) ----------------
+
+ANTI_BYPASS_SCAN_MAX = 100
+ANTI_BYPASS_APPLY_MAX = 50
+
+
+@router.get("/api/admin/anti-bypass/scan")
+async def scan_fleet_anti_bypass(
+    limit: int = Query(40, ge=1, le=ANTI_BYPASS_SCAN_MAX),
+    offset: int = Query(0, ge=0),
+    concurrency: int = Query(3, ge=1, le=6),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Admin only. Read-only fleet scan for the HTTP Injector bypass: which online
+    routers (last_status true) have a hotspot whose proxy is open because Bitwave's
+    relay block is missing. Same check as GET /api/routers/{id}/checkup. Pages
+    through the online routers by id (`offset`, `limit`, `next_offset`), a few
+    routers at a time. Returns router id, account id and status per router
+    (open / protected / no_hotspot / unreachable / error); `open` lists the ids to
+    pass to POST /api/admin/anti-bypass/apply. Changes nothing."""
+    from app.services import anti_bypass_fleet
+
+    user = await get_current_user(token, db)
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin role required")
+
+    online = Router.last_status.is_(True)
+    total = (await db.execute(select(func.count()).select_from(Router).where(online))).scalar() or 0
+    routers = (await db.execute(
+        select(Router).where(online).order_by(Router.id).offset(offset).limit(limit)
+    )).scalars().all()
+    infos = [anti_bypass_fleet.router_info(r) for r in routers]
+    ids = [i["id"] for i in infos]
+    with_setup = set((await db.execute(
+        select(ProvisioningToken.router_id).where(ProvisioningToken.router_id.in_(ids)).distinct()
+    )).scalars().all()) if ids else set()
+    await db.commit()   # nothing held open across the RouterOS calls
+
+    results = await anti_bypass_fleet.scan(infos, concurrency)
+    for r in results:
+        r["fixable"] = r["router_id"] in with_setup
+    next_offset = offset + len(infos)
+    return {
+        "online_total": total,
+        "offset": offset,
+        "scanned": len(results),
+        "next_offset": next_offset if next_offset < total else None,
+        "summary": anti_bypass_fleet.summarize(results),
+        "open": [r["router_id"] for r in results if r["status"] == "open"],
+        "results": results,
+    }
+
+
+class AntiBypassApplyRequest(BaseModel):
+    router_ids: List[int]
+    concurrency: int = 3
+
+    @field_validator("router_ids")
+    @classmethod
+    def _bounded(cls, v: List[int]) -> List[int]:
+        v = list(dict.fromkeys(v))
+        if not v:
+            raise ValueError("router_ids must not be empty")
+        if len(v) > ANTI_BYPASS_APPLY_MAX:
+            raise ValueError(f"at most {ANTI_BYPASS_APPLY_MAX} routers per call")
+        return v
+
+
+@router.post("/api/admin/anti-bypass/apply")
+async def apply_fleet_anti_bypass(
+    request: AntiBypassApplyRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Admin only. Close the HTTP Injector bypass on the given routers (at most 50),
+    a few at a time: exactly what POST /api/routers/{id}/anti-bypass does
+    (idempotent), then the check-up's check again on each router. One failure does
+    not stop the batch. Per router: fixed / failed / unreachable / error /
+    not_found / no_setup_record."""
+    from app.services import anti_bypass_fleet
+    from app.services.provisioning import portal_allow_entries
+
+    user = await get_current_user(token, db)
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin role required")
+
+    ids = request.router_ids
+    routers = {r.id: r for r in (await db.execute(select(Router).where(Router.id.in_(ids)))).scalars().all()}
+    tokens: dict[int, ProvisioningToken] = {}
+    for pt in (await db.execute(
+        select(ProvisioningToken).where(ProvisioningToken.router_id.in_(ids))
+        .order_by(ProvisioningToken.created_at.desc())
+    )).scalars().all():
+        tokens.setdefault(pt.router_id, pt)   # the latest setup record, as the one-router fix uses
+
+    skipped: dict[int, dict] = {}
+    jobs: list[tuple[dict, list[str]]] = []
+    for rid in ids:
+        r = routers.get(rid)
+        if r is None:
+            skipped[rid] = {"router_id": rid, "account_id": None, "status": "not_found"}
+        elif rid not in tokens:
+            skipped[rid] = {"router_id": rid, "account_id": r.user_id, "status": "no_setup_record"}
+        else:
+            jobs.append((anti_bypass_fleet.router_info(r), portal_allow_entries(tokens[rid])))
+    await db.commit()   # nothing held open across the RouterOS calls
+
+    done = {r["router_id"]: r for r in await anti_bypass_fleet.apply(jobs, request.concurrency)}
+    results = [done.get(rid) or skipped[rid] for rid in ids]
+    logger.info("Fleet anti-bypass by admin %s: %s", user.id, anti_bypass_fleet.summarize(results))
+    return {"summary": anti_bypass_fleet.summarize(results), "results": results}

@@ -23,6 +23,7 @@ from app.services import customer_sms_templates as sms_templates
 from app.services.markets import reseller_market
 from app.services.messaging import accounts as provider_accounts
 from app.services.messaging import count_segments, gateway_health, resolve_sender_id
+from app.services.messaging.segments import encoding, non_gsm_characters
 from app.services.messaging.failure_reasons import describe as describe_failure
 from app.services.mpesa import initiate_stk_push_direct
 
@@ -580,20 +581,80 @@ class SendRequest(BaseModel):
     template_id: Optional[int] = None
 
 
-@router.post("/api/messaging/send")
+def _picked(req: SendRequest, user) -> dict:
+    """Who a send goes to, as resolve_recipients takes it."""
+    return dict(filter=req.filter, plan_id=req.plan_id, customer_ids=req.customer_ids,
+                exclude_customer_ids=req.exclude_customer_ids,
+                tz_name=reseller_market(user).timezone)
+
+
+def _covers(balance: int, per_message: int) -> int:
+    return balance // per_message if per_message > 0 else 0
+
+
+@router.post("/api/messaging/send/preview")
+async def preview_send(req: SendRequest,
+                       db: AsyncSession = Depends(get_db),
+                       token: str = Depends(verify_token)):
+    """What a send would cost, before it is sent: recipients (customers without a phone get
+    nothing and are not counted), SMS parts per message (GSM-7: 160 for one part, 153 per part
+    after; any other character such as an emoji or a smart quote makes it UCS-2: 70 / 67),
+    credits needed, the balance, and how many recipients the balance covers when it is short.
+    Changes nothing. Quote these figures for a send, never an estimate."""
+    user = await _require_reseller(token, db)
+    picked = _picked(req, user)
+    recips = await sms_dispatch.resolve_recipients(db, user.id, **picked)
+    without_phone = await sms_dispatch.count_without_phone(db, user.id, **picked)
+    segments = count_segments(req.body)
+    bills_credits = await provider_accounts.bills_platform_credits(db, user.id)
+    per_message = segments if bills_credits else 0
+    total = per_message * len(recips)
+    balance = (await sms_credits.get_or_create_account(db, user.id)).balance if bills_credits else None
+    await db.commit()
+    enough = (not bills_credits) or balance >= total
+    covers = len(recips) if enough else min(_covers(balance, per_message), len(recips))
+    parts = f"{segments} SMS part{'s' if segments != 1 else ''}"
+    if not recips:
+        summary = "No customer with a phone number matches, so nobody would get it."
+    elif not bills_credits:
+        summary = (f"{len(recips)} recipient{'s' if len(recips) != 1 else ''}, {parts} each; "
+                   "sent through your own SMS gateway, so it uses no Bitwave credits.")
+    else:
+        summary = (f"{len(recips)} recipient{'s' if len(recips) != 1 else ''} × {parts} = "
+                   f"{total} credit{'s' if total != 1 else ''}; you have {balance}"
+                   + ("." if enough else f", enough for {covers} of the {len(recips)} recipients."))
+    if without_phone:
+        summary += f" {without_phone} picked customer{'s have' if without_phone != 1 else ' has'} no phone number and get nothing."
+    return {
+        "summary": summary,
+        "recipients": len(recips),
+        "without_phone": without_phone,
+        "characters": len(req.body),
+        "encoding": encoding(req.body),
+        "non_gsm_characters": non_gsm_characters(req.body),
+        "parts_per_message": segments,
+        "credits_per_message": per_message,
+        "credits_needed": total,
+        "credits_balance": balance,
+        "enough_credits": enough,
+        "balance_covers_recipients": covers,
+        "uses_own_gateway": not bills_credits,
+    }
+
+
+@router.post("/api/messaging/send",
+             openapi_extra={"x-preview": "/api/messaging/send/preview", "x-preview-now": True})
 async def send_messages(req: SendRequest, background: BackgroundTasks,
                         db: AsyncSession = Depends(get_db),
                         token: str = Depends(verify_token)):
+    """Send an SMS to customers. Costs credits per recipient × SMS part: the card shows the
+    figures from POST /api/messaging/send/preview."""
     user = await _require_reseller(token, db)
     s = await _get_settings(db)
     if not s.enabled:
         raise HTTPException(status_code=400, detail="Messaging is disabled")
 
-    recips = await sms_dispatch.resolve_recipients(
-        db, user.id, filter=req.filter, plan_id=req.plan_id,
-        customer_ids=req.customer_ids,
-        exclude_customer_ids=req.exclude_customer_ids,
-        tz_name=reseller_market(user).timezone)
+    recips = await sms_dispatch.resolve_recipients(db, user.id, **_picked(req, user))
     if not recips:
         raise HTTPException(status_code=400, detail="No recipients matched")
 
@@ -611,6 +672,7 @@ async def send_messages(req: SendRequest, background: BackgroundTasks,
                 "message": "Insufficient SMS credits",
                 "required": total, "balance": acct.balance,
                 "shortfall": total - acct.balance,
+                "balance_covers_recipients": _covers(acct.balance, per_message_credits),
             })
 
     # Stamp the sender ID of the gateway that will actually carry this

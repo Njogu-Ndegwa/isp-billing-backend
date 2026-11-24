@@ -141,6 +141,23 @@ async def get_profile(
     return await _identity_profile(db, user, token)
 
 
+@router.get("/api/profile/setup-status")
+async def get_setup_status(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Where this account stands in its first setup. Read it first when someone asks to set up
+    their account, get started, or is stuck. Four steps, each done, missing or problem (router
+    connected and online; at least one plan people can see; a payment method linked to the router;
+    a support phone), and `next`: the first step not done and exactly what to do about it
+    (`propose`: the request to send as is; `ask`: one question to ask before the form in `then`).
+    `set_up` is true when every step is done."""
+    from app.services.account_setup import setup_status
+
+    user = await get_current_user(token, db)
+    return await setup_status(db, user)
+
+
 # ---------------------------------------------------------------------------
 # PATCH  /api/profile  — update profile fields
 # ---------------------------------------------------------------------------

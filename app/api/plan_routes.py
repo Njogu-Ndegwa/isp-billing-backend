@@ -15,6 +15,7 @@ from app.db.models import (
     MtnMomoTransaction, MtnMomoTransactionStatus, FapshiTransaction, FapshiTransactionStatus,
 )
 from app.services.auth import verify_token, get_current_user
+from app.services import local_day
 from app.services.plan_cache import (
     get_plans_cached,
     invalidate_plan_cache,
@@ -421,6 +422,95 @@ async def create_plan_api(
         raise HTTPException(status_code=500, detail=f"Failed to create plan: {str(e)}")
 
 
+STARTER_PLANS = (  # (price field, plan name, duration, unit)
+    ("price_1_hour", "1 Hour", 1, DurationUnit.HOURS),
+    ("price_3_hours", "3 Hours", 3, DurationUnit.HOURS),
+    ("price_24_hours", "24 Hours", 24, DurationUnit.HOURS),
+    ("price_1_week", "1 Week", 7, DurationUnit.DAYS),
+)
+
+
+class StarterPlansRequest(BaseModel):
+    price_1_hour: Optional[int] = Field(None, description="Price of the 1 hour plan; leave empty to skip it.")
+    price_3_hours: Optional[int] = Field(None, description="Price of the 3 hours plan; leave empty to skip it.")
+    price_24_hours: Optional[int] = Field(None, description="Price of the 24 hours plan; leave empty to skip it.")
+    price_1_week: Optional[int] = Field(None, description="Price of the 1 week plan; leave empty to skip it.")
+    speed: str = Field("5M/5M", description="Speed of every plan in the set, e.g. 5M/5M.")
+    max_shared_users: Optional[int] = Field(1, description="Devices per purchase.")
+
+
+@router.post("/api/plans/starter-set")
+async def create_starter_plans_api(
+    request: StarterPlansRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token)
+):
+    """Create a starter set of hotspot plans in one go (1 hour, 3 hours, 24 hours, 1 week), on sale on
+    every router. For an account's first plans: the setup status (GET /api/profile/setup-status) gives
+    the prices for the account's market, so the form arrives filled in. A plan whose name already
+    exists is skipped; a price left empty skips that plan."""
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
+    _validate_plan_speed(request.speed)
+    max_shared_users = _validate_max_shared_users(request.max_shared_users)
+    wanted = [(name, getattr(request, field), value, unit) for field, name, value, unit in STARTER_PLANS
+              if getattr(request, field) is not None]
+    if not wanted:
+        raise HTTPException(status_code=400, detail="Give a price for at least one plan")
+    if any(price < 0 for _, price, _, _ in wanted):
+        raise HTTPException(status_code=400, detail="Price cannot be negative")
+    taken = set((await db.execute(
+        select(Plan.name).where(Plan.user_id == user.id, Plan.name.in_([w[0] for w in wanted]))
+    )).scalars().all())
+    created, skipped = [], sorted(taken)
+    for name, price, value, unit in wanted:
+        if name in taken:
+            continue
+        plan = Plan(name=name, speed=request.speed, price=price, duration_value=value, duration_unit=unit,
+                    connection_type=ConnectionType.HOTSPOT, user_id=user.id, plan_type=PlanType.REGULAR,
+                    is_hidden=False, max_shared_users=max_shared_users, fup_period=FUP_PERIOD_PLAN)
+        db.add(plan)
+        created.append(plan)
+    await db.flush()
+    out = {
+        "created": [{"id": p.id, "name": p.name, "price": p.price, "speed": p.speed,
+                     "duration_value": p.duration_value, "duration_unit": p.duration_unit.value}
+                    for p in created],
+        "skipped_existing": skipped,
+    }
+    await db.commit()
+    await invalidate_plan_cache()
+    logger.info("Starter plans created for user %s: %s", user.id, [p["name"] for p in out["created"]])
+    return out
+
+
+class UnhidePlansRequest(BaseModel):
+    plan_ids: Optional[List[int]] = Field(
+        None, description="The hidden plans to put back on sale; leave out for every hidden plan.")
+
+
+@router.post("/api/plans/unhide")
+async def unhide_plans_api(
+    request: UnhidePlansRequest,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token)
+):
+    """Show hidden plans again, so customers can buy them on the hotspot login page. Use it when the
+    plans exist but are all hidden, instead of creating new ones."""
+    user = await get_current_user(token, db)
+    enforce_active_subscription(user)
+    query = select(Plan).where(Plan.user_id == user.id, Plan.is_hidden.is_(True))
+    if request.plan_ids:
+        query = query.where(Plan.id.in_(request.plan_ids))
+    plans = (await db.execute(query)).scalars().all()
+    out = {"shown": [{"id": p.id, "name": p.name} for p in plans], "count": len(plans)}
+    for plan in plans:
+        plan.is_hidden = False
+    await db.commit()
+    await invalidate_plan_cache()
+    return out
+
+
 @router.get("/api/plans")
 async def get_plans_api(
     connection_type: Optional[str] = None,
@@ -798,14 +888,14 @@ async def get_plan_performance(
         )
 
         # Apply date filters if provided
+        # A date alone is that day on the account's own clock, as on the
+        # payment listings (local_day).
         if start_date:
-            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+            start_dt = local_day.range_start(start_date, user)
             payments = payments.where(CustomerPayment.created_at >= start_dt)
 
         if end_date:
-            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-            if 'T' not in end_date:
-                end_dt = end_dt.replace(hour=23, minute=59, second=59)
+            end_dt = local_day.range_end(end_date, user)
             payments = payments.where(CustomerPayment.created_at <= end_dt)
 
         payments = payments.subquery()

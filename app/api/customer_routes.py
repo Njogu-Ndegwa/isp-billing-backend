@@ -1605,6 +1605,28 @@ def _list_filters(status, connection_type, overdue, search, now) -> list:
     return out
 
 
+async def _did_you_mean(db: AsyncSession, conditions: list, search: str) -> list[dict]:
+    """Close matches for a search that found no one, best first: a short read of four
+    columns of this reseller's customers (capped), scored in memory."""
+    from app.services import customer_fuzzy
+
+    pool = (await db.execute(
+        select(Customer.id, Customer.name, Customer.phone, Customer.account_number)
+        .where(*conditions).order_by(Customer.id).limit(customer_fuzzy.MAX_POOL)
+    )).all()
+    close = customer_fuzzy.close_matches(search, pool)
+    if not close:
+        return []
+    by_id = {r.id: r for r in pool}
+    statuses = dict((await db.execute(
+        select(Customer.id, Customer.status).where(Customer.id.in_([m["id"] for m in close]))
+    )).all())
+    return [{"id": m["id"], "name": by_id[m["id"]].name, "phone": by_id[m["id"]].phone,
+             "account_number": by_id[m["id"]].account_number,
+             "status": getattr(statuses.get(m["id"]), "value", None),
+             "matched_on": m["matched_on"], "score": m["score"]} for m in close]
+
+
 @router.get("/api/customers")
 async def get_customers_api(
     router_id: Optional[int] = None,
@@ -1642,6 +1664,10 @@ async def get_customers_api(
 
     With both `page` and `per_page`, returns one page (ordered by id) as
     `{data, page, per_page, total, total_pages}`; otherwise the full array.
+
+    When `search` matches no one, close matches by name, phone (one digit off) or
+    account number come back as `{data: [], total: 0, did_you_mean: [...]}`
+    (best first). They are not results: offer them ("Did you mean Amina?").
     """
     tier_filter = _validate_tier(tier)
     try:
@@ -1657,7 +1683,7 @@ async def get_customers_api(
             conditions.append(has_paid)
         elif tier_filter == "visitor":
             conditions.append(~has_paid)
-        conditions.extend(_list_filters(status, connection_type, overdue, search, now))
+        conditions.extend(_list_filters(status, connection_type, overdue, None, now))
         if plan_id is not None:
             conditions.append(Customer.plan_id == plan_id)
         if expires:
@@ -1666,6 +1692,8 @@ async def get_customers_api(
             conditions.extend(expiry_between(*expiry_window(expires, now, reseller_market(user).timezone)))
         if online is not None:
             conditions.append(await _online_condition(db, user, online))
+        base = list(conditions)   # everything but the search, for close matches
+        conditions.extend(_list_filters(None, None, None, search, now))
         stmt = (
             select(Customer, has_paid.label("has_paid"))
             .where(*conditions)
@@ -1724,7 +1752,14 @@ async def get_customers_api(
             }
             for c, c_has_paid in rows
         ]
-        return _page_envelope(items, page, per_page, total) if paged else items
+        out = _page_envelope(items, page, per_page, total) if paged else items
+        if (search or "").strip() and not items and not total:
+            # nothing contains it: offer close matches (one wrong letter or digit) beside the
+            # empty result, among the same customers the other filters allow
+            close = await _did_you_mean(db, base, search)
+            if close:
+                out = {**(out if paged else {"data": [], "total": 0}), "did_you_mean": close}
+        return out
     except Exception as e:
         logger.error(f"Error fetching customers: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch customers")
@@ -2420,8 +2455,12 @@ async def deactivate_pppoe_customer(
             raise HTTPException(status_code=400, detail="Customer does not have PPPoE credentials")
 
         remove_result = None
+        router_removal_pending = False
         if customer.router:
             payload = build_pppoe_remove_payload(customer, customer.router)
+            # The safety net (reconcile_inactive_pppoe_access_background) only
+            # covers direct-API routers.
+            deferrable = customer.router.auth_method != RouterAuthMethod.RADIUS
             await db.commit()
             remove_result = await call_pppoe_remove(payload)
             if not remove_result or not remove_result.get("success"):
@@ -2430,6 +2469,23 @@ async def deactivate_pppoe_customer(
                     if isinstance(remove_result, dict)
                     else "PPPoE removal returned no result"
                 )
+            if (
+                deferrable
+                and isinstance(remove_result, dict)
+                and remove_result.get("error") == "Failed to connect to router"
+            ):
+                # Router unreachable (CR-1123-B8): deactivate in billing now. The
+                # inactive-PPPoE safety net removes the secret and any session
+                # once the router is back, then records the success log that
+                # stops it repeating; until then there is no success log here.
+                router_removal_pending = True
+                logger.warning(
+                    "PPPoE customer %s deactivated while router %s is unreachable; "
+                    "router removal deferred to the inactive-PPPoE safety net",
+                    customer_id,
+                    customer.router_id,
+                )
+            elif not remove_result or not remove_result.get("success"):
                 logger.error(
                     "Refusing to deactivate PPPoE customer %s because router "
                     "enforcement failed: %s",
@@ -2454,19 +2510,51 @@ async def deactivate_pppoe_customer(
                 status="success",
                 details="Manual deactivation confirmed session and secret absent",
             ))
+        elif router_removal_pending:
+            db.add(ProvisioningLog(
+                customer_id=customer.id,
+                router_id=customer.router_id,
+                action="pppoe_deactivation",
+                status="pending",
+                details=(
+                    "Manual deactivation while the router was unreachable; the "
+                    "inactive-PPPoE safety net removes the secret when it is back"
+                ),
+            ))
         await db.commit()
         await record_customer_event(
             customer.id, "pppoe_deactivated",
-            "PPPoE deactivated: session disconnected and secret removed from the router",
+            (
+                "PPPoE deactivated in Bitwave; the router was unreachable, so the "
+                "secret and session are removed when it is back online"
+                if router_removal_pending
+                else "PPPoE deactivated: session disconnected and secret removed from the router"
+            ),
+            severity="warning" if router_removal_pending else "info",
             actor=user, user_id=user.id, router_id=customer.router_id,
         )
 
+        if router_removal_pending:
+            message = (
+                "The customer is deactivated in Bitwave. Their router is offline right "
+                "now, so their PPPoE login will be removed from the router automatically "
+                "when it is back online. Nothing else needs to be done."
+            )
+        elif remove_result:
+            message = "The customer is deactivated and removed from the router."
+        else:
+            message = "The customer is deactivated in Bitwave."
         return {
             "success": True,
             "customer_id": customer.id,
             "status": customer.status.value,
-            "remove_result": "ok" if remove_result and remove_result.get("success") else "failed",
+            "remove_result": (
+                "pending" if router_removal_pending
+                else "ok" if remove_result and remove_result.get("success") else "failed"
+            ),
             "remove_error": remove_result.get("error") if remove_result else None,
+            "router_removal_pending": router_removal_pending,
+            "message": message,
         }
     except HTTPException:
         raise
@@ -2929,7 +3017,13 @@ async def static_customer_status(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Live router view of a static-IP customer: access, speed queue, pin, device."""
+    """Live router view of a static-IP customer: access, speed queue, pin, device.
+
+    actual_access / in_sync say whether the router lets the customer through.
+    device_online says whether their device answers the router right now (its ARP
+    entry, traffic on the queue); device_note says why not. "Is X offline" is
+    device_online, never access: access can be enabled while the device is off.
+    """
     user = await get_current_user(token, db)
     customer = await _load_static_customer(db, customer_id, user)
     expected_access = customer_should_have_access(customer)
@@ -2951,11 +3045,18 @@ async def static_customer_status(
         None if router_state.get("error")
         else "enabled" if binding.get("enabled") else "suspended"
     )
+    device = router_state.get("device") or {}
     return {
         **info,
         "router": router_state,
         "actual_access": actual_access,
         "in_sync": actual_access == info["expected_access"] and bool(router_state.get("queue")),
+        "device_online": None if router_state.get("error") or not device else device.get("online"),
+        "device_note": (
+            "unknown: the router could not be read" if router_state.get("error") or not device
+            else "the device answers the router" if device.get("online")
+            else device.get("reason") or "the device is not answering the router"
+        ),
     }
 
 
@@ -2965,7 +3066,8 @@ async def get_pppoe_credentials(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(verify_token),
 ):
-    """Get PPPoE credentials for a customer (admin use -- to give to customer)."""
+    """A PPPoE customer's login: the username and password typed into their own router, plus the
+    MikroTik it dials and the ports PPPoE runs on there. The reseller gives this to the customer."""
     try:
         user = await get_current_user(token, db)
 
@@ -2998,6 +3100,9 @@ async def get_pppoe_credentials(
             "expiry": customer.expiry.isoformat() if customer.expiry else None,
             "plan_name": customer.plan.name if customer.plan else None,
             "router_name": customer.router.name if customer.router else None,
+            "router_id": customer.router_id,
+            # the router ports the customer's own router plugs into (its WAN port to one of these)
+            "pppoe_ports": list(customer.router.pppoe_ports or []) if customer.router else [],
         }
     except HTTPException:
         raise

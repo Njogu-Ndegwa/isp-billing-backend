@@ -14,6 +14,7 @@ from app.services.pppoe_provisioning import call_pppoe_remove
 from app.services.router_helpers import get_router_by_id
 from app.services.log_persistence import persist_notable_logs
 from app.services.router_concurrency import run_with_guard
+from app.services.router_time import read_router_clock, stamp_router_times
 from app.services.router_availability import record_router_availability, router_recently_offline
 from app.services.monitor_liveness import clear_live_state, mark_snapshot_unverified
 
@@ -428,6 +429,8 @@ def _pppoe_diagnose_sync(router_info: dict, username: str, db_pppoe_ports: list)
         log_entries = logs.get("data", []) if logs.get("success") else []
         user_logs = [e for e in log_entries if username.lower() in e.get("message", "").lower()]
         info["recent_logs"] = user_logs[-10:]
+        # Log stamps and last-logged-out are the router's own clock: add true UTC.
+        stamp_router_times(info, read_router_clock(api))
 
         severity_order = {"critical": 0, "warning": 1, "info": 2}
         issues.sort(key=lambda x: severity_order.get(x.get("severity", "info"), 99))
@@ -461,7 +464,8 @@ def _pppoe_logs_sync(router_info: dict, username: str = "", limit: int = 50) -> 
         entries = logs.get("data", []) if logs.get("success") else []
         if username:
             entries = [e for e in entries if username.lower() in e.get("message", "").lower()]
-        return {"success": True, "data": entries[-limit:], "count": len(entries[-limit:])}
+        entries = stamp_router_times(entries[-limit:], read_router_clock(api))
+        return {"success": True, "data": entries, "count": len(entries)}
     except Exception as e:
         logger.error(f"PPPoE logs error: {e}")
         return {"error": str(e)}
@@ -501,6 +505,7 @@ def _pppoe_secrets_sync(router_info: dict) -> dict:
                 "session_count": len(user_sessions),
                 "profile_detail": profile,
             })
+        stamp_router_times(enriched, read_router_clock(api))
         return {"success": True, "data": enriched, "count": len(enriched)}
     except Exception as e:
         logger.error(f"PPPoE secrets error: {e}")
@@ -646,6 +651,7 @@ def _pppoe_users_sync(router_info: dict) -> dict:
                 "last_caller_id": secret.get("last_caller_id", ""),
             })
 
+        stamp_router_times(users, read_router_clock(api))
         return {
             "success": True,
             "users": users,
@@ -687,7 +693,7 @@ def _pppoe_server_summary(api: MikroTikAPI) -> dict:
     return {"lookup_success": True, "enabled_interfaces": enabled, "error": None}
 
 
-def _recent_auth_failures(api: MikroTikAPI, username: str) -> dict:
+def _recent_auth_failures(api: MikroTikAPI, username: str, clock=None) -> dict:
     """Count "user <name> authentication failed" lines in the router's log.
 
     Read only when the login is missing or disabled on the router: that is
@@ -704,12 +710,12 @@ def _recent_auth_failures(api: MikroTikAPI, username: str) -> dict:
         return {"lookup_success": False, "count": 0, "last_at": None, "error": logs.get("error")}
     pattern = re.compile(rf"\buser {re.escape(username)} authentication failed", re.IGNORECASE)
     hits = [e for e in logs.get("data", []) if pattern.search(e.get("message", "") or "")]
-    return {
+    return stamp_router_times({
         "lookup_success": True,
         "count": len(hits),
         "last_at": hits[-1].get("time") if hits else None,
         "error": None,
-    }
+    }, clock)
 
 
 def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
@@ -728,6 +734,8 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
         pppoe_server = _pppoe_server_summary(api)
 
         secret = secret_data.get("data") if secret_data.get("found") else None
+        clock = read_router_clock(api)
+        stamp_router_times(secret, clock)
         if not secret:
             return {
                 "success": True,
@@ -746,7 +754,7 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
                 "session_found": None,
                 "session_lookup_error": None,
                 "pppoe_server": pppoe_server,
-                "auth_failures": _recent_auth_failures(api, username),
+                "auth_failures": _recent_auth_failures(api, username, clock),
             }
 
         if secret.get("disabled"):
@@ -767,7 +775,7 @@ def _pppoe_customer_presence_sync(router_info: dict, username: str) -> dict:
                 "session_found": None,
                 "session_lookup_error": None,
                 "pppoe_server": pppoe_server,
-                "auth_failures": _recent_auth_failures(api, username),
+                "auth_failures": _recent_auth_failures(api, username, clock),
             }
 
         session_lookup = api.get_pppoe_session_with_bandwidth(username)
@@ -1145,6 +1153,7 @@ async def pppoe_customer_presence(
             {
                 "reason": secret.get("last_disconnect_reason", ""),
                 "at": secret.get("last_logged_out", ""),
+                "at_utc": secret.get("last_logged_out_utc"),
                 "caller_id": secret.get("last_caller_id", ""),
                 **_infer_disconnect_cause(secret.get("last_disconnect_reason", "")),
             }

@@ -27,6 +27,8 @@ from sqlalchemy.exc import IntegrityError
 from app.config import settings
 from app.db import database
 from app.db.models import Router, RouterHealth
+from app.services import router_metric_history as metric_history
+from app.services import router_cpu_history
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +121,9 @@ async def record(router_id: int, sample: HealthSample, *, source: str,
 
     Only fields present in the sample overwrite the stored row, so an SNMP
     reading (CPU only) does not erase memory figures from the last push.
+    The sample is also folded into the bounded graph history
+    (router_metric_history) in the same transaction, compared against the
+    row as it was before this write (reboots, WAN link drops).
     Returns the router name when a CPU value was stored (for alert copy),
     otherwise None.
     """
@@ -132,17 +137,25 @@ async def record(router_id: int, sample: HealthSample, *, source: str,
         for _attempt in range(2):
             async with database.async_session() as db:
                 row = await db.get(RouterHealth, router_id)
+                await metric_history.fold(
+                    db, router_id, clean, metric_history.PrevReading.of(row), now)
                 if row is None:
-                    db.add(RouterHealth(router_id=router_id, **values))
+                    row = RouterHealth(router_id=router_id, **values)
+                    db.add(row)
                 else:
                     for key, value in values.items():
                         setattr(row, key, value)
+                # Board/version as stored, so a CPU-only SNMP sample still
+                # lands under the model the last push reported.
+                board, version = row.board_name, row.routeros_version
                 try:
                     name = None
                     if clean.cpu_load is not None:
                         name = (await db.execute(
                             select(Router.name).where(Router.id == router_id))).scalar()
                     await db.commit()
+                    if clean.cpu_load is not None:
+                        router_cpu_history.note(router_id, clean.cpu_load, board, version, now=now)
                     return name if clean.cpu_load is not None else None
                 except IntegrityError:
                     await db.rollback()   # lost an insert race; retry as update

@@ -50,9 +50,10 @@ Code (this change):
 - WireGuard watchdog v6 template: exit while a wg-hz peer handshook < 4 min.
 - `CHECKIN_TUNNEL_ROUTER_IDS=ros7`: tunnel-first check-in for every RouterOS 7
   router installed by the standard runtime enrolment.
-- PPPoE FastTrack bypass: one covering network per tight pool range instead of
-  13 blocks (26 rules every forwarded packet walked on 354/537/737); superseded
-  block rules are removed after the new pair exists.
+- PPPoE FastTrack bypass (26 rules every forwarded packet walked on
+  354/537/737): landed separately in #439, one `first-last` rule per
+  direction, plus `scripts/pppoe_fasttrack_bypass_compact.py` for routers
+  that will not be re-provisioned.
 
 ## Verification
 
@@ -61,7 +62,7 @@ Code (this change):
 - Fleet re-check after rollout: 59/59 reachable routers kept every Bitwave
   scheduler advancing, no new script errors.
 - Tests: `tests/test_rb951_cpu_relief.py` plus the existing watchdog, enrolment,
-  PPPoE, queue sync and check-in tunnel suites.
+  queue sync and check-in tunnel suites.
 
 ## The pilot blip: never disable wg-aws
 

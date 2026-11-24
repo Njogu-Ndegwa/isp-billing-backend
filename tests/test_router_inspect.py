@@ -55,6 +55,29 @@ async def test_passwords_and_scripts_never_leave_the_router(client, owner, db, f
 
 
 @pytest.mark.asyncio
+async def test_log_stamps_get_true_utc_from_the_routers_own_clock(client, owner, db, monkeypatch):  # noqa: F811
+    # CR-1123-B3: a router an hour slow on EAT; its log stamps are local time.
+    from datetime import datetime, timedelta
+
+    local = datetime.utcnow() + timedelta(hours=2)
+    stamp = local - timedelta(minutes=40)
+    menus = typical_router_menus()
+    menus["/system/clock"] = [{"date": f"{local:%Y-%m-%d}", "time": f"{local:%H:%M:%S}", "gmt-offset": "+03:00"}]
+    menus["/log"] = [{".id": "*1", "time": f"{stamp:%Y-%m-%d %H:%M:%S}", "topics": "pppoe", "message": "x"}]
+    made = []
+    monkeypatch.setattr(router_inspect_routes, "MikroTikAPI", lambda *a, **k: made.append(FakeRouterOS(menus)) or made[-1])
+    reseller, token = owner
+    r = await make_router(db, reseller, name="Main Tower")
+    await db.commit()
+    res = await client.get(f"/api/routers/{r.id}/routeros", params={"menu": "/log"}, headers=auth(token))
+    assert res.status_code == 200, res.text
+    row = res.json()["rows"][0]
+    when = datetime.strptime(row["time_utc"], "%Y-%m-%dT%H:%M:%SZ")
+    assert abs((datetime.utcnow() - timedelta(minutes=40) - when).total_seconds()) < 120
+    assert all(c.endswith("/print") for c, _ in made[0].calls)
+
+
+@pytest.mark.asyncio
 async def test_another_resellers_router_and_other_menus_are_refused(client, owner, db, fake_router):  # noqa: F811
     _, token = owner
     other = await make_reseller(db)

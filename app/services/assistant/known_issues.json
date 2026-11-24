@@ -89,7 +89,41 @@
       ],
       "fix": "Open the AP's settings and set it to Access Point (bridge) mode, with its DHCP server off and PPPoE off. The cable from the MikroTik goes into the AP's LAN port, not its WAN or internet port. Then customers turn Wi-Fi off and on once. If the AP dials PPPoE on purpose (a staff or free account), know that everyone on that AP gets internet without paying; if the account expired, that AP goes dead until it is renewed.",
       "bitwave": "If the AP is already in AP mode and the problem stays, tell Bitwave support which AP or SSID and which port, and send a phone's Wi-Fi details screenshot from it. Bitwave support can check from our side what the router sees on that port.",
-      "not_this_if": "Every AP fails the same way (look at the line, the router or load balancing instead), or phones on the bad AP get the same address range as phones on good APs."
+      "not_this_if": "Every AP fails the same way (look at the line, the router or load balancing instead), or phones on the bad AP get the same address range as phones on good APs. Also not for a PPPoE customer's own router on a PPPoE port: that one must stay in router mode with its WAN set to PPPoE (pppoe-customer-router-setup)."
+    },
+    {
+      "id": "pppoe-customer-router-setup",
+      "title": "Setting up a PPPoE customer's own router to connect",
+      "symptoms": [
+        "how do I set up the customer's router for PPPoE",
+        "should the customer's PPPoE router be route WAN or bridge WAN",
+        "where do I put the PPPoE username and password on their router",
+        "the PPPoE customer is active but not online yet",
+        "should I enable VLAN for the PPPoE customer"
+      ],
+      "keywords": [
+        "pppoe router",
+        "customer router",
+        "customer's router",
+        "customers router",
+        "their router",
+        "route wan",
+        "bridge wan",
+        "wan type",
+        "pppoe client",
+        "set up pppoe",
+        "setup pppoe",
+        "pppoe setup",
+        "vlan"
+      ],
+      "cause": "A PPPoE customer's own router (Tenda, TP-Link, Mercusys and the like) has to dial the PPPoE login itself. Until it does, the customer shows offline even though their account is active. It only dials in router mode with its WAN set to PPPoE; in bridge or access-point mode it never dials.",
+      "checks": [
+        "GET /api/customers/{customer_id}/pppoe-credentials: draws the PPPoE login card (username, password behind Show, the MikroTik and its PPPoE ports). The customer must be ACTIVE.",
+        "GET /api/pppoe/{router_id}/diagnose/{username}: whether the secret is on the MikroTik and whether their router is trying to log in."
+      ],
+      "fix": "On the customer's router: 1) set the operation mode to Router (router mode or wireless router), not Bridge, Access Point or Repeater. 2) Under WAN or Internet settings, set the connection type to PPPoE. 3) Type the username and password from the PPPoE login card exactly as shown (capitals and spaces count). 4) Leave VLAN off (no VLAN ID is needed) and MTU on automatic, then save. 5) Run a cable from the customer router's WAN (internet) port to one of the MikroTik's PPPoE ports shown on the card, never to ether1. Within a minute the customer shows online. Bridge mode fits only when a different device behind it dials PPPoE itself.",
+      "bitwave": "If the router is set up this way and the PPPoE diagnosis still shows no login attempts, tell Bitwave support which customer, which MikroTik and which port it is plugged into.",
+      "not_this_if": "The device is an access point on a hotspot port: that one goes in access-point (bridge) mode (ap-in-router-mode)."
     },
     {
       "id": "radio-link-wds-off",
@@ -888,7 +922,7 @@
       ],
       "cause": "When the M-Pesa prompt fails for many resellers at once, it's almost always Safaricom's side, not your setup. If only your customers are affected, look at your payment method setup (see payment-collection-setup) or the customer's own phone and line.",
       "checks": [
-        "GET /api/mpesa/transactions/failed for recent failed attempts and their errors.",
+        "GET /api/mpesa/transactions/failed for recent failed attempts and their errors. Each row's failure_fault and failure_explained say who is at fault: a wrong PIN ('initiator information is invalid'), a cancel, no answer or low balance is the customer, not your setup.",
         "GET /api/mpesa/transactions?router_id={router_id}: when did the last completed payment come in?",
         "Ask whether other resellers have the same problem now; ask the customer to retry with the phone unlocked and enough balance."
       ],

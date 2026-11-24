@@ -1885,23 +1885,47 @@ async def _generate_identity(db: AsyncSession) -> str:
     raise ValueError("Could not generate a unique router identity")
 
 
+def router_name_key(name: Optional[str]) -> str:
+    """A router name as compared for clashes: spacing and case do not tell two routers apart."""
+    return " ".join((name or "").split()).casefold()
+
+
+async def router_name_taken(
+    db: AsyncSession, user_id: int, name: Optional[str], exclude_router_id: Optional[int] = None
+) -> bool:
+    """Whether another router on this account already has this name."""
+    stmt = select(Router.name).where(Router.user_id == user_id)
+    if exclude_router_id is not None:
+        stmt = stmt.where(Router.id != exclude_router_id)
+    key = router_name_key(name)
+    return any(router_name_key(n) == key for n in (await db.execute(stmt)).scalars())
+
+
 async def _generate_router_name(db: AsyncSession, user_id: int) -> str:
-    """Generate a router name like 'Bitwave Technologies #3'."""
+    """Generate a router name like 'Bitwave Technologies #3', never one the account already uses.
+
+    Counting routers is not enough: after "#2" is deleted an account with "#1" and
+    "#3" would get a second "#3". Names of routers and of pending setup codes are
+    skipped.
+    """
     user_result = await db.execute(select(User).where(User.id == user_id))
     user = user_result.scalar_one_or_none()
     base_name = (user.business_name or user.organization_name) if user else "Router"
 
-    router_count_result = await db.execute(
-        select(func.count(Router.id)).where(Router.user_id == user_id)
-    )
-    token_count_result = await db.execute(
-        select(func.count(ProvisioningToken.id)).where(
+    router_names = (await db.execute(
+        select(Router.name).where(Router.user_id == user_id)
+    )).scalars().all()
+    token_names = (await db.execute(
+        select(ProvisioningToken.router_name).where(
             ProvisioningToken.user_id == user_id,
             ProvisioningToken.status == ProvisioningTokenStatus.PENDING,
         )
-    )
-    total = (router_count_result.scalar() or 0) + (token_count_result.scalar() or 0)
-    return f"{base_name} #{total + 1}"
+    )).scalars().all()
+    taken = {router_name_key(n) for n in [*router_names, *token_names]}
+    number = len(router_names) + len(token_names) + 1
+    while router_name_key(f"{base_name} #{number}") in taken:
+        number += 1
+    return f"{base_name} #{number}"
 
 
 # ---------------------------------------------------------------------------
@@ -2181,9 +2205,13 @@ async def complete_provisioning(
     db: AsyncSession, token: ProvisioningToken
 ) -> Router:
     """Called by the .rsc callback -- creates the Router record in the database."""
+    name = token.router_name
+    if await router_name_taken(db, token.user_id, name):
+        # a router was renamed to this code's name while it waited
+        name = await _generate_router_name(db, token.user_id)
     router_obj = Router(
         user_id=token.user_id,
-        name=token.router_name,
+        name=name,
         identity=token.identity,
         ip_address=token.wireguard_ip,
         username=API_USERNAME,

@@ -14,6 +14,7 @@ from app.db.models import (
     OutageCompensation, OutageCompensationItem, PaymentStatus, UserRole,
 )
 from app.services.auth import verify_token, get_current_user
+from app.services import local_day
 from app.services.subscription import enforce_active_subscription
 from app.services.hotspot_provisioning import (
     build_hotspot_payload,
@@ -26,6 +27,7 @@ from app.services.hotspot_provisioning import (
     serialize_delivery_attempt,
 )
 from app.services.mpesa_transactions import update_mpesa_transaction_status
+from app.services import mpesa_results
 from app.services.payment_numbers import PAYMENT_SEARCH_DESCRIPTION, payment_search_condition
 from app.services.billing import apply_failed_payment_customer_status, make_payment
 from app.services.plan_cache import FREE_TRIAL_NOT_PURCHASABLE, plan_model_allows_router
@@ -1413,9 +1415,9 @@ async def get_mpesa_transactions(
     - router_id: Filter by specific router (optional)
     - customer_id: Only this customer's payments -- their account history (optional)
     - payment_method: Filter by type -- mobile_money, voucher, cash, card, etc. (optional)
-    - date: Exact date filter (YYYY-MM-DD) -- returns transactions for that day only (optional)
-    - start_date: Range start (ISO format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS) (optional)
-    - end_date: Range end (ISO format) (optional)
+    - date: Exact date filter (YYYY-MM-DD) -- that calendar day on the account's own clock (optional)
+    - start_date: Range start: YYYY-MM-DD (a local day) or a time with its offset, e.g. 2026-11-23T00:30:00+03:00 (optional)
+    - end_date: Range end, inclusive, same forms (optional)
     - status: Filter by status -- completed, pending, failed, expired (optional)
     - search: Find one payment by its M-Pesa code or phone (exact; optional)
     - limit: Max results per page (default 200)
@@ -1426,26 +1428,24 @@ async def get_mpesa_transactions(
         # Called directly (not over HTTP) the default is the Query() marker.
         search = (search.strip() or None) if isinstance(search, str) else None
 
-        # Parse date filters once
+        # Parse date filters once. A date alone is that day on the account's
+        # own clock (local_day), not a UTC day.
         date_start = None
         date_end = None
         if date:
             try:
-                date_start = datetime.strptime(date, "%Y-%m-%d")
-                date_end = date_start.replace(hour=23, minute=59, second=59)
+                date_start, date_end = local_day.day_bounds(date, user)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
         else:
             if start_date:
                 try:
-                    date_start = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+                    date_start = local_day.range_start(start_date, user)
                 except ValueError:
                     raise HTTPException(status_code=400, detail="Invalid start_date format")
             if end_date:
                 try:
-                    date_end = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-                    if "T" not in end_date:
-                        date_end = date_end.replace(hour=23, minute=59, second=59)
+                    date_end = local_day.range_end(end_date, user)
                 except ValueError:
                     raise HTTPException(status_code=400, detail="Invalid end_date format")
 
@@ -1552,6 +1552,7 @@ async def get_mpesa_transactions(
                     "result_code": tx.result_code,
                     "result_desc": tx.result_desc,
                     "failure_source": tx.failure_source.value if tx.failure_source else None,
+                    **_failure_fields(tx),
                     "transaction_date": tx.transaction_date.isoformat() if tx.transaction_date else None,
                     "created_at": tx.created_at.isoformat(),
                     "customer": {
@@ -2182,17 +2183,14 @@ async def get_mpesa_transactions_summary(
         date_end = None
         if date:
             try:
-                date_start = datetime.strptime(date, "%Y-%m-%d")
-                date_end = date_start.replace(hour=23, minute=59, second=59)
+                date_start, date_end = local_day.day_bounds(date, user)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
         else:
             if start_date:
-                date_start = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+                date_start = local_day.range_start(start_date, user)
             if end_date:
-                date_end = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-                if "T" not in end_date:
-                    date_end = date_end.replace(hour=23, minute=59, second=59)
+                date_end = local_day.range_end(end_date, user)
 
         rows = []
         want_mpesa = payment_method in (None, "mobile_money")
@@ -2427,6 +2425,22 @@ async def get_mpesa_transactions_summary(
         raise HTTPException(status_code=500, detail=f"Failed to fetch summary: {str(e)}")
 
 
+def _failure_fields(tx) -> dict:
+    """failure_fault + failure_explained for a failed/expired STK row (one source:
+    app/services/mpesa_results.py), so the same M-Pesa reply always reads the same."""
+    if tx.status not in (MpesaTransactionStatus.failed, MpesaTransactionStatus.expired):
+        return {}
+    code = tx.result_code
+    source = getattr(tx.failure_source, "value", tx.failure_source)
+    if not code and (tx.status == MpesaTransactionStatus.expired or source == "timeout"):
+        code = "TIMEOUT"
+    e = mpesa_results.explain(code, tx.result_desc)
+    return {
+        "failure_fault": e["fault"],
+        "failure_explained": f"{e['explanation']} Next: {e['next_step']}",
+    }
+
+
 @router.get("/api/mpesa/transactions/failed")
 async def get_failed_mpesa_transactions(
     router_id: Optional[int] = None,
@@ -2471,16 +2485,14 @@ async def get_failed_mpesa_transactions(
         
         if start_date:
             try:
-                start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                start_dt = local_day.range_start(start_date, user)
                 stmt = stmt.where(MpesaTransaction.created_at >= start_dt)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid start_date format. Use ISO format (YYYY-MM-DD)")
         
         if end_date:
             try:
-                end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-                if 'T' not in end_date:
-                    end_dt = end_dt.replace(hour=23, minute=59, second=59)
+                end_dt = local_day.range_end(end_date, user)
                 stmt = stmt.where(MpesaTransaction.created_at <= end_dt)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid end_date format. Use ISO format (YYYY-MM-DD)")
@@ -2506,7 +2518,8 @@ async def get_failed_mpesa_transactions(
             if reason not in failure_reasons:
                 failure_reasons[reason] = {
                     "count": 0, "result_code": tx.result_code, "total_amount": 0,
-                    "failure_source": tx.failure_source.value if tx.failure_source else "unknown"
+                    "failure_source": tx.failure_source.value if tx.failure_source else "unknown",
+                    **_failure_fields(tx),
                 }
             failure_reasons[reason]["count"] += 1
             failure_reasons[reason]["total_amount"] += float(tx.amount)
@@ -2518,6 +2531,8 @@ async def get_failed_mpesa_transactions(
                 "reason": reason,
                 "result_code": data["result_code"],
                 "failure_source": data["failure_source"],
+                "failure_fault": data.get("failure_fault"),
+                "failure_explained": data.get("failure_explained"),
                 "count": data["count"],
                 "total_amount_lost": data["total_amount"]
             }
@@ -2536,6 +2551,7 @@ async def get_failed_mpesa_transactions(
                 "failure_source": tx.failure_source.value if tx.failure_source else None,
                 "result_code": tx.result_code,
                 "result_desc": tx.result_desc,
+                **_failure_fields(tx),
                 "created_at": tx.created_at.isoformat(),
                 "updated_at": tx.updated_at.isoformat() if tx.updated_at else None,
                 "customer": {

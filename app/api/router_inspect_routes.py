@@ -21,6 +21,7 @@ from app.services.auth import get_current_user, verify_token
 from app.services.mikrotik_api import MikroTikAPI
 from app.services.router_availability import record_router_availability
 from app.services.router_helpers import get_router_by_id
+from app.services.router_time import ROUTER_CLOCK_KEYS, read_router_clock, stamp_router_times
 
 router = APIRouter(tags=["routers"])
 
@@ -66,7 +67,13 @@ def _print_sync(info: dict, menu: str) -> dict:
     if not api.connect():
         return {"error": "connect_failed"}
     try:
-        return api.send_command(f"{menu}/print")
+        result = api.send_command(f"{menu}/print")
+        # Stamps in a row (log time, last-logged-out, ...) are the router's own
+        # clock; the clock read in this session turns them into true UTC.
+        rows = result.get("data") or [] if result.get("success") else []
+        if any(isinstance(r, dict) and ROUTER_CLOCK_KEYS.intersection(r) for r in rows):
+            result["clock"] = read_router_clock(api)
+        return result
     finally:
         api.disconnect()
 
@@ -105,10 +112,79 @@ async def read_router_menu(
         raise HTTPException(status_code=502, detail=f"The router refused {menu}: {result['error']}")
     await record_router_availability(db, router_id, True, "router_inspect")
 
-    rows = [clean_row(r) for r in result.get("data") or [] if isinstance(r, dict)]
+    rows = [stamp_router_times(clean_row(r), result.get("clock")) for r in result.get("data") or []
+            if isinstance(r, dict)]
     if contains:
         needle = contains.lower()
         rows = [r for r in rows if any(needle in str(v).lower() for v in r.values())]
     total = len(rows)
     rows = rows[-limit:] if menu == "/log" else rows[:limit]
     return {"router": name, "menu": menu, "count": total, "shown": len(rows), "rows": rows}
+
+
+@router.get("/api/routers/{router_id}/offline-customers")
+async def offline_customers(
+    router_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Paid customers on this router who are offline right now: who, since when, and why.
+
+    Use for "who is offline", "how many clients are offline", "since when is X offline",
+    "did anyone go offline today", "why is X offline". Checks the router live, one
+    connection, read-only: PPPoE sessions and each secret's last logout and disconnect
+    reason, hotspot sessions and bypassed hosts, and for static-IP customers the router's
+    ARP entry and speed queue. Paid = active and not expired; an expired customer is
+    never listed as offline. Each row has offline_since (UTC, or null with since_note
+    saying why it is unknown), since_source (router, session_history or last_traffic),
+    the reason the router gives, the plan and its expiry. counts gives paid, online and
+    offline (also per connection type). A router that does not answer is a 503 error
+    saying so, never an empty list.
+    """
+    from datetime import datetime
+
+    from app.services import offline_customers as oc
+    from app.services.router_concurrency import run_with_guard
+
+    user = await get_current_user(token, db)
+    router_obj = await get_router_by_id(db, router_id, user.id, getattr(user, "role", None))
+    if not router_obj:
+        raise HTTPException(status_code=404, detail="Router not found")
+    now = datetime.utcnow()
+    info = {"ip": router_obj.ip_address, "username": router_obj.username,
+            "password": router_obj.password, "port": router_obj.port}
+    name = router_obj.name
+    last_online = oc.utc_text(router_obj.last_online_at)
+    customers = await oc.load_paid_customers(db, router_id, now)
+    await db.commit()  # no DB connection held while the router answers
+
+    kinds = {c["connection_type"] for c in customers}
+    if customers:
+        result = await run_with_guard(router_id, oc.read_presence_sync, info, kinds)
+    else:
+        result = {"success": True}
+    if result.get("error") in ("connect_failed", "timeout", "busy"):
+        if result["error"] != "busy":
+            await record_router_availability(db, router_id, False, "offline_customers")
+        what = {"connect_failed": "did not answer", "timeout": "took too long to answer",
+                "busy": "is busy with other checks"}[result["error"]]
+        raise HTTPException(status_code=503, detail={
+            "message": (f"Router {name} {what}, so who is online cannot be checked right now. "
+                        "This is not a list of offline customers; try again shortly."),
+            "router_reachable": result["error"] == "busy",
+            "router_last_online_at": last_online,
+            "paid_customers": len(customers),
+        })
+    if result.get("error"):
+        raise HTTPException(status_code=502, detail={
+            "message": f"Router {name} answered but a list could not be read: {result.get('detail') or result['error']}",
+            "paid_customers": len(customers),
+        })
+    if customers:
+        await record_router_availability(db, router_id, True, "offline_customers")
+
+    online, offline = oc.classify(customers, result)
+    ids = [c["customer_id"] for c in offline]
+    latest, used = await oc.load_history(db, ids, now)
+    await db.commit()
+    return oc.build_report(router_id, name, online, offline, latest, used, result.get("fetched_utc") or now)
