@@ -2810,41 +2810,6 @@ class MikroTikAPI:
             logger.error(f"Error removing walled garden domain entry {entry_id}: {e}")
             return {"error": str(e)}
 
-    def update_wireguard_endpoint(self, new_endpoint: str, interface_name: str = "wg-aws") -> Dict[str, Any]:
-        """Update the WireGuard peer endpoint address (useful when server IP changes)."""
-        if not self.connected:
-            return {"error": "Not connected"}
-        try:
-            peers = self.send_command("/interface/wireguard/peers/print")
-            if not peers.get("success") or not peers.get("data"):
-                return {"error": "No WireGuard peers found"}
-
-            target_peer = None
-            for peer in peers["data"]:
-                if peer.get("interface") == interface_name:
-                    target_peer = peer
-                    break
-
-            if not target_peer:
-                return {"error": f"No peer found for interface {interface_name}"}
-
-            old_endpoint = target_peer.get("endpoint-address", "unknown")
-            result = self.send_command("/interface/wireguard/peers/set", {
-                "numbers": target_peer[".id"],
-                "endpoint-address": new_endpoint
-            })
-            if result.get("error"):
-                return {"error": result["error"]}
-            return {
-                "success": True,
-                "old_endpoint": old_endpoint,
-                "new_endpoint": new_endpoint,
-                "interface": interface_name
-            }
-        except Exception as e:
-            logger.error(f"Error updating WireGuard endpoint: {e}")
-            return {"error": str(e)}
-
     # =========================================================================
     # PPPoE MANAGEMENT
     # =========================================================================

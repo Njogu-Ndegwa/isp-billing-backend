@@ -1029,6 +1029,18 @@ async def _filter_current_orphan_bypass_macs(candidate_macs: set[str]) -> set[st
     return normalized_candidates - currently_authorized
 
 
+# Comments every ip-binding WE write carries (provisioning/checkin "USER:...",
+# access credentials, static IPs, guest auto-registration, FUP, expiry marks).
+# A bypass without one was added by the reseller (an AP in router mode, CCTV,
+# upstream gear) and is not ours to remove: deleting it cuts everything behind it.
+_OUR_BINDING_MARKERS = ("USER:", "ACCESS_CRED", "STATIC:", "Auto-registered:", "FUP_", "EXPIRED|")
+
+
+def _is_our_binding(comment: str | None) -> bool:
+    text = comment or ""
+    return any(marker.lower() in text.lower() for marker in _OUR_BINDING_MARKERS)
+
+
 def _find_router_binding_cleanup_candidates_sync(router_info: dict, active_macs: set) -> set[str]:
     candidates: set[str] = set()
     api = MikroTikAPI(
@@ -1046,6 +1058,8 @@ def _find_router_binding_cleanup_candidates_sync(router_info: dict, active_macs:
             binding_mac = binding.get("mac-address", "")
             binding_type = binding.get("type", "")
             if not binding_mac or binding_type != "bypassed":
+                continue
+            if not _is_our_binding(binding.get("comment")):
                 continue
             normalized_mac = normalize_mac_address(binding_mac)
             if normalized_mac not in active_macs:
@@ -1077,6 +1091,8 @@ def _remove_router_bindings_sync(router_info: dict, orphan_macs: set[str]) -> in
             binding_type = binding.get("type", "")
             binding_id = binding.get(".id", "")
             if not binding_mac or binding_type != "bypassed":
+                continue
+            if not _is_our_binding(binding.get("comment")):
                 continue
             if not binding_id:
                 logger.warning(

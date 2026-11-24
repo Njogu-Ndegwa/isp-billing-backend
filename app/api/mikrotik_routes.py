@@ -1186,51 +1186,6 @@ async def remove_walled_garden_domain_entry(
 
 
 # ============================================================================
-# WIREGUARD MANAGEMENT
-# ============================================================================
-
-@router.post("/api/mikrotik/wireguard/update-endpoint")
-async def update_wireguard_endpoint(
-    new_endpoint: str,
-    interface_name: str = "wg-aws",
-    router_id: Optional[int] = None,
-    db: AsyncSession = Depends(get_db),
-    token: str = Depends(verify_token)
-):
-    """Update WireGuard peer endpoint address (when server IP changes)."""
-    try:
-        current_user = await get_current_user(token, db)
-        enforce_active_subscription(current_user)
-        if router_id:
-            router = await get_router_by_id(db, router_id, current_user.id, current_user.role.value)
-            if not router:
-                raise HTTPException(status_code=404, detail="Router not found or not accessible")
-            host, user, pwd, port = router.ip_address, router.username, router.password, router.port
-        else:
-            host, user, pwd, port = settings.MIKROTIK_HOST, settings.MIKROTIK_USERNAME, settings.MIKROTIK_PASSWORD, settings.MIKROTIK_PORT
-
-        def _update():
-            api = MikroTikAPI(host, user, pwd, port)
-            if not api.connect():
-                return {"error": "Failed to connect to MikroTik"}
-            try:
-                return api.update_wireguard_endpoint(new_endpoint, interface_name)
-            finally:
-                api.disconnect()
-
-        await db.commit()
-        result = await asyncio.get_event_loop().run_in_executor(None, _update)
-        if result.get("error"):
-            raise HTTPException(status_code=500, detail=result["error"])
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error updating WireGuard endpoint: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ============================================================================
 # DASHBOARD MIKROTIK DATA
 # ============================================================================
 

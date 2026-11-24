@@ -397,3 +397,51 @@ def test_rollback_removes_mgmt_pins():
     api.routes.append(dict(WAN1_DHCP_DEFAULT_V6))
     mikrotik_lb.lb_rollback(api)
     assert not _managed_routes(api)
+
+
+# --- never strand the router without a route (router 671 outage, 2026-11-23) ---
+
+def test_v6_reconcile_leaves_routes_alone_when_wan1_has_no_lease():
+    api = FakeLBAPI(ros_version=V6)
+    assert mikrotik_lb.lb_apply(api, ["ether1", "ether2"])["success"] is True
+    before = [dict(r) for r in api.routes]
+    api.dhcp_clients[0]["status"] = "searching"   # WAN1 lease momentarily gone
+    api.commands = []
+    report = mikrotik_lb.lb_park_ports_v6(api, ["ether1", "ether2"], [])
+    assert report["success"] is False
+    assert not any(cmd in ("/ip/route/remove", "/ip/route/add") for cmd, _ in api.commands)
+    assert api.routes == before
+
+
+def test_v6_reconcile_adds_new_routes_before_removing_stale_ones():
+    api = FakeLBAPI(ros_version=V6)
+    assert mikrotik_lb.lb_apply(api, ["ether1", "ether2"])["success"] is True
+    for r in api.routes:   # every checked/probe route now points at an old gateway
+        if (r.get("comment") or "").endswith("_PROBE"):
+            r["gateway"] = "10.9.9.9"
+    api.commands = []
+    mikrotik_lb.lb_park_ports_v6(api, ["ether1", "ether2"], [])
+    ops = [cmd for cmd, _ in api.commands if cmd in ("/ip/route/add", "/ip/route/remove")]
+    assert "/ip/route/remove" in ops and "/ip/route/add" in ops
+    assert ops.index("/ip/route/remove") > max(i for i, c in enumerate(ops) if c == "/ip/route/add")
+
+
+def _convert_with_nat(nat_rules):
+    api = _router537(nat_rules=nat_rules)
+    _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.100.1",
+                       "address": "192.168.100.3/24"})
+    mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1")
+    return [a for c, a in api.commands if c == "/ip/firewall/nat/add"]
+
+
+def test_second_line_gets_its_own_masquerade_when_nat_is_per_interface():
+    """Provisioning NATs out-interface=ether1; joining the WAN list alone would
+    leave every flow balanced onto ether2 un-NATed."""
+    added = _convert_with_nat([{"chain": "srcnat", "action": "masquerade",
+                                "out-interface": "ether1"}])
+    assert [a["out-interface"] for a in added] == ["ether2"]
+
+
+def test_no_extra_masquerade_when_the_wan_list_is_already_natted():
+    assert _convert_with_nat([{"chain": "srcnat", "action": "masquerade",
+                               "out-interface-list": "WAN"}]) == []

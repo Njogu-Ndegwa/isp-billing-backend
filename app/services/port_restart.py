@@ -179,6 +179,15 @@ def read_port_state(api) -> Dict[str, Any]:
     }
 
 
+def live_uplink_ports(api, router_ip: str, lb_wan_ports: Iterable[str] = ()) -> Dict[str, str]:
+    """Physical ports that carry this router's internet right now, with why:
+    ether1, the default route's interface, any enabled DHCP or PPPoE client,
+    and load-balancing lines. Raises RouterStateError when the router cannot
+    be read (callers must then refuse, not guess)."""
+    state = read_port_state(api)
+    return dict(_build_topology(state, router_ip, lb_wan_ports).wan)
+
+
 # ---------------------------------------------------------------------------
 # Guard evaluation (pure)
 # ---------------------------------------------------------------------------
