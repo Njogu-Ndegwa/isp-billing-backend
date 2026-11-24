@@ -760,6 +760,7 @@ async def get_portal_data(
         User,
     )
     from app.api.portal_routes import _build_public_response
+    from app.services.loyalty import public_payload as loyalty_public_payload
 
     stmt = (
         select(Router, User, ResellerPaymentMethod.method_type)
@@ -864,6 +865,8 @@ async def get_portal_data(
             "max_shared_users": max_shared_users,
         },
         "portal_settings": _build_public_response(portal_settings, reseller),
+        # Loyalty points for this router's customers; null when the reseller has it off.
+        "loyalty": await loyalty_public_payload(db, router_obj.user_id, router_obj.id),
     }
 
 

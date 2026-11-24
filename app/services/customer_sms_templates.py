@@ -35,7 +35,9 @@ _COMMON = ("name", "brand", "plan", "expiry", "account", "paybill", "support_pho
 EVENT_PLACEHOLDERS: dict[str, tuple[str, ...]] = {
     EVENT_EXPIRY: _COMMON,
     EVENT_REMINDER: _COMMON,
-    EVENT_RECEIPT: _COMMON + ("amount", "reference"),
+    # points_*: filled when the payment earned loyalty points, empty otherwise
+    # (a sentence using an empty one is left out).
+    EVENT_RECEIPT: _COMMON + ("amount", "reference", "points_earned", "points_balance"),
     EVENT_WELCOME: _COMMON + ("username", "password"),
 }
 
@@ -78,6 +80,8 @@ SAMPLE_CONTEXT: dict[str, str] = {
     "reference": "QJK3ABCD12",
     "username": "jane_home",
     "password": "x7Kp2mQa",
+    "points_earned": "15",
+    "points_balance": "240",
 }
 
 
@@ -259,8 +263,12 @@ def build_context(
     username: str | None = None,
     password: str | None = None,
     till: str | None = None,
+    points_earned: int | None = None,
+    points_balance: int | None = None,
 ) -> dict[str, str]:
     return {
+        "points_earned": str(points_earned) if points_earned else "",
+        "points_balance": str(points_balance) if points_earned and points_balance is not None else "",
         "name": friendly_name(customer_name),
         "brand": brand_name(reseller),
         "plan": (plan_name or "internet plan").strip(),

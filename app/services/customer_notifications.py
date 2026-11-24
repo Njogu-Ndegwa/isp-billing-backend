@@ -182,6 +182,16 @@ async def _queue_reseller_receipts(
     *,
     session_factory: Callable,
 ) -> int | None:
+    # Award loyalty points first (the same exactly-once function the loyalty
+    # sweep uses), so the receipt can say what the payment earned.
+    try:
+        from app.services.loyalty import ensure_awards
+
+        points = await ensure_awards(payment_ids, session_factory=session_factory)
+    except Exception as exc:
+        logger.warning("Loyalty award before receipts failed: %s", exc)
+        points = {}
+
     async with session_factory() as db:
         settings_row = await db.get(MessagingSettings, 1)
         preferences = await db.get(CustomerExpirySmsSettings, reseller_id)
@@ -236,6 +246,8 @@ async def _queue_reseller_receipts(
                 **_payment_fields(targets.get(row.router_id), payment_account),
                 amount=templates.format_amount(row.amount, market.currency),
                 reference=row.payment_reference,
+                points_earned=(points.get(row.id) or {}).get("earned"),
+                points_balance=(points.get(row.id) or {}).get("balance"),
             )
             recipients.append((
                 row.customer_id,
