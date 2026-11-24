@@ -47,6 +47,11 @@ def offers_a_tour(row):
         else "did not offer a quick tour"
 
 
+def gives_the_way_back(row):
+    """Dennis, 24 Nov: tell them how to go back to the classic dashboard, with its link."""
+    return None if "](/dashboard)" in row["said"] else "did not give the classic dashboard link"
+
+
 def gives_examples(row):
     said = row["said"].lower()
     hits = [w for w in ("sales", "plan", "voucher", "router", "mauzo", "vocha", "mpango") if w in said]
@@ -64,7 +69,8 @@ async def test_asking_for_the_old_app_gets_examples_and_a_tour(client, owner, db
     await build(db, reseller, routers=["Rongai"], plans=HOTSPOT, sms_credits=200)
     use_real_model(monkeypatch)
     row = await ask(client, token, question, monkeypatch)
-    problems = evaluate(row, [never_says("](/", "one tap away", "/dashboard"), offers_a_tour, gives_examples])
+    problems = evaluate(row, [gives_the_way_back, never_says("one tap away", "](/customers", "](/settings", "](/messaging"),
+                              offers_a_tour, gives_examples])
     report(f"no-dashboard/exit/{question[:24]}", row, problems)
     assert not problems, problems
 
@@ -77,7 +83,7 @@ async def test_still_wanting_the_old_app_gets_the_menu_way_back(client, owner, d
     first = await ask(client, token, "How can I exit AI mode?", monkeypatch)
     row = await ask(client, token, "No tour, I still want the old dashboard", monkeypatch,
                     conversation_id=first["conversation_id"])
-    problems = evaluate(row, [never_says("](/", "/dashboard"), lambda r: None if "classic dashboard" in r["said"].lower()
+    problems = evaluate(row, [gives_the_way_back, lambda r: None if "classic dashboard" in r["said"].lower()
                               and "menu" in r["said"].lower() else "did not say where the Classic dashboard item is"])
     report("no-dashboard/exit/still-wants-old", row, problems)
     assert not problems, problems
