@@ -3064,6 +3064,57 @@ class MikroTikAPI:
         return cidrs
 
     @staticmethod
+    def _address_span(value: Any) -> Optional[Tuple[int, int]]:
+        """(first, last) of a firewall address as integers: CIDR, single IP or ``a-b``."""
+        text = str(value or "").strip()
+        if not text or text.startswith("!"):
+            return None
+        try:
+            if "-" in text:
+                first, last = (int(ipaddress.IPv4Address(p.strip())) for p in text.split("-", 1))
+            else:
+                network = ipaddress.IPv4Network(text, strict=False)
+                first, last = int(network.network_address), int(network.broadcast_address)
+        except ValueError:
+            return None
+        return (first, last) if first <= last else None
+
+    def _pool_ranges_to_matchers(self, ranges_str: str) -> List[str]:
+        """Pool ranges as firewall address matchers, one per contiguous block.
+
+        RouterOS takes ``first-last`` in src-address/dst-address, so the usual
+        pool 192.168.89.2-192.168.89.254 is one matcher. Summarised to CIDR it
+        is 13 blocks, which made 26 accept rules (src + dst) that every
+        forwarded packet walked on its way to the queue-bypass rules: about a
+        fifth of an RB951's firewall CPU per packet (router 354, 2026-11-23).
+        A block that is exactly one network keeps its CIDR form.
+        """
+        spans: List[Tuple[int, int]] = []
+        for part in (ranges_str or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            span = self._address_span(part)
+            if span is None:
+                logger.warning(f"Could not parse PPPoE pool range '{part}' for the FastTrack bypass")
+                continue
+            spans.append(span)
+
+        merged: List[List[int]] = []
+        for first, last in sorted(spans):
+            if merged and first <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], last)
+            else:
+                merged.append([first, last])
+
+        matchers: List[str] = []
+        for first, last in merged:
+            first_ip, last_ip = ipaddress.IPv4Address(first), ipaddress.IPv4Address(last)
+            networks = list(ipaddress.summarize_address_range(first_ip, last_ip))
+            matchers.append(str(networks[0]) if len(networks) == 1 else f"{first_ip}-{last_ip}")
+        return matchers
+
+    @staticmethod
     def pppoe_subnet_layout(prefix: str) -> Dict[str, str]:
         """Addresses the PPPoE server uses inside one /24 (``prefix`` = first 3 octets)."""
         return {
@@ -3178,8 +3229,12 @@ class MikroTikAPI:
         warnings: List[str] = []
 
         def _in_old(value: Any) -> bool:
+            text = str(value or "").strip()
             try:
-                return ipaddress.ip_network(str(value or "").strip(), strict=False).subnet_of(old_net)
+                if "-" in text:
+                    # A FastTrack bypass rule written as a range (first-last).
+                    return all(ipaddress.ip_address(p.strip()) in old_net for p in text.split("-", 1))
+                return ipaddress.ip_network(text, strict=False).subnet_of(old_net)
             except (ValueError, TypeError):
                 return False
 
@@ -3315,6 +3370,11 @@ class MikroTikAPI:
         """
         Ensure FastTrack bypass rules exist for the active PPPoE address pool.
         PPP profile rate-limit creates dynamic simple queues, and FastTrack skips them.
+
+        One src and one dst accept rule per contiguous pool block (see
+        ``_pool_ranges_to_matchers``). Rules left from when the pool was
+        written as CIDR blocks are removed once the new ones are in place.
+        The result's ``cidrs`` lists the matchers (name kept for callers).
         """
         if not self.connected:
             return {"error": "Not connected"}
@@ -3327,7 +3387,7 @@ class MikroTikAPI:
                 if active_profile.get("found") and active_profile.get("data", {}).get("remote_address"):
                     effective_pool = active_profile["data"]["remote_address"]
 
-            cidrs: List[str] = []
+            matchers: List[str] = []
             if effective_pool:
                 pool_data = self.get_ip_pool_status(effective_pool)
                 if pool_data.get("error"):
@@ -3336,12 +3396,12 @@ class MikroTikAPI:
                 pools = pool_data.get("pools", [])
                 if pools:
                     pool_ranges = pools[0].get("ranges", "")
-                cidrs = self._pool_ranges_to_cidrs(pool_ranges)
+                matchers = self._pool_ranges_to_matchers(pool_ranges)
 
-            if not cidrs and fallback_pool_ranges:
-                cidrs = self._pool_ranges_to_cidrs(fallback_pool_ranges)
+            if not matchers and fallback_pool_ranges:
+                matchers = self._pool_ranges_to_matchers(fallback_pool_ranges)
 
-            if not cidrs:
+            if not matchers:
                 return {"error": "Could not determine PPPoE pool subnet for FastTrack bypass"}
 
             filters_result = self.send_command_optimized(
@@ -3367,7 +3427,7 @@ class MikroTikAPI:
                     "success": True,
                     "fasttrack_enabled": False,
                     "pool_name": effective_pool,
-                    "cidrs": cidrs,
+                    "cidrs": matchers,
                     "rules_added": 0,
                 }
 
@@ -3392,26 +3452,19 @@ class MikroTikAPI:
             def _rule_before_fasttrack(idx: int) -> bool:
                 return fasttrack_index is None or idx < fasttrack_index
 
-            def _rule_address_matches(rule_address: str, cidr: str) -> bool:
-                rule_value = str(rule_address or "").strip()
-                if rule_value == cidr:
-                    return True
-                try:
-                    network = ipaddress.ip_network(cidr, strict=False)
-                    if network.prefixlen == network.max_prefixlen:
-                        return rule_value == str(network.network_address)
-                except ValueError:
-                    pass
-                return False
+            def _rule_address_matches(rule_address: str, matcher: str) -> bool:
+                # By span, not by text: RouterOS prints a /32 as a bare address.
+                span = self._address_span(rule_address)
+                return span is not None and span == self._address_span(matcher)
 
-            def _ensure_bypass_rule(comment: str, address_field: str, cidr: str) -> Optional[str]:
+            def _ensure_bypass_rule(comment: str, address_field: str, matcher: str) -> Optional[str]:
                 nonlocal rules_added, rules_removed, rules_reused
 
                 matches = _matching_managed_rules(comment)
                 valid_rule = None
                 for idx, rule in matches:
                     if (
-                        _rule_address_matches(rule.get(address_field, ""), cidr)
+                        _rule_address_matches(rule.get(address_field, ""), matcher)
                         and _active_rule(rule)
                         and _rule_before_fasttrack(idx)
                     ):
@@ -3436,7 +3489,7 @@ class MikroTikAPI:
 
                 args = {
                     "chain": "forward",
-                    address_field: cidr,
+                    address_field: matcher,
                     "action": "accept",
                     "comment": comment,
                     "place-before": ft_id,
@@ -3447,25 +3500,50 @@ class MikroTikAPI:
                 rules_added += 1
                 return None
 
-            for cidr in cidrs:
-                src_comment = f"PPPoE bypass FastTrack (src) {cidr}"
-                dst_comment = f"PPPoE bypass FastTrack (dst) {cidr}"
+            wanted_comments = set()
+            for matcher in matchers:
+                src_comment = f"{PPPOE_FASTTRACK_BYPASS_COMMENT_PREFIX} (src) {matcher}"
+                dst_comment = f"{PPPOE_FASTTRACK_BYPASS_COMMENT_PREFIX} (dst) {matcher}"
+                wanted_comments.update((src_comment, dst_comment))
 
-                src_error = _ensure_bypass_rule(src_comment, "src-address", cidr)
+                src_error = _ensure_bypass_rule(src_comment, "src-address", matcher)
                 if src_error:
-                    return {"error": f"FastTrack bypass (src {cidr}): {src_error}"}
+                    return {"error": f"FastTrack bypass (src {matcher}): {src_error}"}
 
-                dst_error = _ensure_bypass_rule(dst_comment, "dst-address", cidr)
+                dst_error = _ensure_bypass_rule(dst_comment, "dst-address", matcher)
                 if dst_error:
-                    return {"error": f"FastTrack bypass (dst {cidr}): {dst_error}"}
+                    return {"error": f"FastTrack bypass (dst {matcher}): {dst_error}"}
+
+            # Rules left from when a pool range was written as CIDR blocks (26
+            # of them for the usual .2-.254 pool). The rules ensured above cover
+            # the same addresses, so the old ones only lengthen the chain every
+            # forwarded packet walks. Removed last, never first: a gap would let
+            # FastTrack take live connections until they close.
+            wanted_spans = [span for span in (self._address_span(m) for m in matchers) if span]
+            rules_superseded = 0
+            for rule in filter_rules:
+                comment = str(rule.get("comment") or "")
+                if not comment.startswith(PPPOE_FASTTRACK_BYPASS_COMMENT_PREFIX) or comment in wanted_comments:
+                    continue
+                if rule.get("chain") != "forward" or rule.get("action") != "accept" or not rule.get(".id"):
+                    continue
+                span = self._address_span(rule.get("src-address") or rule.get("dst-address"))
+                if span is None or not any(w[0] <= span[0] and span[1] <= w[1] for w in wanted_spans):
+                    continue
+                remove = self.send_command("/ip/firewall/filter/remove", {"numbers": rule[".id"]})
+                if remove.get("error"):
+                    warnings.append(f"Could not remove superseded FastTrack bypass rule {comment}: {remove['error']}")
+                else:
+                    rules_superseded += 1
 
             return {
                 "success": True,
                 "fasttrack_enabled": True,
                 "pool_name": effective_pool,
-                "cidrs": cidrs,
+                "cidrs": matchers,
                 "rules_added": rules_added,
                 "rules_removed": rules_removed,
+                "rules_superseded": rules_superseded,
                 "rules_reused": rules_reused,
                 "warnings": warnings,
             }
