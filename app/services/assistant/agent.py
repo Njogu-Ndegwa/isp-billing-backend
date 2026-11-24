@@ -222,7 +222,7 @@ How to work
 - Typing "confirm", "yes", "ok do it", "sawa" or "ndio" in the chat runs nothing: only the tap on the card does. When the person types a go-ahead while a card is waiting, say in one line that it runs when they tap Confirm on that card; never propose the same change again. One card per change: proposing a change again closes its earlier card, so propose again only to change what it does.
 - Confirmed and cancelled actions come back in a message that starts with [Confirmation results]. Report what happened plainly, failures included, then continue the task if more steps remain.
 - A customer can be given internet without paying through M-Pesa: register them if new, then activate with the activate action for their connection (activate-hotspot, activate-pppoe or activate-static), payment_method cash (cash received), other (paid elsewhere) or none (free: a comp, a test). A hotspot customer needs their device MAC.
-- Whenever your answer is "no", "not yet", "I can't" or "Bitwave doesn't" about something the person wants the product to do (a feature the app does not have), however they put it, as a request or as a question ("Can we...?", "Is it possible...?", "Does Bitwave...?"): say so plainly, offer the nearest thing it can do, and in the same turn record the request with POST /api/feedback/requests (title: the feature in a few words; asked: their words). It runs without a Confirm. Your reply answers the question first, from what you found: what is not possible today and the nearest thing that is. Then one short clause that you passed it to Bitwave (others asked too, if the reply says it was added to an existing request); that clause is never the whole reply, and if you already said it, do not say it again. When the exact ask is refused for policy (a password, another reseller's own data) but a feature would meet the need behind it, record that feature: "how affordable are my plans compared to other hotspots" is an anonymous price benchmark. Do not record: how-to questions you can answer, things an action already does, something that works once the person sets it up (a router password saved, a plan made: say what to set up), asks refused for policy with no feature behind them, or bugs (those go to support).
+- Whenever your answer is "no", "not yet", "I can't" or "Bitwave doesn't" about something the person wants the product to do (a feature the app does not have), however they put it, as a request or as a question ("Can we...?", "Is it possible...?", "Does Bitwave...?"): say so plainly, offer the nearest thing it can do, and in the same turn record the request with POST /api/feedback/requests (title: the feature in a few words; asked: their words). It runs without a Confirm. Make that call first, in the same response as your answer or before it; write that you passed it to Bitwave only after the call came back ok, never without the call. Your reply answers the question first, from what you found: what is not possible today and the nearest thing that is. Then one short clause that you passed it to Bitwave (others asked too, if the reply says it was added to an existing request); that clause is never the whole reply, and if you already said it, do not say it again. When the exact ask is refused for policy (a password, another reseller's own data) but a feature would meet the need behind it, record that feature: "how affordable are my plans compared to other hotspots" is an anonymous price benchmark. Do not record: how-to questions you can answer, things an action already does, something that works once the person sets it up (a router password saved, a plan made: say what to set up), asks refused for policy with no feature behind them, or bugs (those go to support).
 - An M-Pesa payment (buying SMS credits, paying the subscription) only sends a PIN prompt to a phone: after Confirm it is waiting, not bought, and the card shows when it is paid. The phone number is the payer's own M-Pesa line: leave it for them to type unless they gave it in this chat; never fill it with the support phone or a customer's number.
 - Why an M-Pesa payment failed: each failed row and failure_summary entry carries failure_fault (customer, mpesa, merchant_setup, bitwave or unknown) and failure_explained. Say who is at fault and what to do from those two fields only; never work out a cause yourself from result_desc or result_code, and never contradict them. "The initiator information is invalid" is a wrong PIN, not the payment setup. When failure_fault is unknown, say the cause is not known and quote M-Pesa's words.
 - For a change to many records, use a bulk action if the index has one; otherwise propose one call per record, at most {max_proposals} per turn, and say how many remain.
@@ -691,11 +691,21 @@ def _only_records_ask(content: list[dict]) -> bool:
     """Every call in this message writes down a feature request. The words next to it are the
     answer ("No, WhatsApp is not supported; SMS is"), not thinking aloud: keep them on screen."""
     uses = [b for b in content if b.get("type") == "tool_use"]
-    return bool(uses) and all(
-        b.get("name") == "call_api" and isinstance(b.get("input"), dict)
-        and str(b["input"].get("method") or "").upper() == "POST"
-        and str(b["input"].get("path") or "").split("?", 1)[0].rstrip("/") == "/api/feedback/requests"
-        for b in uses)
+    return bool(uses) and all(_records_ask(b) for b in uses)
+
+
+def _records_ask(b: dict) -> bool:
+    """A tool call that writes down a feature request (POST /api/feedback/requests)."""
+    return (b.get("type") == "tool_use" and b.get("name") == "call_api" and isinstance(b.get("input"), dict)
+            and str(b["input"].get("method") or "").upper() == "POST"
+            and str(b["input"].get("path") or "").split("?", 1)[0].rstrip("/") == "/api/feedback/requests")
+
+
+# Words telling the person their ask was written down for Bitwave ("I've passed the WhatsApp
+# request to Bitwave", "Noted for Bitwave"). Only true once POST /api/feedback/requests ran.
+_CLAIMS_RECORDED = re.compile(
+    r"(\b(pass(ed|ing)?|not(ed|ing)|record(ed|ing)?|logg(ed|ing)|forward(ed|ing)?|sent|flagg(ed|ing))\b"
+    r"[^.\n]{0,60}\b(to|for|with) bitwave\b|\bnime\w+[^.\n]{0,40}\bkwa bitwave\b)", re.I)
 
 
 def _echo_safe(blocks: list[dict]) -> list[dict]:
@@ -1493,7 +1503,8 @@ class Turn:
 
     async def _loop(self) -> None:
         system = self.system_blocks()
-        checked_claim = False
+        checked_claim = checked_record = False
+        turn_start = len(self.messages)
         for step in range(max(1, settings.ASSISTANT_MAX_STEPS)):
             spoke_before, self._streamed = self._spoke, ""
             try:
@@ -1546,19 +1557,29 @@ class Turn:
                         # screen: never make it again
                         return
                     if self._streamed:
-                        # The words sent back were a finished answer (NEXT line and all). Take them
-                        # off the screen and the transcript, as for words next to a lookup, so the
-                        # answer that follows is the only one; keep them only if nothing follows.
-                        await self.queue.put({"type": "retract", "chars": len(self._streamed)})
-                        if self.transcript and self.transcript[-1].get("type") == "assistant":
-                            self.transcript.pop()
-                        self._aside = said.strip() or self._aside
-                        self._spoke = spoke_before
+                        await self._take_back_answer(said, spoke_before)
                     self.messages.append({"role": "user", "content": [{"type": "text", "text": (
                         "[Check] You told the person a form or change is ready, but you did not call "
                         "call_api for it in this answer, so nothing is on their screen. Call "
                         "describe_action and call_api now (form: true) to put it there, or say "
                         "plainly that it is not ready yet.")}]})
+                    continue
+                # The model said the ask was passed to Bitwave without writing it down, so the
+                # person would be told something that did not happen. Once per turn, send it back
+                # to make the call (or to take the claim out).
+                if not checked_record and _CLAIMS_RECORDED.search(said) and not any(
+                        _records_ask(b) for m in self.messages[turn_start:]
+                        if m.get("role") == "assistant" and isinstance(m.get("content"), list)
+                        for b in m["content"]):
+                    checked_record = True
+                    if self._streamed:
+                        await self._take_back_answer(said, spoke_before)
+                    self.messages.append({"role": "user", "content": [{"type": "text", "text": (
+                        "[Check] You told the person you passed their request to Bitwave, but you did "
+                        "not call POST /api/feedback/requests in this answer, so nothing was recorded. "
+                        "Call it now (title: the feature in a few words; asked: their words), then give "
+                        "your answer again with that clause; or, if it is not a feature request, give "
+                        "the answer without the claim.")}]})
                     continue
                 return
             results = []
@@ -1571,6 +1592,16 @@ class Turn:
             self.messages.append({"role": "user", "content": results})
         await self.emit("notice", {"level": "info",
                                    "message": "Stopped after many steps. Ask again to continue."})
+
+    async def _take_back_answer(self, said: str, spoke_before: bool) -> None:
+        """A finished answer (NEXT line and all) a [Check] sends back. Take it off the screen and
+        the transcript, as for words next to a lookup, so the answer that follows is the only
+        one; keep it only if nothing follows."""
+        await self.queue.put({"type": "retract", "chars": len(self._streamed)})
+        if self.transcript and self.transcript[-1].get("type") == "assistant":
+            self.transcript.pop()
+        self._aside = said.strip() or self._aside
+        self._spoke = spoke_before
 
     async def _emit_text(self, delta: str, state: dict) -> None:
         """Stream text; a new reply after earlier text in this turn starts a new paragraph."""
