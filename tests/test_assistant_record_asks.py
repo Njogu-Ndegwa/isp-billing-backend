@@ -103,3 +103,35 @@ async def test_a_how_to_answer_is_not_flagged(client, owner):  # noqa: F811
                           headers=auth(token))
     events = sse_events(r.text)
     assert not any(t["type"] == "review_flag" for t in await _transcript(client, token, events))
+
+
+@pytest.mark.asyncio
+async def test_an_answer_written_with_the_recorded_ask_stays_on_screen(client, owner, monkeypatch):  # noqa: F811
+    """CR-1124-T1: the model answered and recorded the ask in one message; the answer was
+    taken back as a working note and only "Noted for Bitwave" was left on screen."""
+    import app.api.feedback_routes as fr
+    from tests.test_assistant import visible_text
+
+    async def _no_triage(_post_id):
+        return None
+    monkeypatch.setattr(fr, "run_feedback_triage", _no_triage)
+
+    reseller, token = owner
+    use_model([
+        tool_reply("call_api", {"method": "POST", "path": "/api/feedback/requests",
+                                "body": {"title": "Automatic WhatsApp messages",
+                                         "asked": "Can we send automatic whatsapp messages?"}},
+                   text="No — Bitwave can't send WhatsApp messages yet. Automatic customer messages "
+                        "(welcome, payment receipt, expiry reminder) go out by SMS."),
+        text_reply("Passed to Bitwave; another reseller asked for it too."),
+    ])
+    r = await client.post("/api/assistant/chat", json={"message": "Can we send automatic whatsapp messages?"},
+                          headers=auth(token))
+    shown = visible_text(sse_events(r.text))
+    assert shown.startswith("No — Bitwave can't send WhatsApp messages yet.")
+    assert "go out by SMS" in shown and shown.endswith("another reseller asked for it too.")
+
+
+def test_the_rule_says_answer_first_then_the_note():
+    prompt = agent_mod.SYSTEM_TEMPLATE
+    assert "never the whole reply" in prompt

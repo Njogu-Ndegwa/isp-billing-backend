@@ -148,7 +148,9 @@ async def record_feature_request(payload: FeatureRequestIn, background_tasks: Ba
                                  token: str = Depends(verify_token)):
     """Record a feature someone asked for that the app cannot do yet. If an open request for the
     same thing exists it gets this account's vote and words instead of a second post, so Bitwave
-    sees how many want it. Runs without a Confirm: it only writes down what was asked."""
+    sees how many want it. Runs without a Confirm: it only writes down what was asked. The reply to
+    the person still answers their question first (what is not possible today, the nearest thing
+    that is); being passed to Bitwave is one short clause after it, never the whole reply."""
     from app.services import feature_requests
 
     user = await _require_member(token, db)

@@ -222,7 +222,7 @@ How to work
 - Typing "confirm", "yes", "ok do it", "sawa" or "ndio" in the chat runs nothing: only the tap on the card does. When the person types a go-ahead while a card is waiting, say in one line that it runs when they tap Confirm on that card; never propose the same change again. One card per change: proposing a change again closes its earlier card, so propose again only to change what it does.
 - Confirmed and cancelled actions come back in a message that starts with [Confirmation results]. Report what happened plainly, failures included, then continue the task if more steps remain.
 - A customer can be given internet without paying through M-Pesa: register them if new, then activate with the activate action for their connection (activate-hotspot, activate-pppoe or activate-static), payment_method cash (cash received), other (paid elsewhere) or none (free: a comp, a test). A hotspot customer needs their device MAC.
-- Whenever your answer is "no", "not yet", "I can't" or "Bitwave doesn't" about something the person wants the product to do (a feature the app does not have), however they put it, as a request or as a question ("Can we...?", "Is it possible...?", "Does Bitwave...?"): say so plainly, offer the nearest thing it can do, and in the same turn record the request with POST /api/feedback/requests (title: the feature in a few words; asked: their words). It runs without a Confirm. Then say in one short line that you noted it for Bitwave; if the reply says it was added to an existing request, say others asked too. When the exact ask is refused for policy (a password, another reseller's own data) but a feature would meet the need behind it, record that feature: "how affordable are my plans compared to other hotspots" is an anonymous price benchmark. Do not record: how-to questions you can answer, things an action already does, something that works once the person sets it up (a router password saved, a plan made: say what to set up), asks refused for policy with no feature behind them, or bugs (those go to support).
+- Whenever your answer is "no", "not yet", "I can't" or "Bitwave doesn't" about something the person wants the product to do (a feature the app does not have), however they put it, as a request or as a question ("Can we...?", "Is it possible...?", "Does Bitwave...?"): say so plainly, offer the nearest thing it can do, and in the same turn record the request with POST /api/feedback/requests (title: the feature in a few words; asked: their words). It runs without a Confirm. Your reply answers the question first, from what you found: what is not possible today and the nearest thing that is. Then one short clause that you passed it to Bitwave (others asked too, if the reply says it was added to an existing request); that clause is never the whole reply, and if you already said it, do not say it again. When the exact ask is refused for policy (a password, another reseller's own data) but a feature would meet the need behind it, record that feature: "how affordable are my plans compared to other hotspots" is an anonymous price benchmark. Do not record: how-to questions you can answer, things an action already does, something that works once the person sets it up (a router password saved, a plan made: say what to set up), asks refused for policy with no feature behind them, or bugs (those go to support).
 - An M-Pesa payment (buying SMS credits, paying the subscription) only sends a PIN prompt to a phone: after Confirm it is waiting, not bought, and the card shows when it is paid. The phone number is the payer's own M-Pesa line: leave it for them to type unless they gave it in this chat; never fill it with the support phone or a customer's number.
 - Why an M-Pesa payment failed: each failed row and failure_summary entry carries failure_fault (customer, mpesa, merchant_setup, bitwave or unknown) and failure_explained. Say who is at fault and what to do from those two fields only; never work out a cause yourself from result_desc or result_code, and never contradict them. "The initiator information is invalid" is a wrong PIN, not the payment setup. When failure_fault is unknown, say the cause is not known and quote M-Pesa's words.
 - For a change to many records, use a bulk action if the index has one; otherwise propose one call per record, at most {max_proposals} per turn, and say how many remain.
@@ -685,6 +685,17 @@ def _block_dicts(message) -> list[dict]:
         else:
             blocks.append(json.loads(block.model_dump_json(exclude_unset=True)))
     return _echo_safe(blocks)
+
+
+def _only_records_ask(content: list[dict]) -> bool:
+    """Every call in this message writes down a feature request. The words next to it are the
+    answer ("No, WhatsApp is not supported; SMS is"), not thinking aloud: keep them on screen."""
+    uses = [b for b in content if b.get("type") == "tool_use"]
+    return bool(uses) and all(
+        b.get("name") == "call_api" and isinstance(b.get("input"), dict)
+        and str(b["input"].get("method") or "").upper() == "POST"
+        and str(b["input"].get("path") or "").split("?", 1)[0].rstrip("/") == "/api/feedback/requests"
+        for b in uses)
 
 
 def _echo_safe(blocks: list[dict]) -> list[dict]:
@@ -1494,7 +1505,7 @@ class Turn:
                                            "message": "The assistant could not answer just now. Try again."})
                 return
             content = _block_dicts(message)
-            if self._streamed and any(b.get("type") == "tool_use" for b in content):
+            if self._streamed and any(b.get("type") == "tool_use" for b in content) and not _only_records_ask(content):
                 # Words written next to a lookup are the model thinking aloud ("I'll check
                 # the plans"), not the answer, which comes after the last lookup. Take them
                 # back off the screen; keep them only if no answer follows.
