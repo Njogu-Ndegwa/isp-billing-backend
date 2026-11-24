@@ -90,7 +90,14 @@ def render_usage_push_script(
         # work does not inflate the CPU figure it reports. Every read is a local
         # /system resource value (RouterOS 6 and 7 alike), no network, no login.
         health_prelude = (
-            '    :local hcpu [/system resource get cpu-load]\n'
+            # cpu-load is a 1-second average and that second is spent compiling
+            # this script, so an immediate read reports our own start-up cost
+            # (RB951 router 558: dashboard 80-100% while real load was 20-50%).
+            # Wait it out, then average two readings a second apart.
+            '    :delay 2s\n'
+            '    :local hcpuA [/system resource get cpu-load]\n'
+            '    :delay 1s\n'
+            '    :local hcpu (([/system resource get cpu-load] + $hcpuA) / 2)\n'
             '    :local hfm [/system resource get free-memory]\n'
             '    :local htm [/system resource get total-memory]\n'
             '    :local hfh [/system resource get free-hdd-space]\n'
@@ -254,7 +261,14 @@ _REALTIME_TEMPLATE = r'''# Bitwave usage push v2 (real-time) - safe to re-run.
     :local tok "__TOKEN__"
     :local ident "__IDENT__"
     # Health first, so this script's own work does not inflate the CPU figure.
-    :local cpu [/system resource get cpu-load]
+    # cpu-load is a 1-second average and that second is spent compiling this
+    # script, so an immediate read reports our own start-up cost (RB951 router
+    # 558: dashboard 80-100% while real load was 20-50%). Wait it out, then
+    # average two readings a second apart.
+    :delay 2s
+    :local cpuA [/system resource get cpu-load]
+    :delay 1s
+    :local cpu (([/system resource get cpu-load] + $cpuA) / 2)
     :local fm [/system resource get free-memory]
     :local tm [/system resource get total-memory]
     :local fh [/system resource get free-hdd-space]

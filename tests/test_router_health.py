@@ -223,3 +223,16 @@ def test_script_has_no_bare_return():
     import re
     s = render_usage_push_script(identity="Router-0721", endpoint_url=URL, include_router_metrics=True)
     assert not re.search(r"^\s*:return\s*$", s, re.M)
+
+
+def test_script_cpu_reading_skips_its_own_startup():
+    """cpu-load is a 1 s average; read right away it reports the script's own compile cost."""
+    from app.services.usage_push_script import render_realtime_push_script
+    for s in (
+        render_usage_push_script(identity="Router-0721", endpoint_url=URL, include_router_metrics=True),
+        render_realtime_push_script(identity="Router-0721", endpoint_url=URL),
+    ):
+        first_cpu = s.index("/system resource get cpu-load")
+        assert ":delay 2s" in s[:first_cpu]
+        assert s.count("/system resource get cpu-load") == 2
+        assert s.index("/system resource get cpu-load", first_cpu + 1) < s.index("/queue simple find")
