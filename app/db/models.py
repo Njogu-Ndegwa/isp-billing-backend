@@ -1047,6 +1047,34 @@ class RouterMetricBucket(Base):
     link_drops = Column(Integer, nullable=False, default=0, server_default="0")
 
 
+class RouterCpuBucket(Base):
+    """Fleet CPU per router model, one row per 5-minute bucket per
+    (board_name, RouterOS major) (app/services/router_cpu_history.py).
+
+    Built from the samples that already reach ``router_health``; each router
+    counts once per bucket (its mean over the bucket), so a router that pushes
+    every minute weighs the same as one that pushes every two. Feeds the admin
+    "CPU by router model" chart, which is how a release or a fleet-wide router
+    script change is checked for CPU regressions.
+    """
+    __tablename__ = "router_cpu_buckets"
+
+    bucket_start = Column(DateTime, primary_key=True)
+    board_name = Column(String(60), primary_key=True)
+    ros_major = Column(String(4), primary_key=True)
+    routers = Column(Integer, nullable=False, default=0)
+    samples = Column(Integer, nullable=False, default=0)
+    # Sum of per-router means; mean CPU = cpu_mean_sum / routers.
+    cpu_mean_sum = Column(Float, nullable=False, default=0.0)
+    # Highest single sample seen in the bucket.
+    cpu_peak = Column(Integer, nullable=False, default=0)
+    # Routers whose bucket mean was >= 80%, and routers with any sample >= 95%.
+    routers_ge80 = Column(Integer, nullable=False, default=0)
+    routers_peak_ge95 = Column(Integer, nullable=False, default=0)
+    # Per-router means in ten 10%-wide bins ([0,10) ... [90,100]), for percentiles.
+    hist = Column(JSON, nullable=False, default=list)
+
+
 class RouterUsageBucket(Base):
     """Per-router 5-minute ledger of bytes credited to customers.
 

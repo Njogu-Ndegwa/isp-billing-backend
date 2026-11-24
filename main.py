@@ -3304,6 +3304,23 @@ async def run_router_overload_alert_migrations():
                 wan_link_downs BIGINT NULL
             )
         """))
+        # Fleet CPU per router model, 5-minute buckets (app/services/router_cpu_history.py),
+        # for the admin "CPU by router model" chart.
+        await conn.execute(sa_text("""
+            CREATE TABLE IF NOT EXISTS router_cpu_buckets (
+                bucket_start TIMESTAMP NOT NULL,
+                board_name VARCHAR(60) NOT NULL,
+                ros_major VARCHAR(4) NOT NULL,
+                routers INTEGER NOT NULL DEFAULT 0,
+                samples INTEGER NOT NULL DEFAULT 0,
+                cpu_mean_sum DOUBLE PRECISION NOT NULL DEFAULT 0,
+                cpu_peak INTEGER NOT NULL DEFAULT 0,
+                routers_ge80 INTEGER NOT NULL DEFAULT 0,
+                routers_peak_ge95 INTEGER NOT NULL DEFAULT 0,
+                hist JSON NOT NULL,
+                PRIMARY KEY (bucket_start, board_name, ros_major)
+            )
+        """))
     logger.info("Router overload-alert migrations complete")
 
 
@@ -4901,6 +4918,13 @@ async def startup_event():
 async def shutdown_event():
     from app.services.native_router_stream import stop as stop_native_streams
     await stop_native_streams()
+    # Keep the CPU-by-model chart gap-free across deploys: write the open
+    # 5-minute buckets now (additive, so the next instance just adds to them).
+    try:
+        from app.services import router_cpu_history
+        await router_cpu_history.flush(include_open=True)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[CPU-HISTORY] shutdown flush skipped: {e}")
     if scheduler.running:
         scheduler.shutdown(wait=False)
         logger.info("Background scheduler stopped")
