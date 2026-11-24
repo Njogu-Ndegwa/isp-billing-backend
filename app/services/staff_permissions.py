@@ -318,6 +318,9 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     # --- routers: read ------------------------------------------------------
     ((R,), "/api/routers/{router_id}/uptime", "routers.view", None),
     ((R,), "/api/routers/{router_id}/live", "routers.view", None),
+    # Graph history: shown on the dashboard's Router Health card and the live page.
+    ((R,), "/api/routers/{router_id}/health-history", ("routers.view", "routers.manage", "dashboard.view"), None),
+    ((R,), "/api/router-health/ranking", ("routers.view", "routers.manage", "dashboard.view"), None),
     ((R,), "/api/routers/{router_id}/checkin-actions", "routers.view", None),
     ((R,), "/api/routers/{router_id}/bandwidth-check", "routers.view", None),
     ((R,), "/api/routers/{router_id}/diagnose/{mac_address}", "routers.view", None),

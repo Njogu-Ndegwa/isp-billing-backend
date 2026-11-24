@@ -56,6 +56,41 @@ class HealthSample:
         return all(v is None for v in self.__dict__.values())
 
 
+# How far the WAN counters may run ahead of the same interface's row in the
+# ports list. The script reads the ports first and the WAN counters a moment
+# later (seconds, more on the reports that also walk leases and neighbours).
+_WAN_MATCH_SLACK_BYTES = 256 * 1024 * 1024
+_WAN_MATCH_SLACK_FRACTION = 0.005
+
+
+def wan_link_downs_from_ports(ports, iface_rx_bytes: int, iface_tx_bytes: int) -> Optional[int]:
+    """The WAN's link-down counter, found in the push report's ports list.
+
+    The installed reporter (v3) sends ``link_downs`` for every physical port but
+    not ``wan_link_downs`` on its own, and does not say which port is the WAN.
+    The WAN is the one port whose byte counters match ``iface_rx/tx_bytes`` (the
+    WAN counters, read a moment after the ports): equal or a little behind, in
+    both directions. None unless exactly one port matches, e.g. when the WAN is
+    a PPPoE or VLAN interface that is not in the list, or on a fresh router
+    whose counters are all near zero.
+    """
+    if not ports or (iface_rx_bytes or 0) + (iface_tx_bytes or 0) <= 0:
+        return None
+
+    def close(port_value: int, wan_value: int) -> bool:
+        slack = max(_WAN_MATCH_SLACK_BYTES, int(wan_value * _WAN_MATCH_SLACK_FRACTION))
+        return 0 <= wan_value - port_value <= slack
+
+    matches = [
+        p for p in ports
+        if close(int(getattr(p, "rx_bytes", 0) or 0), int(iface_rx_bytes or 0))
+        and close(int(getattr(p, "tx_bytes", 0) or 0), int(iface_tx_bytes or 0))
+    ]
+    if len(matches) != 1:
+        return None
+    return int(getattr(matches[0], "link_downs", 0) or 0)
+
+
 _UPTIME_UNITS = {"w": 604800, "d": 86400, "h": 3600, "m": 60, "s": 1}
 
 
