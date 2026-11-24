@@ -263,6 +263,7 @@ from app.services.mikrotik_lb_background import reconcile_lb_paid_background
 from app.services.payment_port_attribution import attribute_recent_payment_ports_background
 from app.services.router_status_alerts import scan_and_notify_offline_routers
 from app.services.router_overload_alerts import poll_router_cpu, scan_payment_overload
+from app.services.router_health_poll import poll_router_health
 from app.services.router_reachability_probe import (
     PROBE_INTERVAL_SECONDS as ROUTER_REACHABILITY_PROBE_SECONDS,
     probe_router_reachability,
@@ -4530,6 +4531,15 @@ async def startup_event():
         trigger=IntervalTrigger(seconds=301),
         id='router_cpu_snmp_poll',
         name='Poll enrolled routers CPU over SNMP (event loop, no threads)',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        poll_router_health,
+        trigger=IntervalTrigger(seconds=300),
+        id='router_health_poll',
+        name='Poll CPU/memory/WAN drops of online routers that send no health readings',
         replace_existing=True,
         max_instances=1,
         coalesce=True,

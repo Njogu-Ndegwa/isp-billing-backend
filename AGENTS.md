@@ -151,6 +151,12 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   100% CPU for ~4 s every minute, router 585, 2026-10-10). A new router script
   must render through `with_gate`/`gate_rsc_body` and be added to
   `GATED_SCRIPTS`. Existing routers: `scripts/router_script_gate_rollout.py`.
+- Routers that do not push health (hAP lites, no encrypted tunnel) are read by
+  the server every 5 min (`app/services/router_health_poll.py`, `source='poll'`,
+  kill switch `ROUTER_HEALTH_POLL_ENABLED`), 15 min while at >=85% CPU. Measured
+  on hAP lites (2026-11-24): ~0.2 CPU-s per poll, but `/ip/route/print` costs up
+  to 1.4 s at 90% CPU on ROS 6, so the WAN name is cached for a day. Don't add
+  per-poll reads without measuring them on a hAP lite first.
 
 ## Router Health Monitoring (every router, new ones too)
 

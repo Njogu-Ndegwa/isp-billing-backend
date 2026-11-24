@@ -374,6 +374,10 @@ class Settings(BaseSettings):
     ROUTER_OVERLOAD_ALERTS_ENABLED: bool = True
     ROUTER_SNMP_POLL_ENABLED: bool = False
     ROUTER_SNMP_COMMUNITY: str = ""
+    # Server-side health poll (~5 min) for online routers that send no health
+    # readings (hAP lites kept off the push agent, routers without an
+    # encrypted tunnel). app/services/router_health_poll.py.
+    ROUTER_HEALTH_POLL_ENABLED: bool = True
 
     # --- Feedback board (Ideas + Bugs) / AI triage -----------------------
     # ANTHROPIC_API_KEY lives in the server .env only — never committed.
