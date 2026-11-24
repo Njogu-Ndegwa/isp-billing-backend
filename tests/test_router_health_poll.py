@@ -11,6 +11,7 @@ from app.db import database
 from app.db.models import RouterHealth, RouterMetricBucket, SubscriptionStatus
 from app.services import router_health as rh
 from app.services import router_health_poll as poll
+from app.services.app_settings import set_setting
 from tests.factories import make_reseller, make_router
 
 HAP_LITE = {
@@ -63,6 +64,35 @@ def test_wan_from_routes(rows, wan):
     assert poll.wan_from_routes(rows) == wan
 
 
+def test_rollout_allowlist_and_switches():
+    nobody = poll.parse_rollout("", None, None)
+    assert not nobody.allows(330, "hAP lite")
+    canary = poll.parse_rollout("330, 478", "", "")
+    assert canary.allows(330, None) and canary.allows(478, "hAP lite")
+    assert not canary.allows(439, "hAP lite")
+    everyone = poll.parse_rollout("ALL", "174,184", "hap lite, hap mini")
+    assert everyone.allows(439, "RB951G-2HnD") and everyone.allows(255, None)
+    assert not everyone.allows(174, None)                 # per-router off switch
+    assert not everyone.allows(330, "hAP lite")           # per-board off switch
+    assert not poll.parse_rollout("yes please", None, None).allows(1, None)
+
+
+def test_slots_spread_the_fleet_over_five_minutes():
+    t = datetime(2026, 11, 24, 12, 0)
+    minutes = [t + timedelta(minutes=m) for m in range(10)]
+    for rid in (330, 331, 332, 478, 1000):
+        hits = [m for m in minutes if poll.in_slot(rid, m)]
+        assert len(hits) == 2 and hits[1] - hits[0] == timedelta(minutes=5)
+    assert sum(poll.in_slot(rid, t) for rid in range(100)) == 20
+
+
+def test_timeout_backs_off_at_once():
+    poll._failures.clear()
+    poll.note_failure(9, NOW, slow=True)
+    assert poll.backing_off(9, NOW + timedelta(minutes=1))
+    poll._failures.clear()
+
+
 def test_failure_backoff():
     poll._failures.clear()
     for _ in range(poll.FAILURES_BEFORE_BACKOFF):
@@ -84,6 +114,7 @@ class FakeRouterOS:
     fail_hosts: set = set()
     routes = ROS6_ROUTES
     link_downs = "4"
+    cpu = "7"
 
     def __init__(self, host, user, password, port=8728):
         self.host = host
@@ -98,7 +129,7 @@ class FakeRouterOS:
         assert FakeRouterOS.open_sessions() == 0, "DB session held across RouterOS I/O"
         FakeRouterOS.calls.append((self.host, path))
         if path == "/system/resource/print":
-            return {"rows": [dict(HAP_LITE)], "done": {}}
+            return {"rows": [dict(HAP_LITE, **{"cpu-load": FakeRouterOS.cpu})], "done": {}}
         if path == "/ip/route/print":
             return {"rows": FakeRouterOS.routes, "done": {}}
         if path == "/interface/print":
@@ -128,9 +159,12 @@ def fake_ros(monkeypatch):
     monkeypatch.setattr(poll, "AsyncNativeAPI", FakeRouterOS)
     monkeypatch.setattr(poll, "_router_busy", lambda target: False)
     monkeypatch.setattr(settings, "ROUTER_HEALTH_POLL_ENABLED", True)
+    monkeypatch.setattr(settings, "ROUTER_HEALTH_POLL_ROUTER_IDS", "all")
+    monkeypatch.setattr(poll, "SLOTS", 1)          # every minute is every router's slot
     FakeRouterOS.calls = []
     FakeRouterOS.fail_hosts = set()
     FakeRouterOS.link_downs = "4"
+    FakeRouterOS.cpu = "7"
     FakeRouterOS.open_sessions = lambda: active["n"]
     poll._wan_cache.clear()
     poll._failures.clear()
@@ -204,3 +238,45 @@ async def test_disabled_does_nothing(db, fake_ros, monkeypatch):
     monkeypatch.setattr(settings, "ROUTER_HEALTH_POLL_ENABLED", False)
     assert await poll.poll_router_health() == 0
     assert fake_ros.calls == []
+
+
+async def test_nothing_is_polled_until_allowlisted(db, fake_ros, monkeypatch):
+    owner = await make_reseller(db)
+    await make_router(db, owner, ip_address="10.0.100.9", last_status=True)
+    monkeypatch.setattr(settings, "ROUTER_HEALTH_POLL_ROUTER_IDS", "")
+    assert await poll.poll_router_health() == 0
+    assert fake_ros.calls == []
+
+
+async def test_canary_allowlist_and_board_switch_from_app_settings(db, fake_ros, monkeypatch):
+    monkeypatch.setattr(settings, "ROUTER_HEALTH_POLL_ROUTER_IDS", "")
+    owner = await make_reseller(db)
+    canary = await make_router(db, owner, ip_address="10.0.100.9", last_status=True)
+    await make_router(db, owner, ip_address="10.0.100.10", last_status=True)
+    await set_setting(db, poll.KEY_ROUTER_IDS, str(canary.id))
+    t0 = datetime.utcnow() - timedelta(minutes=10)
+    assert await poll.poll_router_health(now=t0) == 1
+    assert {h for h, _ in fake_ros.calls} == {"10.0.100.9"}
+
+    # Back out every hAP lite at once: the canary last reported "hAP lite".
+    await set_setting(db, poll.KEY_ROUTER_IDS, "all")
+    await set_setting(db, poll.KEY_EXCLUDE_BOARDS, "hap lite")
+    fake_ros.calls.clear()
+    assert await poll.poll_router_health(now=datetime.utcnow()) == 1
+    assert {h for h, _ in fake_ros.calls} == {"10.0.100.10"}
+
+
+async def test_busy_router_is_asked_nothing_more_and_waits_15_minutes(db, fake_ros):
+    owner = await make_reseller(db)
+    router = await make_router(db, owner, ip_address="10.0.100.9", last_status=True)
+    fake_ros.cpu = "92"
+    t0 = datetime.utcnow() - timedelta(minutes=16)
+    assert await poll.poll_router_health(now=t0) == 1
+    assert [p for _, p in fake_ros.calls] == ["login", "/system/resource/print"]
+    row = await db.get(RouterHealth, router.id)
+    await db.refresh(row)
+    assert row.cpu_load == 92 and row.wan_link_downs is None
+    fake_ros.calls.clear()
+    assert await poll.poll_router_health(now=t0 + timedelta(minutes=5)) == 0
+    assert await poll.poll_router_health(now=t0 + timedelta(minutes=10)) == 0
+    assert await poll.poll_router_health(now=t0 + timedelta(minutes=15)) == 1

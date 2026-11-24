@@ -4537,7 +4537,7 @@ async def startup_event():
     )
     scheduler.add_job(
         poll_router_health,
-        trigger=IntervalTrigger(seconds=300),
+        trigger=IntervalTrigger(seconds=60),   # each router has one slot in five
         id='router_health_poll',
         name='Poll CPU/memory/WAN drops of online routers that send no health readings',
         replace_existing=True,

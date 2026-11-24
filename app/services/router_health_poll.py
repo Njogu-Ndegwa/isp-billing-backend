@@ -14,12 +14,27 @@ login + ``/system/resource`` + ``/interface ?name=<wan>`` takes ~1 s and about
 that finds the WAN port is the expensive part on ROS 6 (up to 1.4 s at 90%
 CPU), so the WAN name is resolved once and cached for a day.
 
+Rollout (Dennis: "careful, especially the hAP lites - they must not spike"):
+* Nothing is polled until routers are allowlisted. The allowlist lives in the
+  ``app_settings`` table so canary -> wider -> all, and backing out, need no
+  deploy or restart:
+    health_poll_router_ids          "" (none) | "330,478" | "all"
+    health_poll_exclude_router_ids  "174,184"   per-router off switch
+    health_poll_exclude_boards      "hap lite"  per-board off switch (substring
+                                    of the last reported board name)
+  With no row, ``settings.ROUTER_HEALTH_POLL_ROUTER_IDS`` (default "") applies.
+  ``ROUTER_HEALTH_POLL_ENABLED=false`` stops the job outright.
+* Staggered: the job runs every minute and each router has one minute slot in
+  five (router_id % 5), so the fleet is spread evenly over the cadence.
+
 Rules:
 * Only routers that are online, owner not cut off, and have no push/SNMP
   reading in the last 10 minutes. A router that starts pushing drops out on
   its own.
 * Back-off: a router whose last poll read >= 85% CPU waits 15 minutes.
-* Repeated failures (unreachable, legacy login) back off for 30 minutes.
+* Repeated failures (unreachable, legacy login) back off for 30 minutes; a
+  timeout (slow router) backs off at once. Short per-router timeout, no retry.
+* A reading taken at >= 85% CPU skips the WAN port read for that round.
 * A router whose lock is held (payment provisioning, cleanup) is skipped this
   round, never waited on.
 * Event loop only (AsyncNativeAPI): no executor threads, which payments share.
@@ -45,6 +60,7 @@ from app.config import settings
 from app.db import database
 from app.db.models import Router, RouterAuthMethod, RouterHealth, User
 from app.services import router_health
+from app.services.app_settings import get_setting
 from app.services.native_router_api import AsyncNativeAPI
 
 logger = logging.getLogger(__name__)
@@ -59,9 +75,14 @@ FAILURES_BEFORE_BACKOFF = 3
 FAILURE_BACKOFF = timedelta(minutes=30)
 WAN_CACHE_TTL = timedelta(hours=24)
 
+SLOTS = 5                                    # one minute slot in five per router
 CONCURRENCY = 4
-ROUTER_TIMEOUT_SECONDS = 20
-RUN_BUDGET_SECONDS = 150
+ROUTER_TIMEOUT_SECONDS = 8                   # a healthy hAP lite poll takes 1-3 s
+RUN_BUDGET_SECONDS = 45                      # the job runs every 60 s
+
+KEY_ROUTER_IDS = "health_poll_router_ids"
+KEY_EXCLUDE_IDS = "health_poll_exclude_router_ids"
+KEY_EXCLUDE_BOARDS = "health_poll_exclude_boards"
 
 RESOURCE_PROPS = ("cpu-load,free-memory,total-memory,free-hdd-space,total-hdd-space,"
                   "uptime,version,board-name")
@@ -94,14 +115,58 @@ def due(health: Optional[RouterHealth], now: datetime) -> bool:
     return True
 
 
+@dataclass
+class Rollout:
+    all_routers: bool
+    router_ids: frozenset
+    exclude_ids: frozenset
+    exclude_boards: tuple
+
+    def allows(self, router_id: int, board: Optional[str]) -> bool:
+        if router_id in self.exclude_ids:
+            return False
+        if board and any(b in board.lower() for b in self.exclude_boards):
+            return False
+        return self.all_routers or router_id in self.router_ids
+
+
+def _ids(raw: Optional[str]) -> frozenset:
+    out = set()
+    for part in (raw or "").replace(";", ",").split(","):
+        part = part.strip()
+        if part.isdigit():
+            out.add(int(part))
+    return frozenset(out)
+
+
+def parse_rollout(router_ids: Optional[str], exclude_ids: Optional[str],
+                  exclude_boards: Optional[str]) -> Rollout:
+    """Settings text -> Rollout. Pure. Anything unparseable means "nobody"."""
+    raw = (router_ids or "").strip().lower()
+    return Rollout(
+        all_routers=raw in ("all", "*"),
+        router_ids=_ids(raw),
+        exclude_ids=_ids(exclude_ids),
+        exclude_boards=tuple(b.strip().lower() for b in (exclude_boards or "").split(",")
+                             if b.strip()),
+    )
+
+
+def in_slot(router_id: int, now: datetime) -> bool:
+    """Whether this minute is the router's slot. Pure."""
+    minute = int((now - datetime(1970, 1, 1)).total_seconds() // 60)
+    return router_id % SLOTS == minute % SLOTS
+
+
 def backing_off(router_id: int, now: datetime) -> bool:
     count, last = _failures.get(router_id, (0, None))
     return count >= FAILURES_BEFORE_BACKOFF and last is not None and now - last < FAILURE_BACKOFF
 
 
-def note_failure(router_id: int, now: datetime) -> None:
+def note_failure(router_id: int, now: datetime, *, slow: bool = False) -> None:
     count, _ = _failures.get(router_id, (0, None))
-    _failures[router_id] = (count + 1, now)
+    count = max(count + 1, FAILURES_BEFORE_BACKOFF if slow else 0)
+    _failures[router_id] = (count, now)
 
 
 def note_success(router_id: int) -> None:
@@ -161,6 +226,14 @@ async def load_targets(now: datetime) -> list[Target]:
     from app.services.ops_health import is_owner_cut_off
 
     async with database.async_session() as db:
+        stored_ids = await get_setting(db, KEY_ROUTER_IDS)
+        rollout = parse_rollout(
+            stored_ids if stored_ids is not None else settings.ROUTER_HEALTH_POLL_ROUTER_IDS,
+            await get_setting(db, KEY_EXCLUDE_IDS),
+            await get_setting(db, KEY_EXCLUDE_BOARDS))
+        if not rollout.all_routers and not rollout.router_ids:
+            await db.commit()
+            return []
         rows = (await db.execute(
             select(Router.id, Router.ip_address, Router.username, Router.password,
                    Router.port, Router.auth_method, User.subscription_status, RouterHealth)
@@ -174,7 +247,10 @@ async def load_targets(now: datetime) -> list[Target]:
     for rid, ip, user, password, port, auth, owner_status, health in rows:
         if auth == RouterAuthMethod.RADIUS or is_owner_cut_off(owner_status):
             continue
-        if not user or not due(health, now) or backing_off(rid, now):
+        board = health.board_name if health is not None else None
+        if not user or not rollout.allows(rid, board) or not in_slot(rid, now):
+            continue
+        if not due(health, now) or backing_off(rid, now):
             continue
         targets.append(Target(rid, ip, user, password or "", int(port or 8728)))
     return targets
@@ -210,13 +286,22 @@ async def read_router(target: Target, now: datetime) -> router_health.HealthSamp
         await api.connect()
         resource = (await api.rpc("/system/resource/print",
                                   {".proplist": RESOURCE_PROPS}))["rows"][0]
-        try:
-            link_downs = await _wan_link_downs(api, target.router_id, now)
-        except Exception:
-            link_downs = None   # the resource reading still stands
+        link_downs = None
+        if _cpu(resource) < BUSY_CPU_PERCENT:   # busy right now: ask nothing more
+            try:
+                link_downs = await _wan_link_downs(api, target.router_id, now)
+            except Exception:
+                pass   # the resource reading still stands
         return sample_from(resource, link_downs)
     finally:
         await api.close()
+
+
+def _cpu(resource: dict) -> int:
+    try:
+        return int(resource.get("cpu-load"))
+    except (TypeError, ValueError):
+        return 100
 
 
 def _router_busy(target: Target) -> bool:
@@ -256,7 +341,8 @@ async def poll_router_health(now: Optional[datetime] = None) -> int:
                                                 ROUTER_TIMEOUT_SECONDS)
             except Exception as exc:
                 failed += 1
-                note_failure(target.router_id, now)
+                note_failure(target.router_id, now,
+                             slow=isinstance(exc, asyncio.TimeoutError))
                 logger.debug("[HEALTH-POLL] router %s: %s", target.router_id,
                              type(exc).__name__)
                 return
