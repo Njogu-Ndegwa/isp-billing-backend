@@ -107,12 +107,15 @@ def test_what_the_bot_used_to_send_people_off_for_is_in_its_index():
 
 @pytest.mark.asyncio
 async def test_asking_for_the_old_app_gets_the_assistant_and_a_tour(client, owner):
-    """'How can I exit AI mode?' / 'Nataka kurudi kwa app ya zamani': the classic dashboard is
-    replaced, so the answer is what can be done here, with examples, and an offer of a tour."""
+    """'How can I exit AI mode?' / 'Nataka kurudi kwa app ya zamani': the answer is what can be
+    done here, with examples, and an offer of a tour, in the language they wrote in. The classic
+    dashboard still exists, so it is never called gone or replaced."""
     _, token = owner
     text = await _system_text(client, token)
     assert "exit AI mode" in text and "nataka kurudi kwa app ya zamani" in text
-    assert "the classic dashboard has been replaced" in text
+    assert "can now be done here, just by asking" in text
+    assert "has been replaced" not in text
+    assert "Kiswahili gets Kiswahili" in text
     # the examples and the tour come first; the way back only if they still want it
     exit_rule = text[text.index("Asked how to leave the assistant"):text.index("The tour, once they say yes")]
     assert exit_rule.index("quick tour") < exit_rule.index("Only if they still want the old one")
