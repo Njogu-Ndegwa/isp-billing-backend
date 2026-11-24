@@ -397,3 +397,30 @@ def test_rollback_removes_mgmt_pins():
     api.routes.append(dict(WAN1_DHCP_DEFAULT_V6))
     mikrotik_lb.lb_rollback(api)
     assert not _managed_routes(api)
+
+
+# --- never strand the router without a route (router 671 outage, 2026-11-23) ---
+
+def test_v6_reconcile_leaves_routes_alone_when_wan1_has_no_lease():
+    api = FakeLBAPI(ros_version=V6)
+    assert mikrotik_lb.lb_apply(api, ["ether1", "ether2"])["success"] is True
+    before = [dict(r) for r in api.routes]
+    api.dhcp_clients[0]["status"] = "searching"   # WAN1 lease momentarily gone
+    api.commands = []
+    report = mikrotik_lb.lb_park_ports_v6(api, ["ether1", "ether2"], [])
+    assert report["success"] is False
+    assert not any(cmd in ("/ip/route/remove", "/ip/route/add") for cmd, _ in api.commands)
+    assert api.routes == before
+
+
+def test_v6_reconcile_adds_new_routes_before_removing_stale_ones():
+    api = FakeLBAPI(ros_version=V6)
+    assert mikrotik_lb.lb_apply(api, ["ether1", "ether2"])["success"] is True
+    for r in api.routes:   # every checked/probe route now points at an old gateway
+        if (r.get("comment") or "").endswith("_PROBE"):
+            r["gateway"] = "10.9.9.9"
+    api.commands = []
+    mikrotik_lb.lb_park_ports_v6(api, ["ether1", "ether2"], [])
+    ops = [cmd for cmd, _ in api.commands if cmd in ("/ip/route/add", "/ip/route/remove")]
+    assert "/ip/route/remove" in ops and "/ip/route/add" in ops
+    assert ops.index("/ip/route/remove") > max(i for i, c in enumerate(ops) if c == "/ip/route/add")

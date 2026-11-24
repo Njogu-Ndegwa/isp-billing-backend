@@ -706,15 +706,29 @@ def _v6_reconcile_routes(api, report: dict, wan_ports: List[str],
                          exclude: Optional[List[str]] = None) -> str:
     """Make the router's managed v6 routes match the plan for the current leases.
 
-    Wrong/stale managed routes are removed and re-added; matching ones are left
-    alone, so re-running (or converting another port) is cheap and idempotent.
+    Wrong/stale managed routes are replaced; matching ones are left alone, so
+    re-running (or converting another port) is cheap and idempotent.
+
+    Never leaves the router without a route: new routes are added BEFORE stale
+    ones are removed (the API session itself may ride a route being replaced),
+    and nothing is touched while WAN1 has no bound lease — that plan would drop
+    WAN1's checked default and the management pins, and on a router whose WAN1
+    DHCP adds no default route of its own that is no default at all (the
+    lb_rollback outage on router 671, 2026-11-23).
     """
     leases = _v6_wan_leases(api, wan_ports)
     for port in exclude or ():
         leases.pop(port, None)  # treated as dormant: no routes, tables fall back
+    if wan_ports and wan_ports[0] not in leases:
+        _step(report, "routes.reconcile", False,
+              f"WAN1 ({wan_ports[0]}) has no bound DHCP lease (or was excluded); "
+              "routes left unchanged so the router keeps its internet")
+        report["success"] = False
+        return "unchanged"
     mode, plan = _v6_route_plan(wan_ports, leases, _v6_mgmt_endpoints(api))
     wanted = dict(plan)
     existing = _rd(api, "/ip/route/print", [".id", "comment"] + list(_V6_ROUTE_COMPARE))
+    stale: List[dict] = []
     for r in existing:
         comment = r.get("comment") or ""
         if not _V6_MANAGED_ROUTE.fullmatch(comment):
@@ -723,11 +737,14 @@ def _v6_reconcile_routes(api, report: dict, wan_ports: List[str],
         if want is not None and all(str(want[k]) == str(r.get(k) or "") for k in want):
             wanted.pop(comment)  # already correct
             continue
-        _wr(api, report, f"route.remove.{comment}", "/ip/route/remove", {".id": r[".id"]})
+        stale.append(r)
     for comment, args in plan:
         if comment in wanted:
             _wr(api, report, f"route.add.{comment}", "/ip/route/add",
                 {**args, "comment": comment})
+    for r in stale:
+        comment = r.get("comment") or ""
+        _wr(api, report, f"route.remove.{comment}", "/ip/route/remove", {".id": r[".id"]})
     report["route_mode"] = mode
     if mode == "direct":
         report.setdefault("warnings", []).append(
