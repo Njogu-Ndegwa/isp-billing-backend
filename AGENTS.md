@@ -152,6 +152,31 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   must render through `with_gate`/`gate_rsc_body` and be added to
   `GATED_SCRIPTS`. Existing routers: `scripts/router_script_gate_rollout.py`.
 
+## Router Health Monitoring (every router, new ones too)
+
+Rule (Dennis, 2026-11-24): every router we add gets the same health monitoring as the
+existing fleet, automatically, with the same safety limits. That covers CPU/memory history,
+p95/p99/peak, the Router load ranking, and reboot and WAN-drop counts. Nobody has to remember
+it per router.
+
+- **Every way of creating a router must enrol it.** Today those are
+  `/api/provision/{token}/complete` and `POST /api/routers/create`, and both call
+  `schedule_install_after_provisioning`. A new creation path (import, bulk add, re-provision
+  onto a new row) must call it too, and must be added to
+  `tests/test_new_router_health_contract.py`.
+- **Monitoring must never be what overloads a router.** hAP lite / hAP mini (`smips`) never
+  get the push agent: the installer skips them, and you must not use `ALLOW_SMALL`. Whatever
+  feeds their graphs must be measured on canary routers first (`/tool profile`, CPU before and
+  after), be cheap and infrequent, back off when CPU is high or a call is slow, and have a kill
+  switch. The same goes for any board added to `SMALL_ARCHITECTURES` later.
+- **A new router with no readings is listed, never hidden.** It shows under "Online but no
+  health readings" on the Router load page (`ranking()["not_reporting"]`) until data arrives.
+  The panel says "never reported", not "fills in soon".
+- **Anything new the push sends stays in the rendered script for every router.** Graphs, p95/p99
+  and WAN drops must not depend on a hand-installed extra. WAN drops come from `ports[]`
+  (`wan_link_downs_from_ports`), so `ports[]` must stay in every report.
+- How it works and the rollout history: `docs/agent-memory/realtime-push-rollout.md`.
+
 ## Router Provisioning Gotchas
 
 - Provisioning import dies with `Script Error: expected end of command` at an
