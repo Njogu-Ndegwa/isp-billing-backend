@@ -94,3 +94,21 @@ async def test_cancelled_attempt_does_not_freeze_rotation(db, session_factory, m
     with pytest.raises(asyncio.CancelledError):
         await background.collect_bandwidth_snapshot()
     assert background._bandwidth_router_cursor == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["SUSPENDED", "INACTIVE"])
+async def test_cut_off_owners_routers_leave_the_rotation(db, session_factory, monkeypatch, status):
+    """Routers of a suspended/inactive reseller are never probed, so their
+    stale offline status no longer counts as "recently offline". They must not
+    take rotation slots from live poll-only routers (router 750, 2026-11-23)."""
+    from app.db.models import SubscriptionStatus
+
+    # Created first, so they sit at the front of the id-ordered rotation.
+    cut_off = await make_reseller(db, subscription_status=getattr(SubscriptionStatus, status))
+    dead = [await make_router(db, cut_off, last_status=False) for _ in range(4)]
+    live_ids, _clock, attempts = await prepare(db, session_factory, monkeypatch)
+    monkeypatch.setattr(background, "BANDWIDTH_RUN_TIME_BUDGET_SECONDS", 10_000)
+    await background.collect_bandwidth_snapshot()
+    assert attempts == live_ids
+    assert not set(attempts) & {r.id for r in dead}
