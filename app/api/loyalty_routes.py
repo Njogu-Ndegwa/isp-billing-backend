@@ -50,7 +50,9 @@ class LoyaltyRewardIn(BaseModel):
         description=(
             "Points the customer spends for this plan. With earn_mode per_kes the share "
             "given back is plan price / (points_cost x kes_per_point) x 100 %: for about "
-            "2% back on a 50 KES plan at 10 KES per point, points_cost = 250. With "
+            "2% back on a 50 KES plan at 10 KES per point, points_cost = 250; 5 points would be "
+            "100% back (free after KES 50 of spend). Read the numbers from GET "
+            "/api/loyalty/settings (reward_examples, value_percent), never work them out. With "
             "per_purchase, points_cost N means 'every Nth purchase free'."
         ),
     )
@@ -123,6 +125,39 @@ class LoyaltySettingsIn(BaseModel):
     )
 
 
+GENEROUS_PERCENT = 20  # a reward giving back more than this share of spend is worth a warning
+
+
+def _points_for_share(price, kes_per_point: int, percent: float) -> Optional[int]:
+    """Points a plan should cost so that it gives back ``percent`` of spend (per_kes)."""
+    if not price or not kes_per_point or percent <= 0:
+        return None
+    return max(1, round(float(price) * 100 / (percent * kes_per_point)))
+
+
+async def _reward_examples(db: AsyncSession, user_id: int, cfg: dict) -> list[dict]:
+    """For the cheapest hotspot plans: what each would give back at a few point costs.
+    Only for per_kes, where the share depends on the numbers."""
+    if cfg["earn_mode"] != "per_kes" or not cfg["kes_per_point"]:
+        return []
+    plans = (await db.execute(
+        select(Plan).where(Plan.user_id == user_id, Plan.connection_type == ConnectionType.HOTSPOT,
+                           Plan.price > 0)
+        .order_by(Plan.price, Plan.id).limit(5)
+    )).scalars().all()
+    out = []
+    for plan in plans:
+        costs = {pct: _points_for_share(plan.price, cfg["kes_per_point"], pct) for pct in (2, 5, 10)}
+        out.append({
+            "plan_id": plan.id, "plan_name": plan.name, "plan_price": plan.price,
+            "points_cost_for_2_percent_back": costs[2],
+            "points_cost_for_5_percent_back": costs[5],
+            "points_cost_for_10_percent_back": costs[10],
+            "spend_to_earn_it_at_5_percent": (costs[5] or 0) * cfg["kes_per_point"],
+        })
+    return out
+
+
 async def _settings_payload(db: AsyncSession, user_id: int, row: Optional[LoyaltySettings]) -> dict:
     cfg = loyalty.settings_values(row)
     plan_ids = {r["plan_id"] for r in cfg["rewards"]} | {int(k) for k in cfg["plan_points"]}
@@ -144,6 +179,8 @@ async def _settings_payload(db: AsyncSession, user_id: int, row: Optional[Loyalt
             "plan_price": plan.price if plan else None,
             "value_percent": loyalty.value_percent(plan.price if plan else None, reward["points_cost"], cfg),
         })
+        share = rewards[-1]["value_percent"]
+        rewards[-1]["generous"] = share is not None and share > GENEROUS_PERCENT
     return {
         "enabled": cfg["enabled"],
         "enabled_at": cfg["enabled_at"].isoformat() if cfg["enabled_at"] else None,
@@ -159,6 +196,9 @@ async def _settings_payload(db: AsyncSession, user_id: int, row: Optional[Loyalt
             for plan_id, points in cfg["plan_points"].items()
         ],
         "rewards": rewards,
+        # Worked numbers for picking a reward, so nobody does the sum in their head
+        # (24 Nov: the assistant said 10% back where it was 100%).
+        "reward_examples": await _reward_examples(db, user_id, cfg),
         "expiry_days": cfg["expiry_days"],
         "min_paid_amount": cfg["min_paid_amount"],
         "max_redemptions_per_day": cfg["max_redemptions_per_day"],
@@ -170,7 +210,12 @@ async def get_loyalty_settings(db: AsyncSession = Depends(get_db), token: str = 
     """Whether customers earn loyalty points, how, and which plans they can get for points.
 
     rewards[].value_percent is the share of spend given back (per_kes only):
-    plan price / (points_cost x kes_per_point) x 100. Off by default.
+    plan price / (points_cost x kes_per_point) x 100. Example: 1 point per KES 10 and a
+    KES 50 plan for 5 points is 50 / (5 x 10) x 100 = 100% back, the plan is free after
+    KES 50 of spend. Never work a share out yourself: quote value_percent, or
+    reward_examples (points costs for 2/5/10% back on the cheapest hotspot plans) when
+    no reward is set. Warn the person when a reward gives back more than 20%.
+    Off by default.
     """
     user = await _require_reseller(token, db)
     # Not persisted: a GET must not create settings rows.

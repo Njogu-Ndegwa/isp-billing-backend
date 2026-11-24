@@ -737,3 +737,34 @@ def test_staff_rules_for_loyalty():
         assert not rule.allows(["routers.view"])
     rule, _ = perms.match_rule("PUT", "/api/loyalty/settings")
     assert not rule.allows(["customers.view"])
+
+
+async def test_settings_give_worked_reward_numbers_and_flag_generous_rewards(db, reseller_api, monkeypatch):
+    """24 Nov live test: the assistant said a 5-point reward on a KES 50 plan at 1 point per KES 10
+    gave about 10% back; it is 100%. The settings now carry the worked numbers so nothing is
+    computed in the chat, and a reward giving back more than 20% is flagged."""
+    reseller = await make_reseller(db)
+    _auth_as(monkeypatch, reseller)
+    daily = await make_plan(db, reseller, price=50, name="Daily")
+    await make_plan(db, reseller, connection_type=ConnectionType.PPPOE, price=10, name="Home")
+
+    got = (await reseller_api.get("/api/loyalty/settings")).json()
+    examples = {e["plan_id"]: e for e in got["reward_examples"]}
+    assert list(examples) == [daily.id]  # hotspot plans only
+    assert examples[daily.id]["points_cost_for_2_percent_back"] == 250
+    assert examples[daily.id]["points_cost_for_5_percent_back"] == 100
+    assert examples[daily.id]["points_cost_for_10_percent_back"] == 50
+    assert examples[daily.id]["spend_to_earn_it_at_5_percent"] == 1000
+
+    put = (await reseller_api.put("/api/loyalty/settings", json={
+        "enabled": True, "rewards": [{"plan_id": daily.id, "points_cost": 5}],
+    })).json()
+    assert put["rewards"][0]["value_percent"] == 100.0
+    assert put["rewards"][0]["generous"] is True
+    fair = (await reseller_api.put("/api/loyalty/settings", json={
+        "rewards": [{"plan_id": daily.id, "points_cost": 250}],
+    })).json()
+    assert fair["rewards"][0]["generous"] is False
+
+    per_purchase = (await reseller_api.put("/api/loyalty/settings", json={"earn_mode": "per_purchase"})).json()
+    assert per_purchase["reward_examples"] == []
