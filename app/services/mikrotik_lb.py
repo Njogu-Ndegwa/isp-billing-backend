@@ -1388,15 +1388,24 @@ def _ensure_masquerade(api, report: dict, port: str, wan_index: int,
             if _wr(api, report, f"interface_list.add.{wl}.{port}",
                    "/interface/list/member/add", {"list": wl, "interface": port}):
                 added.append(("list", wl))
-    if not wan_lists:
-        nat = _rd(api, "/ip/firewall/nat/print", ["out-interface", "action", "dynamic"])
-        if not any(x.get("action") == "masquerade" and x.get("out-interface") == port
-                   for x in nat if x.get("dynamic") != "true"):
-            comment = f"{_wan_dhcp_comment(wan_index)}_MASQ"
-            if _wr(api, report, f"nat.add.masquerade.{port}", "/ip/firewall/nat/add",
-                   {"chain": "srcnat", "action": "masquerade", "out-interface": port,
-                    "comment": comment}):
-                added.append(("nat", comment))
+    # The list membership only helps if a masquerade actually uses one of those
+    # lists. Provisioning writes out-interface=ether1 rules on many routers, so
+    # "ether1 is in WAN" does not mean anything NATs the WAN list: check the
+    # rules, else balanced flows leave this port un-NATed and die.
+    nat = _rd(api, "/ip/firewall/nat/print",
+              ["out-interface", "out-interface-list", "action", "dynamic", "disabled", "chain"])
+    covered = any(
+        x.get("action") == "masquerade" and x.get("disabled") != "true"
+        and x.get("chain", "srcnat") == "srcnat"
+        and (x.get("out-interface") == port or x.get("out-interface-list") in wan_lists)
+        for x in nat if x.get("dynamic") != "true"
+    )
+    if not covered:
+        comment = f"{_wan_dhcp_comment(wan_index)}_MASQ"
+        if _wr(api, report, f"nat.add.masquerade.{port}", "/ip/firewall/nat/add",
+               {"chain": "srcnat", "action": "masquerade", "out-interface": port,
+                "comment": comment}):
+            added.append(("nat", comment))
     return added
 
 

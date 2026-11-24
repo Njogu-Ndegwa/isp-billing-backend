@@ -424,3 +424,24 @@ def test_v6_reconcile_adds_new_routes_before_removing_stale_ones():
     ops = [cmd for cmd, _ in api.commands if cmd in ("/ip/route/add", "/ip/route/remove")]
     assert "/ip/route/remove" in ops and "/ip/route/add" in ops
     assert ops.index("/ip/route/remove") > max(i for i, c in enumerate(ops) if c == "/ip/route/add")
+
+
+def _convert_with_nat(nat_rules):
+    api = _router537(nat_rules=nat_rules)
+    _on_dhcp_add(api, {"status": "bound", "gateway": "192.168.100.1",
+                       "address": "192.168.100.3/24"})
+    mikrotik_lb.lb_convert_port(api, "ether2", 1, wan1_port="ether1")
+    return [a for c, a in api.commands if c == "/ip/firewall/nat/add"]
+
+
+def test_second_line_gets_its_own_masquerade_when_nat_is_per_interface():
+    """Provisioning NATs out-interface=ether1; joining the WAN list alone would
+    leave every flow balanced onto ether2 un-NATed."""
+    added = _convert_with_nat([{"chain": "srcnat", "action": "masquerade",
+                                "out-interface": "ether1"}])
+    assert [a["out-interface"] for a in added] == ["ether2"]
+
+
+def test_no_extra_masquerade_when_the_wan_list_is_already_natted():
+    assert _convert_with_nat([{"chain": "srcnat", "action": "masquerade",
+                               "out-interface-list": "WAN"}]) == []
