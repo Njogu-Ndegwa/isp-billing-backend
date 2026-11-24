@@ -442,8 +442,6 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
      "Added a walled-garden IP"),
     (("DELETE",), "/api/mikrotik/walled-garden/ip/{entry_id}", "routers.manage",
      "Removed a walled-garden IP"),
-    (("POST",), "/api/mikrotik/wireguard/update-endpoint", "routers.manage",
-     "Updated a WireGuard endpoint"),
     ((R,), "/api/pppoe/{router_id}/secrets", "routers.manage", None),
     (("DELETE",), "/api/pppoe/{router_id}/users/{username}", "routers.manage",
      "Disconnected PPPoE user {username} on router {router_id}"),
