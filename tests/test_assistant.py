@@ -991,7 +991,7 @@ async def test_the_model_chooses_the_drawing_never_the_numbers(client, owner, db
 
     system = model.requests[0]["system"][0]["text"]
     assert "NEXT: question one | question two | question three" in system
-    assert "trend for figures per day" in system and "never repeat rows" in system
+    assert "figures per day / week / month a trend" in system and "never repeat rows" in system
 
 
 def test_rollout_buckets_are_fixed_per_account():
@@ -1572,6 +1572,22 @@ async def test_a_rule_on_a_query_parameter_says_to_send_it_as_one(client, owner,
     told = [res for req in model.requests for res in tool_results(req)]
     assert "'online' is a query parameter of this endpoint" in told[0]["error"]
     assert '{"online": true}' in told[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_route_of_ids_only_is_never_drawn(client, owner, db):
+    """"Who is online" read from /api/realtime/customers/online drew a table of bare ids
+    (10 times in a week): it is never drawn, and the model is told which route shows people."""
+    reseller, token = owner
+    model = use_model([
+        tool_reply("call_api", {"method": "GET", "path": "/api/realtime/customers/online", "show": "table"}, "tu_1"),
+        text_reply("Done."),
+    ])
+    events = sse_events((await client.post("/api/assistant/chat", json={"message": "who is online?"},
+                                           headers=auth(token))).text)
+    assert not [e for e in events if e["type"] == "data"]
+    told = [res for req in model.requests for res in tool_results(req)]
+    assert "/api/customers" in told[0]["display"] and '"online": true' in told[0]["display"]
 
 
 @pytest.mark.asyncio

@@ -47,6 +47,12 @@ FALLBACK_MODELS = frozenset({
 # optionally, which fields of the result to draw; every number on screen comes
 # from the result itself.
 SHOW_VALUES = ("auto", "table", "card", "none", "tiles", "trend", "bars", "share")
+# Routes whose answer is ids only: never drawn, whatever show says (the page draws nothing
+# a person can read from them). "Who is online" is GET /api/customers?online=true.
+NEVER_DRAWN = {
+    "GET /api/realtime/customers/online": "Not drawn: it holds ids only. To show who is online, read GET /api/customers with query {\"online\": true}.",
+    "GET /api/realtime/routers": "Not drawn: it holds router ids only.",
+}
 MAX_VALUE_FIELDS = 4
 MAX_FIELD_NAME = 60
 
@@ -300,7 +306,13 @@ Answering
 
 Showing results
 - Draw only what was asked for. When the question narrows a list (active customers, offline routers, failed payments, one router's customers), pass the action's own filter for it, and for anything it has no filter for, add where rules on the rows' fields (plan.name, amount, expiry, router.name...), with sort and limit for a top N. Never draw the whole list as the answer to a narrower question.
-- The page draws a read's result for the person when you choose how with "show": tiles for a few totals, table for a list, card for one record, trend for figures per day, week or month, bars for a top-N or a comparison between names, share for a split of one whole (by status, plan or payment method), none for a lookup only you need. Pick the drawing that answers the question, and prefer an action that already returns the grouping you need (per day, per plan, per router) over a long raw list.
+- The page draws a read's result when you set "show", and each route has its own drawing: a list is a table, one record a card, a period's totals tiles, figures per day / week / month a trend, a ranking (per plan, top users) bars. "show" is a hint the route may overrule, so the drawing is chosen by the route you read: pick the route that answers the question, and use show none for a lookup only you need. A chart route is drawn as a table only when the person asks for a table. Prefer a route that already returns the grouping you need over a long raw list:
+  - how much I made today / this week / this month (a total): GET /api/mpesa/transactions/summary with the dates (tiles);
+  - money per day or over a period: GET /api/dashboard/revenue-over-time with period day (trend);
+  - which plan sells or earns most: GET /api/plans/performance (bars); who uses the most data: GET /api/mikrotik/top-users (bars);
+  - payments, failed payments, customers, routers, plans: their list routes (table); one customer: GET /api/customers/{{id}} (card);
+  - a business overview: GET /api/dashboard/overview (tiles); one router's CPU and memory: GET /api/mikrotik/health with router_id (tiles); its uptime: GET /api/routers/{{id}}/uptime.
+  - GET /api/realtime/customers/online returns ids only and is never drawn.
 - For trend, bars and share you may add "fields" naming the fields of the result rows to draw (label and value). Leave it out when you are unsure of the names; the page then picks them itself.
 - The numbers on screen always come from the data, never from you. So say the answer in one or two sentences, the headline figure and what stands out, and never repeat rows, lists or tables in your text.
 - Every figure you state must come from a result in this conversation. If you do not have it, look it up or say you do not know.
@@ -1978,6 +1990,8 @@ class Turn:
             except listing.ListingError as exc:
                 return self._tool_result(tool_use_id, {"error": str(exc)}, True)
         note = None
+        if show != "none" and action.key in NEVER_DRAWN:
+            show, note = "none", NEVER_DRAWN[action.key]
         if action.key == PPPOE_LOGIN_ACTION and isinstance(data, dict):
             return await self._pppoe_login_card(tool_use_id, call_id, action, method, path, data, status=result.status)
         if show != "none":
