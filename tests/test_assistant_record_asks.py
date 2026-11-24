@@ -135,3 +135,104 @@ async def test_an_answer_written_with_the_recorded_ask_stays_on_screen(client, o
 def test_the_rule_says_answer_first_then_the_note():
     prompt = agent_mod.SYSTEM_TEMPLATE
     assert "never the whole reply" in prompt
+
+
+ANSWER_CLAIMING = ("No — Bitwave can't send WhatsApp messages yet; automatic customer messages go out by SMS. "
+                   "I've passed the WhatsApp request to Bitwave.\n\nNEXT: How many SMS credits do I have?")
+
+
+def _no_triage(monkeypatch):
+    import app.api.feedback_routes as fr
+
+    async def _none(_post_id):
+        return None
+    monkeypatch.setattr(fr, "run_feedback_triage", _none)
+
+
+@pytest.mark.parametrize("said", [
+    "I've passed the WhatsApp request to Bitwave.",
+    "Noted for Bitwave — another reseller asked for it too.",
+    "I recorded it as a feature request for Bitwave.",
+    "Nimeipeleka ombi lako kwa Bitwave.",
+])
+def test_a_passed_to_bitwave_claim_is_spotted(said):
+    assert agent_mod._CLAIMS_RECORDED.search(said)
+
+
+@pytest.mark.parametrize("said", [
+    "No — Bitwave sends SMS, not WhatsApp. Buy SMS credits to turn the reminders on.",
+    "Call Bitwave support on the number in Settings.",
+    "Your invoice from Bitwave is paid.",
+])
+def test_ordinary_answers_do_not_claim_it(said):
+    assert agent_mod._CLAIMS_RECORDED.search(said) is None
+
+
+@pytest.mark.asyncio
+async def test_claiming_it_was_passed_without_the_call_is_sent_back_once(client, owner, db, monkeypatch):  # noqa: F811
+    """CR-1124-T1 regression: the model answered well and said it passed the ask to Bitwave,
+    but never called POST /api/feedback/requests. The check sends it back; the call runs and
+    the person sees one answer."""
+    import json
+
+    from app.db.models import FeedbackPost
+    from tests.test_assistant import visible_text
+
+    _no_triage(monkeypatch)
+    reseller, token = owner
+    final = ("No — Bitwave can't send WhatsApp messages yet; automatic customer messages go out by SMS. "
+             "Passed to Bitwave.\n\nNEXT: How many SMS credits do I have?")
+    model = use_model([
+        text_reply(ANSWER_CLAIMING),
+        tool_reply("call_api", {"method": "POST", "path": "/api/feedback/requests",
+                                "body": {"title": "Automatic WhatsApp messages",
+                                         "asked": "Can we send automatic whatsapp messages?"}}),
+        text_reply(final),
+    ])
+    r = await client.post("/api/assistant/chat", json={"message": "Can we send automatic whatsapp messages?"},
+                          headers=auth(token))
+    events = sse_events(r.text)
+    nudge = json.dumps(model.requests[1]["messages"][-1])
+    assert "[Check]" in nudge and "/api/feedback/requests" in nudge
+    [post] = (await db.execute(select(FeedbackPost))).scalars().all()
+    assert post.source == "assistant"
+    shown = visible_text(events)
+    assert shown == final and shown.count("NEXT:") == 1
+    said = [t["text"] for t in await _transcript(client, token, events) if t["type"] == "assistant"]
+    assert said == [final]
+
+
+@pytest.mark.asyncio
+async def test_sent_back_and_nothing_follows_the_first_answer_stays(client, owner, monkeypatch):  # noqa: F811
+    from tests.test_assistant import visible_text
+
+    reseller, token = owner
+    model = use_model([text_reply(ANSWER_CLAIMING), text_reply("")])
+    r = await client.post("/api/assistant/chat", json={"message": "Can we send automatic whatsapp messages?"},
+                          headers=auth(token))
+    assert visible_text(sse_events(r.text)) == ANSWER_CLAIMING
+    assert len(model.requests) == 2      # sent back once, never again
+
+
+@pytest.mark.asyncio
+async def test_no_check_when_the_call_ran_or_nothing_is_claimed(client, owner, monkeypatch):  # noqa: F811
+    _no_triage(monkeypatch)
+    reseller, token = owner
+    model = use_model([
+        tool_reply("call_api", {"method": "POST", "path": "/api/feedback/requests",
+                                "body": {"title": "Automatic WhatsApp messages",
+                                         "asked": "Can we send automatic whatsapp messages?"}}),
+        text_reply(ANSWER_CLAIMING),
+    ])
+    await client.post("/api/assistant/chat", json={"message": "Can we send automatic whatsapp messages?"},
+                      headers=auth(token))
+    assert len(model.requests) == 2 and "[Check]" not in str(model.requests[-1]["messages"][-1])
+
+    model = use_model([text_reply("Yes — open Messaging, pick who gets it and write the SMS.")])
+    await client.post("/api/assistant/chat", json={"message": "Can I send an SMS to my customers?"},
+                      headers=auth(token))
+    assert len(model.requests) == 1
+
+
+def test_the_rule_says_the_call_comes_before_the_claim():
+    assert "only after the call came back ok" in agent_mod.SYSTEM_TEMPLATE
