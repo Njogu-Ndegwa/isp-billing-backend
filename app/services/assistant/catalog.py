@@ -632,14 +632,24 @@ def normal_mac(raw: str) -> str:
 _KEEP = object()
 
 
-def _cleared(schema: dict, key: str, prop: Any, f: dict) -> Any:
-    if f.get("required") or f["kind"] == "boolean" or f.get("default") or f.get("value") in (None, "", []):
-        return _KEEP  # nothing there to clear, or nothing to clear it with
+def _clear_with(schema: dict, key: str, prop: Any) -> Any:
+    """What the API says clears this field ("x-clear"), or _KEEP when it says nothing."""
     if isinstance(prop, dict) and "x-clear" in prop:
         return prop["x-clear"]
     spec = schema.get("x-clear")
     if isinstance(spec, dict) and (key in spec or "*" in spec):
         return spec.get(key, spec.get("*"))
+    return _KEEP
+
+
+def _cleared(schema: dict, key: str, prop: Any, f: dict, now: Any = None) -> Any:
+    # now: the record's value, as the card may have opened already emptied ("badge_text": "")
+    if f.get("required") or f["kind"] == "boolean" or f.get("default") or (
+            f.get("value") in (None, "", []) and now in (None, "", [])):
+        return _KEEP  # nothing there to clear, or nothing to clear it with
+    said = _clear_with(schema, key, prop)
+    if said is not _KEEP:
+        return said
     if isinstance(prop, dict) and prop.get("nullable"):
         return None
     return _KEEP
@@ -836,6 +846,8 @@ def form_fields(action: Action, body: Any, context: Optional[dict] = None,
                 f["multiline"] = True
         if kind == "datetime":
             f["zone"] = zone_label(tz)  # the person's own clock ("EAT")
+        if action.method in ("PUT", "PATCH") and key not in required and kind != "boolean"                 and _clear_with(schema, key, prop) is not _KEEP:
+            f["clears"] = True  # emptied on this edit, the API removes it (a plan's badge)
         if kind == "password":
             pass  # never sent back to the page, never pre-filled
         elif current.get(key) is not None:
@@ -925,7 +937,8 @@ def apply_form_values(action: Action, base: Any, values: dict,
             body.pop(key, None)
             continue
         if raw is None or (isinstance(raw, str) and not raw.strip()) or raw == []:
-            cleared = _cleared(schema, key, props.get(key), f) if editing else _KEEP
+            now = context.get(key) if isinstance(context, dict) else None
+            cleared = _cleared(schema, key, props.get(key), f, now) if editing else _KEEP
             if cleared is _KEEP:
                 body.pop(key, None)
             else:

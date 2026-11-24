@@ -272,9 +272,10 @@ class PlanUpdateRequest(BaseModel):
     router_profile: Optional[str] = None
     plan_type: Optional[str] = None
     is_hidden: Optional[bool] = Field(None, description='Hidden from the hotspot login page, so nobody new buys it; customers on it keep it.')
-    badge_text: Optional[str] = None
+    # "" removes the badge or end date (null keeps it): what an emptied assistant form field sends
+    badge_text: Optional[str] = Field(None, json_schema_extra={"x-clear": ""})
     original_price: Optional[int] = Field(None, description="The 'was' price shown crossed out next to the price (special offers).")
-    valid_until: Optional[str] = Field(None, json_schema_extra={"format": "date-time"}, description='After this moment the plan is off sale for good. For a time-limited offer, create a separate special_offer plan rather than putting an end date on a regular plan.')
+    valid_until: Optional[str] = Field(None, json_schema_extra={"format": "date-time", "x-clear": ""}, description='After this moment the plan is off sale for good. For a time-limited offer, create a separate special_offer plan rather than putting an end date on a regular plan.')
     data_cap_mb: Optional[int] = None
     fup_action: Optional[str] = None
     fup_throttle_profile: Optional[str] = None
