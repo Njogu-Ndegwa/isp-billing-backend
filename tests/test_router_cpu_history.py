@@ -86,25 +86,63 @@ async def test_a_bucket_written_twice_adds_up(db):
     assert sum(row.hist) == 2
 
 
-async def test_a_restart_does_not_count_routers_twice(db, monkeypatch):
-    # Old process: two routers, then the shutdown flush writes the open bucket.
-    ch.note(1, 40, RB951, "7.20.7", now=T0 + timedelta(minutes=1))
-    ch.note(2, 20, RB951, "7.20.7", now=T0 + timedelta(minutes=1))
-    await ch.flush(T0 + timedelta(minutes=2), include_open=True)
-    # New process starts inside the same bucket; the same routers push again.
+async def _push(router_id, cpu, at):
+    await rh.record(router_id, rh.HealthSample(cpu_load=cpu, board_name=RB951, routeros_version="7.20.7"),
+                    source="push", now=at)
+
+
+async def _rows(db):
+    return {r.bucket_start: r for r in (await db.execute(select(RouterCpuBucket))).scalars()}
+
+
+async def test_a_restart_counts_each_router_once_across_both_halves(db, monkeypatch):
+    owner = await make_reseller(db)
+    r1, r2, r3 = [(await make_router(db, owner)).id for _ in range(3)]
+    # Outgoing process: two routers in the first minute, then its shutdown flush.
+    await _push(r1, 40, T0 + timedelta(minutes=1))
+    await _push(r2, 20, T0 + timedelta(minutes=1))
+    await ch.flush(T0 + timedelta(minutes=1, seconds=10), include_open=True)
+    assert (await _rows(db))[T0].routers == 2
+    # New process starts in the same bucket (fresh memory): r1 again, r3 only now.
+    ch._open.clear()
     monkeypatch.setattr(ch, "_start_bucket", T0)
-    ch.note(1, 60, RB951, "7.20.7", now=T0 + timedelta(minutes=3))
-    ch.note(2, 30, RB951, "7.20.7", now=T0 + timedelta(minutes=3))
-    ch.note(1, 50, RB951, "7.20.7", now=T0 + timedelta(minutes=6))       # next bucket: normal
+    monkeypatch.setattr(ch, "_previous_rebuilt", False)
+    await _push(r1, 60, T0 + timedelta(minutes=3))
+    await _push(r3, 10, T0 + timedelta(minutes=4))
+    await _push(r1, 50, T0 + timedelta(minutes=6))                         # next bucket: normal
     await ch.flush(T0 + timedelta(minutes=11))
-    rows = {r.bucket_start: r for r in (await db.execute(select(RouterCpuBucket))).scalars()}
-    assert (rows[T0].routers, rows[T0].cpu_mean_sum) == (2, 60.0)          # was 4 routers
+    rows = await _rows(db)
+    # 24 Nov: adding halves gave 4 routers here; keeping the first half gave 2.
+    assert rows[T0].routers == 3
+    assert rows[T0].cpu_mean_sum == 50.0 + 20.0 + 10.0                     # r1 is (40+60)/2
+    assert rows[T0].samples == 4
     assert rows[T0 + timedelta(minutes=5)].routers == 1
 
 
-async def test_a_start_bucket_nobody_wrote_is_still_kept(db, monkeypatch):
-    # Crash or first boot: no shutdown flush, so the new process's half is all there is.
+async def test_the_bucket_before_a_restart_is_rebuilt_whole(db, monkeypatch):
+    owner = await make_reseller(db)
+    r1, r2 = [(await make_router(db, owner)).id for _ in range(2)]
+    prev = T0 - timedelta(minutes=5)
+    # The outgoing process wrote only r1 for the previous bucket; r2's later push
+    # reached the per-router history but not that process's tally.
+    db.add(RouterCpuBucket(bucket_start=prev, board_name=RB951, ros_major="7", routers=1, samples=1,
+                           cpu_mean_sum=30.0, cpu_peak=30, hist=[0, 0, 0, 1] + [0] * 6))
+    await db.commit()
+    await _push(r1, 30, prev + timedelta(minutes=1))
+    await _push(r2, 70, prev + timedelta(minutes=4))
+    ch._open.clear()
     monkeypatch.setattr(ch, "_start_bucket", T0)
+    monkeypatch.setattr(ch, "_previous_rebuilt", False)
+    await _push(r1, 35, T0 + timedelta(minutes=2))
+    await ch.flush(T0 + timedelta(minutes=6))
+    row = (await _rows(db))[prev]
+    assert (row.routers, row.cpu_mean_sum, row.cpu_peak) == (2, 100.0, 70)
+
+
+async def test_without_per_router_history_the_tally_is_used(db, monkeypatch):
+    # The per-router write failed (or a test fed the tally only): keep the tally.
+    monkeypatch.setattr(ch, "_start_bucket", T0)
+    monkeypatch.setattr(ch, "_previous_rebuilt", False)
     ch.note(1, 40, RB951, "7.20.7", now=T0 + timedelta(minutes=3))
     await ch.flush(T0 + timedelta(minutes=6))
     row = (await db.execute(select(RouterCpuBucket))).scalar_one()
