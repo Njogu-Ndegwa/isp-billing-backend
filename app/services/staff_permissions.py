@@ -543,6 +543,12 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     ((R,), "/api/portal/settings", "portal.manage", None),
     (("PUT",), "/api/portal/settings", "portal.manage", "Changed portal settings"),
     (("POST",), "/api/portal/settings/reset", "portal.manage", "Reset portal settings"),
+    ((R,), "/api/portal/router-themes", "portal.manage", None),
+    ((R,), "/api/portal/router-themes/{router_id}", "portal.manage", None),
+    (("PUT",), "/api/portal/router-themes/{router_id}", "portal.manage",
+     "Changed the portal theme of router {router_id}"),
+    (("DELETE",), "/api/portal/router-themes/{router_id}", "portal.manage",
+     "Reset router {router_id} to the default portal theme"),
 
     # --- hero ads -------------------------------------------------------------
     # A staff token acts as its reseller, and the handlers already scope every

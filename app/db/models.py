@@ -2410,6 +2410,43 @@ class PortalSettings(Base):
     user = relationship("User", backref="portal_settings")
 
 
+class PortalRouterTheme(Base):
+    """
+    Optional per-router override of the captive portal's look.
+
+    The account-wide row in `portal_settings` stays the default for every router.
+    A router with a row here shows its own theme instead; every other router keeps
+    the default. Only the look is overridable (colours, header layout, logo, photo,
+    welcome texts, footer); support contacts, ads, ratings, language and package
+    ordering stay account-wide.
+
+    Each theme column is nullable: NULL means "use the account default" for that
+    one field, so an override that only changes the colour still picks up a later
+    change to the account logo. Deleting the row resets the router to the default.
+    """
+    __tablename__ = "portal_router_themes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    router_id = Column(
+        Integer, ForeignKey("routers.id", ondelete="CASCADE"), unique=True, nullable=False
+    )
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    color_theme = Column(String(50), nullable=True)
+    header_style = Column(String(50), nullable=True)
+    show_welcome_banner = Column(Boolean, nullable=True)
+    welcome_title = Column(String(200), nullable=True)
+    welcome_subtitle = Column(String(500), nullable=True)
+    company_logo_url = Column(String(500), nullable=True)
+    header_bg_image_url = Column(String(500), nullable=True)
+    footer_text = Column(String(500), nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 # ========================================
 # C2B PAYBILL (Customer-to-Business)
 # ========================================

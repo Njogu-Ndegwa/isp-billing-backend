@@ -25,6 +25,7 @@ from app.db.models import (
     RouterLogEntry,
     RouterUsageBucket,
     UsageCapWatchState,
+    PortalRouterTheme,
     User,
     UserRole,
     Voucher,
@@ -2268,6 +2269,11 @@ async def delete_router(
         await db.execute(
             sql_delete(UsageCapWatchState)
             .where(UsageCapWatchState.router_id == router_id)
+        )
+        # The router's own captive portal theme, if it had one.
+        await db.execute(
+            sql_delete(PortalRouterTheme)
+            .where(PortalRouterTheme.router_id == router_id)
         )
         await db.execute(
             sql_delete(ProvisioningToken)

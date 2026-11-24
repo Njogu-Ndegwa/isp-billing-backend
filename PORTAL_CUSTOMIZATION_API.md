@@ -323,3 +323,52 @@ After saving, link to the live portal with their router's identity so they can p
 ```
 https://portal.yourdomain.com/?router=<identity>
 ```
+
+
+---
+
+## 8. Per-Router Themes
+
+The settings above are the **account default**: every router shows them. A router can
+also have **its own look**, and every other router keeps the default.
+
+Only the look can differ per router:
+
+`color_theme`, `header_style`, `show_welcome_banner`, `welcome_title`, `welcome_subtitle`,
+`company_logo_url`, `header_bg_image_url`, `footer_text`
+
+Ads, support contacts, ratings, language and package order stay account-wide.
+
+Each field in an override is optional. A field the router never set follows the account
+default, including later changes to the default. No override means the router's portal
+payload is exactly the account's, the same as before this feature.
+
+### List routers
+
+`GET /api/portal/router-themes` returns every router on the account with
+`has_override` and `overridden_fields`.
+
+### Read one router
+
+`GET /api/portal/router-themes/{router_id}` returns:
+
+- `settings`: what this router's portal shows (account settings with the router's own fields on top)
+- `account_settings`: the default
+- `has_override`, `overridden_fields`, `theme_fields`
+
+### Change one router
+
+`PUT /api/portal/router-themes/{router_id}` with any of the theme fields. Only the fields
+sent change. A field sent as `null` puts that field back on the default for this router.
+Any other portal setting in the body is rejected with a 422. Once no field is left, the
+override is removed.
+
+### Reset one router
+
+`DELETE /api/portal/router-themes/{router_id}` puts the router back on the default.
+
+### Captive portal
+
+Both `GET /api/public/portal/{identity}` (`portal_settings`) and
+`GET /api/public/portal/settings/{router_id}` apply the router's own theme first, then
+fall back to the account default.

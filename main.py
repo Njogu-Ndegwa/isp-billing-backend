@@ -2107,6 +2107,13 @@ async def run_portal_settings_migrations():
             EXCEPTION WHEN duplicate_column THEN NULL;
             END $$
         """))
+    # Per-router theme overrides (one optional row per router). New table, so
+    # existing accounts are untouched: no row means the account default, as before.
+    async with async_engine.begin() as conn:
+        from app.db.models import PortalRouterTheme
+        await conn.run_sync(
+            lambda c: PortalRouterTheme.__table__.create(c, checkfirst=True)
+        )
     logger.info("Portal settings table ready")
 
 
