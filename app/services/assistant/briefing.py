@@ -16,7 +16,9 @@ payments add to revenue (a comp voucher is a payment, not revenue).
 from __future__ import annotations
 
 import logging
+import re
 import time
+from collections import Counter
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
@@ -41,6 +43,7 @@ LIST_LIMIT = 5
 EXPIRING_LIST_DAYS = 7     # the "next to expire" list looks this far ahead
 NETWORK_LIMIT = 12         # routers drawn one by one on the home screen (trouble first)
 LIVE_MAX_AGE_SECONDS = 600  # a router's own report older than this is not "live"
+WIRED_PORT = re.compile(r"^(ether|sfp|combo|qsfp)", re.IGNORECASE)  # the sockets on the router's front
 
 # section -> the dashboard route(s) whose access decides it (any one is enough)
 GATES: dict[str, tuple[tuple[str, str], ...]] = {
@@ -159,24 +162,29 @@ async def _routers(db, user_id: int, now: datetime) -> dict:
 
     rows = (await db.execute(
         select(Router.id, Router.name, Router.identity, Router.last_status, Router.last_checked_at,
-               Router.last_online_at, Router.availability_checks, Router.availability_successes)
+               Router.last_online_at, Router.availability_checks, Router.availability_successes,
+               Router.pppoe_ports, Router.dual_ports, Router.plain_ports, Router.lb_enabled, Router.lb_config)
         .where(Router.user_id == user_id).order_by(Router.id).limit(1000)
     )).all()
     counts = {"online": 0, "offline": 0, "unknown": 0}
     down = []
     network = []
-    for rid, name, identity, last_status, last_checked_at, last_online_at, checks, successes in rows:
+    for (rid, name, identity, last_status, last_checked_at, last_online_at, checks, successes,
+         pppoe_ports, dual_ports, plain_ports, lb_enabled, lb_config) in rows:
         status = derive_router_status(
             SimpleNamespace(last_status=last_status, last_checked_at=last_checked_at), now=now)
         counts[status] = counts.get(status, 0) + 1
         if status == "offline":
             down.append((last_online_at or datetime.min, rid, name, last_online_at))
+        setup = port_setup(pppoe_ports, dual_ports, plain_ports, lb_enabled, lb_config)
         network.append({
             "id": rid, "name": name, "identity": identity, "status": status,
             "last_online_at": _iso(last_online_at),
             "reachable_pct": round(successes * 100 / checks, 1) if checks else None,
             "active_customers": None,   # filled in when the caller may see customers
             "live": _live(rid, now),
+            "port_setup": setup,
+            "ports": _ports(rid, now, setup) if status != "offline" else None,
         })
     down.sort(key=lambda item: item[0], reverse=True)  # the most recent outage first
     network.sort(key=lambda r: (r["status"] != "offline", r["live"] is None, r["id"]))  # trouble first
@@ -218,6 +226,82 @@ def _live(router_id: int, now: datetime) -> Optional[dict]:
         }
     except Exception:
         logger.exception("[assistant] live report read failed for router %s", router_id)
+        return None
+
+
+def _names(value: Any) -> list:
+    return sorted({str(p) for p in value if p}) if isinstance(value, (list, tuple)) else []
+
+
+def port_setup(pppoe_ports: Any, dual_ports: Any, plain_ports: Any, lb_enabled: Any, lb_config: Any) -> dict:
+    """What each port was set up for in Bitwave, from the router's saved settings.
+
+    internet: the WAN ports (the load-balanced ones when load balancing is on, else
+    ether1, the convention every other port setting refuses to touch); pppoe, both
+    (hotspot and PPPoE on one port) and free (internet with no login) are the ports
+    moved off the hotspot. Every other port in the LAN bridge is hotspot.
+    """
+    wan = _names((lb_config or {}).get("wan_ports")) if lb_enabled and isinstance(lb_config, dict) else []
+    return {
+        "internet": wan or ["ether1"],
+        "pppoe": _names(pppoe_ports),
+        "both": _names(dual_ports),
+        "free": _names(plain_ports),
+    }
+
+
+def port_role(name: str, setup: dict, bridge_of: Optional[dict]) -> str:
+    """internet | both | pppoe | free | hotspot | unused, for one port.
+
+    ``bridge_of`` maps a port to its bridge (None when the router did not say): a
+    port in no bridge and set up for nothing carries no customers ("unused").
+    """
+    bridged = None if bridge_of is None else bool(bridge_of.get(name))
+    if name in setup["internet"] and not bridged:
+        return "internet"
+    for role in ("both", "pppoe", "free"):
+        if name in setup[role]:
+            return role
+    return "unused" if bridged is False else "hotspot"
+
+
+def _ports(router_id: int, now: datetime, setup: dict) -> Optional[list]:
+    """Each socket on the router: what it is set up for, whether it has a link, how
+    many devices sit behind it. From the router's own report, as ``_live``: nothing
+    here contacts the router. None when it does not report ports or the report is old.
+
+    ``lost_link``: no link now, but it had one since the router started, so something
+    that was plugged in and working (an access point, a switch, the internet line)
+    went dark. A socket that never had a link is just empty.
+    """
+    try:
+        from app.services import realtime_state
+
+        state = realtime_state.get_router_live(router_id)
+        if state is None or not state.ports or (now - state.received_at).total_seconds() > LIVE_MAX_AGE_SECONDS:
+            return None
+        bridge_of = ({bp.get("interface"): bp.get("bridge") for bp in state.bridge_ports}
+                     if state.bridge_ports is not None else None)
+        devices = Counter(state.bridge_hosts.values()) if state.bridge_hosts is not None else None
+        out = []
+        for p in state.ports:
+            name = str(p.get("name") or "")
+            if not WIRED_PORT.match(name):
+                continue
+            role = port_role(name, setup, bridge_of)
+            disabled = bool(p.get("disabled"))
+            up = bool(p.get("running")) and not disabled
+            out.append({
+                "name": name, "role": role, "up": up, "disabled": disabled,
+                "lost_link": not up and not disabled and role != "unused" and bool(p.get("last_link_up")),
+                "link_downs": int(p.get("link_downs") or 0),
+                "devices": devices.get(name, 0) if devices is not None and role != "internet" else None,
+            })
+        # in the order printed on the router: ether2 before ether10
+        out.sort(key=lambda x: [int(s) if s.isdigit() else s for s in re.split(r"(\d+)", x["name"].lower())])
+        return out or None
+    except Exception:
+        logger.exception("[assistant] port report read failed for router %s", router_id)
         return None
 
 
