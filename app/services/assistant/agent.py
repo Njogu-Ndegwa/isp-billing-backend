@@ -47,6 +47,12 @@ FALLBACK_MODELS = frozenset({
 # optionally, which fields of the result to draw; every number on screen comes
 # from the result itself.
 SHOW_VALUES = ("auto", "table", "card", "none", "tiles", "trend", "bars", "share")
+# Routes whose answer is ids only: never drawn, whatever show says (the page draws nothing
+# a person can read from them). "Who is online" is GET /api/customers?online=true.
+NEVER_DRAWN = {
+    "GET /api/realtime/customers/online": "Not drawn: it holds ids only. To show who is online, read GET /api/customers with query {\"online\": true}.",
+    "GET /api/realtime/routers": "Not drawn: it holds router ids only.",
+}
 MAX_VALUE_FIELDS = 4
 MAX_FIELD_NAME = 60
 
@@ -287,6 +293,7 @@ Answering
 - Say the answer once, after your last lookup. Words you write next to a tool call are not shown, so do not narrate ("I'll look that up"): the page already shows that you are checking.
 - Never mention database ids ("id 1", "#34") unless the person asked for one; use names.
 - Who is offline, how many are offline, since when someone is offline, who went offline today, why someone is offline: read GET /api/routers/{{id}}/offline-customers for each of the person's routers (all of them when they did not name one). It checks the router live and gives each paid customer who is not connected now, since when (offline_since; when it is null, say the time is not known and why, from since_note; never make one up) and the router's reason. When since_source is last_traffic, say "no data used since" that time, not that they went offline then. "Offline" never means "expired": an expired customer is not offline, and expiry dates never answer an offline question. If the router does not answer, say that the router itself is unreachable (and since when it was last online), not that nobody is offline.
+- Who is online, who is connected right now, how many are on: GET /api/customers with query {{"online": true}} (add router_id for one router), drawn as a table. Its rows are customers (name, plan, router, paid time) and the page adds their live speed. It covers routers on live reporting; for each router it lists in not_live_routers, also read GET /api/hotspot/{{id}}/users and GET /api/pppoe/{{id}}/users of that router (the customer names are in them), and say which routers are not live. Never answer it with GET /api/routers/{{id}}/users: that is the router's raw hotspot account list (MACs, profiles), not customers.
 - Is one static-IP customer offline: GET /api/customers/{{id}}/static/status and answer from device_online (their device answering the router now, from its ARP entry and traffic) with device_note for why; access enabled or in_sync only means the router would let them through, never that they are online.
 - When a router went down: the router's last successful contact, down_since (in the uptime outages and down_now, and on an offline router in the routers list; last_online_at is the same moment). checks_failing_since / started_at / status_last_checked_at is only when Bitwave's checks began failing, later; give it, if at all, as a second detail ("our checks failed from 08:53").
 - A new question about who is offline or when something went down, later in the same chat, is read again from live data, never answered from an earlier answer or from expiries. If the new figure differs from one you gave before, say what changed ("9 were offline at 14:45; now 4 are, 5 reconnected"); never contradict an earlier figure without saying so.
@@ -299,7 +306,13 @@ Answering
 
 Showing results
 - Draw only what was asked for. When the question narrows a list (active customers, offline routers, failed payments, one router's customers), pass the action's own filter for it, and for anything it has no filter for, add where rules on the rows' fields (plan.name, amount, expiry, router.name...), with sort and limit for a top N. Never draw the whole list as the answer to a narrower question.
-- The page draws a read's result for the person when you choose how with "show": tiles for a few totals, table for a list, card for one record, trend for figures per day, week or month, bars for a top-N or a comparison between names, share for a split of one whole (by status, plan or payment method), none for a lookup only you need. Pick the drawing that answers the question, and prefer an action that already returns the grouping you need (per day, per plan, per router) over a long raw list.
+- The page draws a read's result when you set "show", and each route has its own drawing: a list is a table, one record a card, a period's totals tiles, figures per day / week / month a trend, a ranking (per plan, top users) bars. "show" is a hint the route may overrule, so the drawing is chosen by the route you read: pick the route that answers the question, and use show none for a lookup only you need. A chart route is drawn as a table only when the person asks for a table. Prefer a route that already returns the grouping you need over a long raw list:
+  - how much I made today / this week / this month (a total): GET /api/mpesa/transactions/summary with the dates (tiles);
+  - money per day or over a period: GET /api/dashboard/revenue-over-time with period day (trend);
+  - which plan sells or earns most: GET /api/plans/performance (bars); who uses the most data: GET /api/mikrotik/top-users (bars);
+  - payments, failed payments, customers, routers, plans: their list routes (table); one customer: GET /api/customers/{{id}} (card);
+  - a business overview: GET /api/dashboard/overview (tiles); one router's CPU and memory: GET /api/mikrotik/health with router_id (tiles); its uptime: GET /api/routers/{{id}}/uptime.
+  - GET /api/realtime/customers/online returns ids only and is never drawn.
 - For trend, bars and share you may add "fields" naming the fields of the result rows to draw (label and value). Leave it out when you are unsure of the names; the page then picks them itself.
 - The numbers on screen always come from the data, never from you. So say the answer in one or two sentences, the headline figure and what stands out, and never repeat rows, lists or tables in your text.
 - Every figure you state must come from a result in this conversation. If you do not have it, look it up or say you do not know.
@@ -1763,9 +1776,20 @@ class Turn:
                          + (f" (needs the '{need}' permission)" if need and self.caller.staff_id else "")
                          + (" (View-as is read-only)" if self.caller.read_only else "") + ".",
             }, True)
+        # A path value sent in query ({"router_id": 487} beside "/api/routers/{router_id}/users",
+        # OPIC 2026-11-24) belongs in the path: move it there rather than fail the call.
+        if isinstance(query, dict):
+            for name, value in list(params.items()):
+                given = query.get(name)
+                if (not value or "{" in str(value)) and given not in (None, ""):
+                    params[name] = str(given)
+                    query = {k: v for k, v in query.items() if k != name}
         path = build_path(action, params)
         if path is None:
-            return self._tool_result(tool_use_id, {"error": "A path value is missing or not valid."}, True)
+            example = re.sub(r"\{(\w+)\}", lambda m: f"<{m.group(1)}>", action.template)
+            return self._tool_result(tool_use_id, {
+                "error": f"A path value is missing or not valid. Put each value in the path itself, "
+                         f"e.g. {action.method} {example} with the real value in place of <...>, not in query."}, True)
         secrets = shaping.secret_fields(query) + shaping.secret_fields(body)
         if secrets:
             return self._tool_result(tool_use_id, {
@@ -1959,12 +1983,15 @@ class Turn:
             try:
                 # off the event loop: thousands of rows take a moment, and other requests must not wait
                 data, narrowed_note = await asyncio.to_thread(
-                    listing.narrow, data, **narrowing, tz_name=await self._zone())
+                    listing.narrow, data, **narrowing, tz_name=await self._zone(),
+                    params=[p["name"] for p in action.query_params])
                 if partial and narrowed_note is not None:
                     narrowed_note["warning"] = partial
             except listing.ListingError as exc:
                 return self._tool_result(tool_use_id, {"error": str(exc)}, True)
         note = None
+        if show != "none" and action.key in NEVER_DRAWN:
+            show, note = "none", NEVER_DRAWN[action.key]
         if action.key == PPPOE_LOGIN_ACTION and isinstance(data, dict):
             return await self._pppoe_login_card(tool_use_id, call_id, action, method, path, data, status=result.status)
         if show != "none":

@@ -138,5 +138,39 @@ async def test_the_customer_list_keeps_only_who_is_online(db, monkeypatch):
     monkeypatch.setattr(customer_routes, "get_current_user", _current_user)
     online = await customer_routes.get_customers_api(router_id=None, tier=None, online=True, db=db, token="t")
     offline = await customer_routes.get_customers_api(router_id=None, tier=None, online=False, db=db, token="t")
-    assert [c["name"] for c in online] == ["Calvins"]
-    assert [c["name"] for c in offline] == ["Idle"]
+    assert [c["name"] for c in online["data"]] == ["Calvins"]
+    assert [c["name"] for c in offline["data"]] == ["Idle"]
+    assert online["total"] == 1 and online["live_router_ids"] == [router.id]
+    assert online["not_live_routers"] == [] and "coverage_note" not in online
+
+
+@pytest.mark.asyncio
+async def test_who_is_online_names_the_routers_it_cannot_see(db, monkeypatch):
+    """A router that is not on live reporting is named in the answer (with where to read it),
+    so "who is online" never reads as "nobody is online" there."""
+    from app.api import customer_routes
+
+    reseller = await make_reseller(db)
+    live_router = await make_router(db, reseller)
+    dark_router = await make_router(db, reseller)
+    plan = await make_plan(db, reseller, connection_type=ConnectionType.HOTSPOT)
+    expiry = datetime.utcnow() + timedelta(days=2)
+    on = await make_customer(db, reseller, plan, live_router, name="Calvins", mac_address="AA:00:00:00:00:31",
+                             status=CustomerStatus.ACTIVE, expiry=expiry)
+    await make_customer(db, reseller, plan, dark_router, name="Unseen", mac_address="AA:00:00:00:00:32",
+                        status=CustomerStatus.ACTIVE, expiry=expiry)
+    _push(live_router.id, hosts=[HostSample(mac="AA:00:00:00:00:31", ip="10.5.50.31", bytes_in=1, bytes_out=1)],
+          live_customers={"AA:00:00:00:00:31": on.id})
+
+    async def _current_user(_token, _db):
+        return reseller
+
+    monkeypatch.setattr(customer_routes, "get_current_user", _current_user)
+    out = await customer_routes.get_customers_api(router_id=None, tier=None, online=True, db=db, token="t")
+    assert [c["name"] for c in out["data"]] == ["Calvins"]
+    assert out["live_router_ids"] == [live_router.id]
+    assert [r["id"] for r in out["not_live_routers"]] == [dark_router.id]
+    assert f"#{dark_router.id}" in out["coverage_note"] and "/api/hotspot/{id}/users" in out["coverage_note"]
+
+    one = await customer_routes.get_customers_api(router_id=live_router.id, tier=None, online=True, db=db, token="t")
+    assert one["not_live_routers"] == []

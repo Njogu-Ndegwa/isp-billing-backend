@@ -205,7 +205,10 @@ async def ask(client, token, question: str, monkeypatch, conversation_id: Option
     conv = next((e.get("id") for e in events if e["type"] == "conversation"), None) or         next((e.get("conversation_id") for e in events if e["type"] == "done"), None)
     said = re.sub(r"\s+", " ", visible_text(events)).strip()
     said = re.split(r"\s*\[?NEXT:", said)[0].strip()  # the suggested follow-ups are not the answer
-    return {"question": question, "said": said,
+    # what was drawn: the route read and the drawing asked for (the page's route rules decide the rest)
+    drawn = [{"method": e.get("method"), "path": e.get("path"), "query": e.get("query"), "show": e.get("show")}
+             for e in events if e["type"] == "data"]
+    return {"question": question, "said": said, "drawn": drawn,
             "cards": cards, "tools": tools, "errors": errors, "conversation_id": conv}
 
 

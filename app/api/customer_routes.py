@@ -1574,6 +1574,25 @@ async def _online_condition(db: AsyncSession, user, online: bool):
     return Customer.id.in_(ids)
 
 
+async def _online_coverage(db: AsyncSession, user, router_id: Optional[int]) -> dict:
+    """Which of the caller's routers the online filter covers (live reporting) and which it cannot."""
+    from app.api.usage_routes import _live_router_ids_for
+
+    live = set(await _live_router_ids_for(db, user))
+    stmt = select(Router.id, Router.name).where(Router.user_id == user.id).order_by(Router.id)
+    if router_id is not None:
+        stmt = stmt.where(Router.id == router_id)
+    mine = (await db.execute(stmt)).all()
+    not_live = [{"id": rid, "name": name} for rid, name in mine if rid not in live]
+    out: dict = {"live_router_ids": sorted(rid for rid, _ in mine if rid in live), "not_live_routers": not_live}
+    if not_live:
+        out["coverage_note"] = (
+            "Who is online is known only on routers on live reporting. Not covered here: "
+            + ", ".join(f"{r['name']} (#{r['id']})" for r in not_live[:10])
+            + ". For those, read GET /api/hotspot/{id}/users and GET /api/pppoe/{id}/users.")
+    return out
+
+
 def _list_filters(status, connection_type, overdue, search, now) -> list:
     """The narrowing the Customers list can do on the server, so a question like
     "my active customers" gets only those (an unknown filter used to be ignored
@@ -1753,6 +1772,11 @@ async def get_customers_api(
             for c, c_has_paid in rows
         ]
         out = _page_envelope(items, page, per_page, total) if paged else items
+        if online is not None:
+            # say which routers the online filter could and could not see, so "who is online"
+            # never reads as "nobody" on a router that is not on live reporting
+            out = {**(out if paged else {"data": items, "total": len(items)}),
+                   **await _online_coverage(db, user, router_id)}
         if (search or "").strip() and not items and not total:
             # nothing contains it: offer close matches (one wrong letter or digit) beside the
             # empty result, among the same customers the other filters allow

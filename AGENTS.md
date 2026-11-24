@@ -435,6 +435,12 @@ it per router.
   anything malformed). Both ride on the `data` event; every number on screen comes
   from the API result. A finished answer ends with a `NEXT: a | b | c` line that the
   page turns into follow-up buttons (it is part of the stored text).
+- The drawing is the route's, not the model's: the admin frontend's `app/lib/assistantTables.ts`
+  holds `DISPLAY_RULES` (route -> table / card / tiles / trend / bars, `show` only a hint where a
+  rule allows it) and `TABLE_SPECS` (each list's columns). The intents resellers ask, with the
+  route and display each must get, are in its `app/lib/assistantIntents.json`, read by the
+  frontend tests and by `tests/workflow_eval/test_display_intents.py`. Id-only routes are never
+  drawn (`agent.NEVER_DRAWN`).
 - Home screen figures: `GET /api/assistant/briefing` (`briefing.py`). One short session
   of COUNT/SUM queries, kept 60 s per person, never 500s. Each section is gated by the
   dashboard route that shows the same thing (`briefing.GATES`), so staff permissions and
