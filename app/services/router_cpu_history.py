@@ -15,11 +15,15 @@ so a router pushing every minute weighs the same as one pushing every two.
 Costs nothing on the routers (it reuses samples they already send) and nothing
 on the hot ``routers`` row. Writes are additive.
 
-Restarts: the outgoing process writes its open bucket at shutdown, so the
-bucket a new process starts in is usually already in the table. Adding the new
-process's half to it counted most routers twice (24 Nov 2026: 210 routers in
-a bucket that had 105). So the new process writes its start bucket only when
-no row exists yet; otherwise it keeps the outgoing process's half.
+Restarts: a restart splits a bucket between two processes, and neither one's
+in-memory tally holds the whole bucket. Adding both halves counted most
+routers twice (24 Nov 2026: 210 routers in a bucket that had 105); keeping
+only the first half dropped most of them when the restart came early (94 of
+106 after the 08:21 deploy, averages off by up to 14 points). The per-router
+history (``router_metric_buckets``, router_metric_history.py) is written to
+the database with every sample, so it holds those buckets whole. The bucket a
+process starts in, and the one before it, are therefore rebuilt from it
+instead of from the tally.
 """
 
 from __future__ import annotations
@@ -34,7 +38,7 @@ from typing import Dict, List, Optional, Tuple
 from sqlalchemy import delete, select
 
 from app.db import database
-from app.db.models import AppDeploy, AppInstanceHeartbeat, RouterCpuBucket, RouterHealth
+from app.db.models import AppDeploy, AppInstanceHeartbeat, RouterCpuBucket, RouterHealth, RouterMetricBucket
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +82,7 @@ def bucket_start(ts: datetime) -> datetime:
 
 # The bucket this process started in; see "Restarts" above.
 _start_bucket: datetime = bucket_start(datetime.utcnow())
+_previous_rebuilt = False
 
 
 def ros_major(version: Optional[str]) -> str:
@@ -141,7 +146,7 @@ def _summarise(per_router: Dict[int, _RouterTally]) -> dict:
 async def flush(now: Optional[datetime] = None, *, include_open: bool = False) -> int:
     """Write every closed bucket (or every bucket, with ``include_open``) in one
     short session. Returns rows written. Never raises."""
-    global _flush_lock, _last_prune
+    global _flush_lock, _last_prune, _previous_rebuilt
     now = now or datetime.utcnow()
     if _flush_lock is None:
         _flush_lock = asyncio.Lock()
@@ -154,14 +159,24 @@ async def flush(now: Optional[datetime] = None, *, include_open: bool = False) -
         written = 0
         try:
             async with database.async_session() as db:
+                restart_buckets = {_start_bucket - timedelta(seconds=BUCKET_SECONDS), _start_bucket}
+                if not _previous_rebuilt and _start_bucket in taken and not include_open:
+                    # First close of the start bucket: the one before it was cut by the
+                    # restart too, and is complete in the per-router history by now.
+                    written += await _rebuild_from_per_router(db, _start_bucket - timedelta(seconds=BUCKET_SECONDS))
+                    _previous_rebuilt = True
                 for start, bucket in taken.items():
+                    if start in restart_buckets:
+                        rebuilt = await _rebuild_from_per_router(db, start)
+                        if rebuilt:
+                            written += rebuilt
+                            continue
+                        # No per-router history (its write failed): fall back to the tally.
                     for (board, major), per_router in bucket.routers.items():
                         s = _summarise(per_router)
                         if not s["routers"]:
                             continue
                         row = await db.get(RouterCpuBucket, (start, board, major))
-                        if row is not None and start == _start_bucket:
-                            continue    # the outgoing process already wrote this bucket
                         if row is None:
                             db.add(RouterCpuBucket(bucket_start=start, board_name=board, ros_major=major, **s))
                         else:
@@ -181,6 +196,40 @@ async def flush(now: Optional[datetime] = None, *, include_open: bool = False) -
             logger.exception("router_cpu_history: could not write %d bucket(s)", len(taken))
             return 0
         return written
+
+
+async def _rebuild_from_per_router(db, start: datetime) -> int:
+    """Replace one bucket's rows with a fold of ``router_metric_buckets`` (each
+    router's sample count, sum and peak for that 5-minute bucket), filed under
+    the model each router reports now. Returns rows written; 0 when there is no
+    per-router history for it, in which case nothing is changed."""
+    try:
+        async with db.begin_nested():
+            rows = (await db.execute(
+                select(RouterMetricBucket.router_id, RouterMetricBucket.cpu_samples,
+                       RouterMetricBucket.cpu_sum, RouterMetricBucket.cpu_max,
+                       RouterHealth.board_name, RouterHealth.routeros_version)
+                .join(RouterHealth, RouterHealth.router_id == RouterMetricBucket.router_id, isouter=True)
+                .where(RouterMetricBucket.step_seconds == BUCKET_SECONDS,
+                       RouterMetricBucket.bucket_start == start,
+                       RouterMetricBucket.cpu_samples > 0))).all()
+            if not rows:
+                return 0
+            per_key: Dict[Key, Dict[int, _RouterTally]] = {}
+            for rid, n, total, peak, board, version in rows:
+                per_key.setdefault(model_key(board, version), {})[int(rid)] = _RouterTally(
+                    n=int(n), total=int(total), peak=int(peak if peak is not None else total / n))
+            await db.execute(delete(RouterCpuBucket).where(RouterCpuBucket.bucket_start == start))
+            written = 0
+            for (board, major), per_router in per_key.items():
+                s = _summarise(per_router)
+                if s["routers"]:
+                    db.add(RouterCpuBucket(bucket_start=start, board_name=board, ros_major=major, **s))
+                    written += 1
+            return written
+    except Exception:  # noqa: BLE001 - the tally is the fallback
+        logger.exception("router_cpu_history: could not rebuild bucket %s from per-router history", start)
+        return 0
 
 
 def _spawn(coro) -> None:
