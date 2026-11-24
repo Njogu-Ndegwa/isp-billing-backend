@@ -4578,6 +4578,29 @@ def resolve_port_set(ports: Optional[List[str]], add: Optional[List[str]], remov
     return [p for p in dict.fromkeys(base) if p not in gone]
 
 
+def _refuse_live_uplinks(api, router_info: dict, ports: List[str]) -> Optional[dict]:
+    """Read the router and refuse to turn a port that carries its internet into an
+    access port. refuse_wan_ports only knows ether1 and the LB ports while LB is on;
+    a second WAN left over after LB was disabled, or an uplink on another port,
+    would be bridged into the customer LAN (its DHCP client stops, the modem's DHCP
+    server lands on the customers)."""
+    if not ports:
+        return None
+    from app.services.port_restart import RouterStateError, live_uplink_ports
+    try:
+        wan = live_uplink_ports(api, router_info["ip"])
+    except RouterStateError as exc:
+        return {"error": f"Could not check which ports carry the internet, nothing changed: {exc}"}
+    bad = {p: wan[p] for p in ports if p in wan}
+    if not bad:
+        return None
+    return {
+        "error": "Refused, nothing changed. These ports carry the router's internet: "
+                 + "; ".join(f"{p}: {why}" for p, why in bad.items()),
+        "failed_ports": sorted(bad),
+    }
+
+
 def refuse_wan_ports(router_obj, ports: List[str], mode: str) -> None:
     """ether1 and the load-balancing WAN ports carry the internet in: never an access port."""
     lb = router_obj.lb_config if isinstance(getattr(router_obj, "lb_config", None), dict) else {}
@@ -4621,6 +4644,10 @@ def _apply_pppoe_ports_sync(
         return {"error": "connect_failed"}
     try:
         target_ports = list(dict.fromkeys(new_ports or []))
+        refused = _refuse_live_uplinks(
+            api, router_info, [p for p in target_ports if p not in (old_ports or [])])
+        if refused:
+            return refused
         remaining_dual_after_request = [
             p for p in (current_dual_ports or [])
             if p not in (dual_ports_to_remove or [])
@@ -4957,6 +4984,10 @@ def _apply_plain_ports_sync(
         return {"error": "connect_failed"}
     try:
         target_ports = list(dict.fromkeys(new_ports or []))
+        refused = _refuse_live_uplinks(
+            api, router_info, [p for p in target_ports if p not in (old_ports or [])])
+        if refused:
+            return refused
 
         # Cross-mode migration: tear down PPPoE on overlapping ports first.
         if pppoe_ports_to_remove:
@@ -5248,6 +5279,10 @@ def _apply_dual_ports_sync(
         return {"error": "connect_failed"}
     try:
         target_ports = list(dict.fromkeys(new_ports or []))
+        refused = _refuse_live_uplinks(
+            api, router_info, [p for p in target_ports if p not in (old_ports or [])])
+        if refused:
+            return refused
 
         # Cross-mode: tear down dedicated PPPoE on overlapping ports first.
         if pppoe_ports_to_remove:
