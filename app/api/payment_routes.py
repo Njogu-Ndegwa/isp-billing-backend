@@ -1160,6 +1160,37 @@ async def register_hotspot_and_pay_api(
         raise HTTPException(status_code=500, detail=f"Failed to register and initiate payment: {str(e)}")
 
 
+_PORTAL_FAILURE_WINDOW = timedelta(minutes=30)
+
+
+async def _portal_mpesa_failure(db: AsyncSession, customer: Customer) -> Optional[dict]:
+    """Why this customer's newest M-Pesa prompt failed, in their own words.
+
+    Only when Safaricom confirmed it (status failed, source client) with a
+    code the customer can act on, and only for a recent prompt; otherwise
+    None, so a timeout is never shown as a failure.
+    """
+    if customer.status == CustomerStatus.ACTIVE:
+        return None
+    txn = await db.scalar(
+        select(MpesaTransaction)
+        .where(
+            MpesaTransaction.customer_id == customer.id,
+            MpesaTransaction.created_at > datetime.utcnow() - _PORTAL_FAILURE_WINDOW,
+        )
+        .order_by(MpesaTransaction.created_at.desc(), MpesaTransaction.id.desc())
+        .limit(1)
+    )
+    from app.db.models import FailureSource
+    if (
+        txn is None
+        or txn.status != MpesaTransactionStatus.failed
+        or txn.failure_source != FailureSource.CLIENT
+    ):
+        return None
+    return mpesa_results.customer_reason(txn.result_code, txn.result_desc)
+
+
 @router.get("/api/hotspot/payment-status/{customerId}")
 async def get_payment_status(
     customerId: int,
@@ -1223,6 +1254,7 @@ async def get_payment_status(
 
         from app.api.fapshi_routes import customer_payment_flags
         confirmation = await customer_payment_flags(db, customer.id)
+        mpesa_failure = await _portal_mpesa_failure(db, customer)
         return {
             "customer_id": customer.id,
             "status": customer.status.value,
@@ -1233,6 +1265,8 @@ async def get_payment_status(
             **confirmation,
             "access_code": access_code,
             "max_devices": max_devices,
+            # {reason_key, reason, next_step} once M-Pesa confirmed the prompt failed
+            "mpesa_failure": mpesa_failure,
         }
     except HTTPException:
         raise

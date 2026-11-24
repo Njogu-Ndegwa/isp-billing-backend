@@ -42,6 +42,7 @@ from app.db.models import (
     User,
 )
 from app.services.auth import get_current_user, verify_token
+from app.services.mpesa_results import customer_reason
 from app.services import pppoe_expired_guards as guards
 from app.services.plan_cache import get_plans_cached, plan_model_allows_router, sort_portal_plans
 from app.services.pppoe_expired_redirect import (
@@ -402,6 +403,12 @@ async def expired_page_status(
             "status": txn.status.value if txn.status else None,
             "created_at": txn.created_at.isoformat() if txn.created_at else None,
             "result_desc": txn.result_desc if txn.status == MpesaTransactionStatus.failed else None,
+            # why M-Pesa refused it, in the payer's words ({reason_key, reason, next_step})
+            "failure": (
+                customer_reason(txn.result_code, txn.result_desc)
+                if txn.status == MpesaTransactionStatus.failed and txn.failure_source == FailureSource.CLIENT
+                else None
+            ),
         }
         if txn.status == MpesaTransactionStatus.pending:
             # Lost callback? Ask Safaricom (no-op while the prompt is young).

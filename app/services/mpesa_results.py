@@ -117,10 +117,7 @@ def explain(result_code, result_desc: Optional[str] = None) -> dict:
     """
     code = _code_text(result_code)
     desc = " ".join(str(result_desc or "").split())
-    key = code if code in _CODES else None
-    if key is None:
-        low = desc.lower()
-        key = next((c for words, c in _TEXTS if words in low), None)
+    key = _known_key(result_code, result_desc)
     if key is None:
         said = f"M-Pesa code {code or 'none'}" + (f' ("{desc[:120]}")' if desc else "")
         return {
@@ -131,6 +128,58 @@ def explain(result_code, result_desc: Optional[str] = None) -> dict:
         }
     fault, _, explanation, next_step = _CODES[key]
     return {"fault": fault, "explanation": explanation, "next_step": next_step, "known": True}
+
+
+# What the person paying on the captive portal is told, for the results
+# Safaricom confirms as "not paid" and that they can do something about.
+# Their own words: no "the customer", no support names, no phone numbers.
+# code -> (key the portal translates by, what happened, what to do)
+_FOR_PAYER: dict[str, tuple[str, str, str]] = {
+    "1": ("insufficient_balance", "Your M-Pesa balance is too low for this plan.",
+          "Top up M-Pesa, then try again."),
+    "17": ("repeat_too_soon", "M-Pesa blocked a repeat of the same amount.",
+           "Wait 2 minutes, then try again."),
+    "1001": ("phone_busy", "Your phone was busy with another M-Pesa request.",
+             "Wait a minute, then try again."),
+    "1019": ("expired", "The M-Pesa prompt expired before it was answered.",
+             "Try again and enter your PIN as soon as the prompt shows."),
+    "1025": ("prompt_not_sent", "M-Pesa could not send the prompt to your phone.",
+             "Try again in a moment."),
+    "9999": ("prompt_not_sent", "M-Pesa could not send the prompt to your phone.",
+             "Try again in a moment."),
+    "1032": ("cancelled", "The M-Pesa prompt was cancelled on your phone.",
+             "Try again when you are ready and enter your PIN."),
+    "1037": ("phone_unreachable", "M-Pesa could not reach your phone.",
+             "Check the number, keep the phone on and unlocked with network, then try again."),
+    "1038": ("no_pin_entered", "The PIN was not entered on the M-Pesa prompt.",
+             "Try again and enter your PIN when the prompt shows."),
+    "2001": ("wrong_pin", "The M-Pesa PIN was wrong.",
+             "Try again and enter your PIN carefully."),
+    "8006": ("pin_locked", "Your M-Pesa PIN is locked after too many wrong tries.",
+             "Contact Safaricom to unlock it, then try again."),
+}
+
+
+def _known_key(result_code, result_desc: Optional[str]) -> Optional[str]:
+    code = _code_text(result_code)
+    if code in _CODES:
+        return code
+    low = " ".join(str(result_desc or "").split()).lower()
+    return next((c for words, c in _TEXTS if words in low), None)
+
+
+def customer_reason(result_code, result_desc: Optional[str] = None) -> Optional[dict]:
+    """Why a confirmed-failed prompt failed, in the payer's words, or None.
+
+    None for a success, our own codes (TIMEOUT, SERVER_ERROR, ...), the
+    reseller's setup, and codes we do not know: the portal then says nothing
+    more than it does today.
+    """
+    entry = _FOR_PAYER.get(_known_key(result_code, result_desc) or "")
+    if entry is None:
+        return None
+    key, reason, next_step = entry
+    return {"reason_key": key, "reason": reason, "next_step": next_step}
 
 
 def failure_explained(result_code, result_desc: Optional[str] = None) -> str:

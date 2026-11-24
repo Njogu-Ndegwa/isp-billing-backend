@@ -409,3 +409,23 @@ async def test_status_poll_reports_back_online_after_payment(db, session_factory
 
     after = await client.get(f"/api/public/pppoe/expired/{router.id}/status", params={"u": "jane"})
     assert after.json()["online"] is True
+
+
+async def test_status_poll_says_why_the_prompt_failed(db, session_factory, client):
+    from app.db.models import FailureSource
+
+    _, _, router, customer = await _setup(db, status=CustomerStatus.INACTIVE)
+    now = datetime.utcnow()
+    db.add(MpesaTransaction(
+        checkout_request_id="ws_CO_PPPOE_PIN", phone_number="254799000111", amount=1500,
+        reference=f"PPPOE-{customer.id}", customer_id=customer.id,
+        status=MpesaTransactionStatus.failed, failure_source=FailureSource.CLIENT,
+        result_code="2001", result_desc="The initiator information is invalid.",
+        created_at=now, updated_at=now,
+    ))
+    await db.commit()
+
+    payment = (await client.get(f"/api/public/pppoe/expired/{router.id}/status", params={"u": "jane"})).json()["payment"]
+    assert payment["status"] == "failed"
+    assert payment["failure"]["reason_key"] == "wrong_pin"
+    assert payment["failure"]["next_step"]
