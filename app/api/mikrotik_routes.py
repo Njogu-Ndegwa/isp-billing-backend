@@ -630,9 +630,10 @@ def _apply_router_health(result, health, now: datetime):
 def _push_covers_live_fields(health, now: datetime) -> bool:
     """A fresh PUSH report carries everything the dashboard's RouterOS login is
     for (CPU, memory, storage, uptime, version, board), so that login - extra
-    load on the very routers we worry about - can be skipped. SNMP carries CPU
-    only and does not qualify."""
-    return (_health_is_fresh(health, now) and health.source == "push"
+    load on the very routers we worry about - can be skipped. So does the
+    server's health poll (``poll``, router_health_poll.py), which reads the
+    same /system/resource fields. SNMP carries CPU only and does not qualify."""
+    return (_health_is_fresh(health, now) and health.source in ("push", "poll")
             and health.memory_total_bytes is not None and health.cpu_load is not None)
 
 

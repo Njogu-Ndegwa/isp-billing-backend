@@ -117,6 +117,8 @@ def test_only_fresh_push_with_memory_skips_the_login():
     now = datetime.utcnow()
     assert mr._push_covers_live_fields(_health(), now) is True
     assert mr._push_covers_live_fields(_health(source="snmp"), now) is False
+    # The server health poll reads the same /system/resource fields as the push.
+    assert mr._push_covers_live_fields(_health(source="poll"), now) is True
     assert mr._push_covers_live_fields(_health(memory_total_bytes=None), now) is False
     assert mr._push_covers_live_fields(
         _health(sampled_at=now - timedelta(minutes=11)), now) is False

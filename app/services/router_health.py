@@ -1,7 +1,8 @@
 """Latest router health, one row per router (``router_health``).
 
 Sources: the push agent (``source='push'``, every ~2 min, over the router's own
-internet) and the SNMP pilot poller (``source='snmp'``). Whatever arrives most
+internet), the SNMP pilot poller (``source='snmp'``) and the server-side health
+poll for routers that do not push (``source='poll'``, router_health_poll.py). Whatever arrives most
 recently wins; the dashboard dial and the CPU overload alerts read from here,
 so every surface shows the same number.
 
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 SOURCE_PUSH = "push"
 SOURCE_SNMP = "snmp"
+SOURCE_POLL = "poll"
 
 _MAX_BYTES = 1 << 42           # 4 TiB — far beyond any MikroTik
 _MAX_UPTIME = 10 * 365 * 86400
