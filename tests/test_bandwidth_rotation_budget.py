@@ -28,6 +28,7 @@ async def prepare(db, session_factory, monkeypatch, *, failed_read=False):
     monkeypatch.setattr(background, "async_session", session_factory)
     monkeypatch.setattr(background, "time", SimpleNamespace(monotonic=lambda: clock.seconds))
     monkeypatch.setattr(background, "_bandwidth_router_cursor", 0)
+    monkeypatch.setattr(background, "_bandwidth_last_attempt", {})
     monkeypatch.setattr(background, "BANDWIDTH_MAX_ROUTERS_PER_RUN", 8)
     monkeypatch.setattr(background, "BANDWIDTH_RUN_TIME_BUDGET_SECONDS", 90)
     monkeypatch.setattr(background, "_background_db_pool_is_busy", lambda _job: False)
@@ -112,3 +113,41 @@ async def test_cut_off_owners_routers_leave_the_rotation(db, session_factory, mo
     await background.collect_bandwidth_snapshot()
     assert attempts == live_ids
     assert not set(attempts) & {r.id for r in dead}
+
+
+@pytest.mark.asyncio
+async def test_restart_resumes_with_least_recently_snapshotted_routers(db, session_factory, monkeypatch):
+    """The cursor lives in memory and every deploy resets it to 0. With deploys
+    every ~10 minutes the id-ordered rotation never reached the high-id routers
+    (router 750 TOLE #1, no snapshot for two days, 2026-11-24). After a restart
+    the next run must pick the routers whose last snapshot is oldest or missing."""
+    from datetime import datetime, timedelta
+    from app.db.models import BandwidthSnapshot
+
+    owner = await make_reseller(db)
+    routers = [await make_router(db, owner) for _ in range(4)]
+    ids, _clock, attempts = await prepare(db, session_factory, monkeypatch)
+    ids = [r.id for r in routers] + ids  # 12 routers, ascending id
+    now = datetime.utcnow()
+    snapshot_ages = {
+        **{rid: timedelta(minutes=10) for rid in ids[0:4]},
+        **{rid: timedelta(minutes=20) for rid in ids[4:8]},
+        ids[8]: timedelta(seconds=1),       # snapshotted just now: goes last
+        ids[9]: timedelta(days=3),          # outside the look-back: counts as never
+    }  # ids[10], ids[11] (the highest ids) were never snapshotted
+    for rid, age in snapshot_ages.items():
+        db.add(BandwidthSnapshot(router_id=rid, recorded_at=now - age))
+    await db.commit()
+
+    monkeypatch.setattr(background, "BANDWIDTH_RUN_TIME_BUDGET_SECONDS", 10_000)
+    monkeypatch.setattr(background, "BANDWIDTH_MAX_ROUTERS_PER_RUN", 4)
+    # Simulated restart: in-memory rotation state is gone.
+    monkeypatch.setattr(background, "_bandwidth_router_cursor", 0)
+    monkeypatch.setattr(background, "_bandwidth_last_attempt", {})
+
+    await background.collect_bandwidth_snapshot()
+    assert attempts == [ids[9], ids[10], ids[11], ids[4]]
+
+    await background.collect_bandwidth_snapshot()
+    await background.collect_bandwidth_snapshot()
+    assert attempts[4:] == ids[5:8] + ids[0:4] + [ids[8]]

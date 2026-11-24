@@ -116,6 +116,10 @@ DELETED_CUSTOMER_CLEANUP_MIN_INTERVAL = timedelta(minutes=10)
 BANDWIDTH_MAX_ROUTERS_PER_RUN = 8
 BANDWIDTH_RUN_TIME_BUDGET_SECONDS = 90
 BANDWIDTH_HISTORY_RETENTION_DAYS = 30
+# How far back the rotation looks for each router's last snapshot. Only the
+# recorded_at index exists, so the grouped read is a range scan of this window;
+# a router with nothing inside it counts as never snapshotted (first in line).
+BANDWIDTH_FAIRNESS_LOOKBACK = timedelta(days=2)
 INACTIVE_PPPOE_RECONCILE_BATCH_SIZE = 20
 INACTIVE_PPPOE_RECONCILE_MAX_PER_ROUTER = 5
 
@@ -270,6 +274,9 @@ _last_safety_net_cleanup_at: datetime | None = None
 _last_access_credential_reaper_at: datetime | None = None
 _last_deleted_customer_cleanup_at: datetime | None = None
 _bandwidth_router_cursor = 0
+# router id -> when this process last tried to poll it (success or not), so a
+# router that fails to answer does not stay "oldest" and hog every run.
+_bandwidth_last_attempt: dict[int, datetime] = {}
 _queue_sync_router_cursor = 0
 _mac_login_reconcile_cursor = 0
 _inactive_pppoe_reconcile_cursor = 0
@@ -4079,6 +4086,28 @@ async def collect_bandwidth_snapshot():
 
             start_index = _bandwidth_router_cursor % len(eligible_routers)
             ordered_routers = eligible_routers[start_index:] + eligible_routers[:start_index]
+            # The cursor is process memory and every deploy resets it to 0, so
+            # with frequent deploys the id-ordered walk never reached high-id
+            # routers (router 750 TOLE #1: no snapshot for 2 days, 2026-11-24).
+            # Serve the least recently snapshotted routers first; the snapshot
+            # table survives restarts. One grouped read, no per-router query.
+            last_snapshot = dict((await db.execute(
+                select(BandwidthSnapshot.router_id, func.max(BandwidthSnapshot.recorded_at))
+                .where(
+                    BandwidthSnapshot.recorded_at >= now - BANDWIDTH_FAIRNESS_LOOKBACK,
+                    BandwidthSnapshot.router_id.in_([r.id for r in eligible_routers]),
+                )
+                .group_by(BandwidthSnapshot.router_id)
+            )).all())
+            await db.commit()
+
+            def _last_served(router) -> datetime:
+                seen = [t for t in (last_snapshot.get(router.id), _bandwidth_last_attempt.get(router.id)) if t]
+                return max(seen) if seen else datetime.min
+
+            # sorted() is stable: ties (e.g. never snapshotted) keep cursor order.
+            ordered_routers.sort(key=_last_served)
+            rotation_index = {r.id: i for i, r in enumerate(eligible_routers)}
             routers_to_process = ordered_routers[:BANDWIDTH_MAX_ROUTERS_PER_RUN]
             processed_count = 0
             logger.info(
@@ -4094,7 +4123,7 @@ async def collect_bandwidth_snapshot():
                 start_index,
             )
 
-            for offset, router in enumerate(routers_to_process):
+            for router in routers_to_process:
                 if time.monotonic() - run_started >= BANDWIDTH_RUN_TIME_BUDGET_SECONDS:
                     logger.warning(
                         "[BANDWIDTH] Stopping run after %.1fs budget; processed %d router(s)",
@@ -4112,7 +4141,8 @@ async def collect_bandwidth_snapshot():
                 # slow first router can consume the budget; the other seven
                 # must remain next in the rotation. Advancing before I/O also
                 # preserves progress if this attempt raises or is cancelled.
-                _bandwidth_router_cursor = (start_index + offset + 1) % len(eligible_routers)
+                _bandwidth_router_cursor = (rotation_index[router.id] + 1) % len(eligible_routers)
+                _bandwidth_last_attempt[router.id] = now
                 processed_count += 1
                 try:
                     router_info = {
