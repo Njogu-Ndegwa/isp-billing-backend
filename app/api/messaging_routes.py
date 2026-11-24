@@ -542,6 +542,7 @@ async def credit_ledger(limit: int = Query(50, ge=1, le=200),
 @router.get("/api/messaging/recipients")
 async def list_recipients(filter: str = Query("all"),
                           plan_id: Optional[int] = None,
+                          router_id: Optional[int] = None,
                           search: Optional[str] = None,
                           exclude_customer_ids: Optional[str] = Query(None),
                           limit: int = Query(50, ge=1, le=500),
@@ -552,7 +553,7 @@ async def list_recipients(filter: str = Query("all"),
     exclude = [int(x) for x in exclude_customer_ids.split(",") if x.strip().isdigit()] \
         if exclude_customer_ids else None
     recips = await sms_dispatch.resolve_recipients(
-        db, user.id, filter=filter, plan_id=plan_id, search=search,
+        db, user.id, filter=filter, plan_id=plan_id, search=search, router_id=router_id,
         exclude_customer_ids=exclude, tz_name=reseller_market(user).timezone)
     page = recips[offset:offset + limit]
     return {"count": len(recips), "recipients": page,
@@ -576,6 +577,10 @@ class SendRequest(BaseModel):
             "expiring_today": "Time ends today", "expiring_tomorrow": "Time ends tomorrow",
             "expired_recently": "Time ran out in the last 7 days", "by_plan": "One plan's customers"}})
     plan_id: Optional[int] = None
+    # only the customers on one router, together with the filter ("active customers on Rongai")
+    router_id: Optional[int] = Field(None, description=(
+        "Only customers on this router (with the filter: e.g. active customers on one router). "
+        "Ignored when customer_ids are picked."))
     customer_ids: Optional[list[int]] = None
     exclude_customer_ids: Optional[list[int]] = None
     template_id: Optional[int] = None
@@ -584,7 +589,7 @@ class SendRequest(BaseModel):
 def _picked(req: SendRequest, user) -> dict:
     """Who a send goes to, as resolve_recipients takes it."""
     return dict(filter=req.filter, plan_id=req.plan_id, customer_ids=req.customer_ids,
-                exclude_customer_ids=req.exclude_customer_ids,
+                exclude_customer_ids=req.exclude_customer_ids, router_id=req.router_id,
                 tz_name=reseller_market(user).timezone)
 
 

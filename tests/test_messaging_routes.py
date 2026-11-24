@@ -7,14 +7,18 @@ import app.api.messaging_routes as mr
 from app.api.messaging_routes import router as messaging_router
 from app.db.database import get_db
 from app.services.auth import verify_token
+from sqlalchemy import select
+
 from app.db.models import (
+    Customer,
+    CustomerStatus,
     CustomerExpirySmsSettings,
     SmsCreditOrder,
     SmsCreditOrderStatus,
     UserRole,
 )
 from app.services import sms_credits
-from tests.factories import make_reseller, make_plan, make_customer, make_sms_account
+from tests.factories import make_reseller, make_plan, make_customer, make_router, make_sms_account
 
 
 @pytest_asyncio.fixture
@@ -548,3 +552,35 @@ async def test_send_refusal_says_how_many_the_balance_covers(db, client, monkeyp
     assert resp.status_code == 400
     detail = resp.json()["detail"]
     assert detail["required"] == 5 and detail["balance"] == 3 and detail["balance_covers_recipients"] == 3
+
+
+@pytest.mark.asyncio
+async def test_a_send_can_go_to_one_routers_customers(db, client, monkeypatch):
+    """SMS to the customers on one router ("active customers on Rongai"), with the filter,
+    without a hand-built list: the assistant sends it in the chat instead of a page."""
+    r = await make_reseller(db); _auth_as(monkeypatch, r)
+    await make_sms_account(db, r, balance=50)
+    p = await make_plan(db, r)
+    hill = await make_router(db, r, name="Hill")
+    town = await make_router(db, r, name="Town")
+    for i in range(3):
+        await make_customer(db, r, p, hill, status=CustomerStatus.ACTIVE, phone=f"25470000050{i}")
+    await make_customer(db, r, p, hill, status=CustomerStatus.INACTIVE, phone="254700000509")
+    for i in range(2):
+        await make_customer(db, r, p, town, status=CustomerStatus.ACTIVE, phone=f"25470000060{i}")
+
+    async def preview(**body):
+        resp = await client.post("/api/messaging/send/preview", json={"body": "Hi", **body})
+        assert resp.status_code == 200, resp.text
+        return resp.json()["recipients"]
+
+    assert await preview(filter="all") == 6
+    assert await preview(filter="all", router_id=hill.id) == 4
+    assert await preview(filter="active", router_id=hill.id) == 3
+    assert await preview(filter="active", router_id=town.id) == 2
+    # a picked list is taken as it is
+    town_ids = list((await db.execute(select(Customer.id).where(Customer.router_id == town.id))).scalars())
+    assert await preview(customer_ids=town_ids, router_id=hill.id) == 2
+
+    listed = await client.get("/api/messaging/recipients", params={"filter": "active", "router_id": hill.id})
+    assert listed.json()["count"] == 3

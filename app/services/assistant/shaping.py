@@ -10,14 +10,14 @@ Two views of every result:
 
 Requests are checked the other way round: ``secret_fields`` finds secret
 values the model tried to send, which the agent refuses -- passwords and keys
-are typed on the dashboard page, not into a chat.
+are typed into a form card's password field, never into the chat.
 """
 from __future__ import annotations
 
 import json
 from typing import Any
 
-MASK = "•••• (hidden — open the page to see it)"
+MASK = "•••• (hidden: never shown in the chat)"
 
 _SECRET_PARTS = (
     "password", "passwd", "passkey", "secret", "api_key", "apikey", "private_key",
@@ -196,7 +196,7 @@ def for_screen(data: Any, limit_chars: int = 180_000) -> Any:
         shaped = _cut(data, max_list=max_list, max_str=max_str, max_depth=9)
         if _size(shaped) <= limit_chars:
             return shaped
-    return {"_note": "Too large to show here. Open the page for the full list."}
+    return {"_note": "Too large to show at once. Ask for it narrower (a filter) or a page at a time."}
 
 
 def to_json_text(value: Any) -> str:

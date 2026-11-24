@@ -1,0 +1,41 @@
+"""The assistant does the job in the chat instead of sending a reseller to a dashboard page.
+
+From the 22-24 Nov 2026 chat review: with the classic dashboard closed to resellers, replies
+still said "do the router-only send from the messaging page", "open Messaging -> Credits",
+"Settings -> Portal", "open their page -> Get PPPoE credentials". The scripted checks of
+the same rule are in tests/test_assistant_no_dashboard_links.py.
+"""
+import pytest
+
+from tests.assistant_eval_kit import (
+    KEY, any_of, ask, build, card_for, customer, evaluate, never_says, plan, report, use_real_model,
+)
+from tests.test_assistant import client, owner  # noqa: F401  (fixtures)
+
+pytestmark = pytest.mark.skipif(not KEY, reason="needs ASSISTANT_EVAL_KEY (a real model key)")
+
+HOTSPOT = [plan("1 Hour", 10), plan("Daily pass", 35)]
+NO_PAGE = never_says("](/", "dashboard", "messaging page", "settings page", "on the page", "open the page",
+                     "settings →", "settings ->")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("question, checks", [
+    ("Send an SMS to the active customers on Rongai only", [card_for("POST", "/api/messaging/send")]),
+    ("How do I send to one router from the dashboard?", [card_for("POST", "/api/messaging/send")]),
+    ("I want to buy sms credits", [card_for("POST", "/api/messaging/credits/purchase")]),
+    ("I want to change my password", [card_for("PUT", "/api/profile/password")]),
+    ("Where do I change who gets the router offline alerts?",
+     [any_of(card_for("PUT", "/api/messaging/alert-contacts"), lambda row: None if any(
+         "/api/messaging/alert-contacts" in t for t in row["tools"]) else "did not read the alert contacts")]),
+])
+async def test_the_job_is_done_in_the_chat(client, owner, db, monkeypatch, question, checks):  # noqa: F811
+    reseller, token = owner
+    await build(db, reseller, routers=["Rongai", "Town"], plans=HOTSPOT, sms_credits=200,
+                customers=[customer("Amina", "254711000001", "Daily pass", router="Rongai"),
+                           customer("Baraka", "254711000002", "Daily pass", router="Town")])
+    use_real_model(monkeypatch)
+    row = await ask(client, token, question, monkeypatch)
+    problems = evaluate(row, [NO_PAGE, *checks])
+    report(f"no-dashboard/{question[:30]}", row, problems)
+    assert not problems, problems

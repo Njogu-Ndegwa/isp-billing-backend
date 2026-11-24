@@ -409,6 +409,9 @@ sessions plus many `Lock: tuple` waiters that only clear on restart.
   `app_settings.assistant_home_percent` (admins set it with
   `PUT /api/admin/assistant/rollout`, default 0). Platform admins and View-as are never
   moved by the percentage. `GET /api/assistant/status` reports `home` / `home_choice`.
+- For resellers the chat is all of Bitwave: it never sends anyone to a dashboard page or writes
+  page links (`PAGES_IN_CHAT` in `agent.py`; platform admins keep `PAGES_ADMIN`). Something the
+  bot cannot do in the chat is said plainly and recorded with `POST /api/feedback/requests`.
 - `/api/assistant/*` holds no DB session during model or API calls (Session
   Discipline). Tests: `tests/test_assistant.py` (scripted fake model / fake HTTP stream).
 

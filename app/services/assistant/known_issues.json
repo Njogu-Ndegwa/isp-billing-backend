@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-21",
+  "version": "2026-11-24",
   "issues": [
     {
       "id": "triage-order",
@@ -442,7 +442,7 @@
         "smart tv",
         "tv haina"
       ],
-      "cause": "The payment went through and the customer is ACTIVE in the dashboard, but the router never got their access: it was offline or flapping when the payment came in, or the plan was later moved to another device (see tv-second-device-loses-plan). Delivery retries by itself once the router is reachable.",
+      "cause": "The payment went through and the customer is ACTIVE in Bitwave, but the router never got their access: it was offline or flapping when the payment came in, or the plan was later moved to another device (see tv-second-device-loses-plan). Delivery retries by itself once the router is reachable.",
       "checks": [
         "GET /api/customers/{customer_id}: status ACTIVE and expiry after the payment time?",
         "GET /api/customers/{customer_id}/payment-summary or GET /api/mpesa/transactions?customer_id={customer_id} to confirm the payment completed.",
@@ -744,7 +744,7 @@
         "management",
         "not delivering"
       ],
-      "cause": "The router has internet, but Bitwave's management connection to it keeps failing, so the dashboard shows offline and new payments wait to be delivered. Known causes: older RouterOS routers that share one public address with another router on the same ISP take turns being reachable; and on some older routers the management connection gets stuck and redials over and over.",
+      "cause": "The router has internet, but Bitwave's management connection to it keeps failing, so Bitwave shows it offline and new payments wait to be delivered. Known causes: older RouterOS routers that share one public address with another router on the same ISP take turns being reachable; and on some older routers the management connection gets stuck and redials over and over.",
       "checks": [
         "GET /api/routers/{router_id}/uptime and GET /api/routers: offline or on-and-off while customers on it still browse?",
         "GET /api/mpesa/transactions?router_id={router_id}: payments arriving while new payers don't get access.",
@@ -850,7 +850,7 @@
         "lag",
         "chini"
       ],
-      "cause": "Usually the line, not the billing. The billing system only lets customers in and out at their plan's speed; it never slows them below it. Starlink and other ISPs limit speeds at busy hours, so a Starlink speed test that looks fine in the morning says little about the evening, when customers complain. Each customer is also capped at their plan's speed, and a busy small router can be the bottleneck. The live rate in the dashboard is what the customer is using right now, not the speed they can get.",
+      "cause": "Usually the line, not the billing. The billing system only lets customers in and out at their plan's speed; it never slows them below it. Starlink and other ISPs limit speeds at busy hours, so a Starlink speed test that looks fine in the morning says little about the evening, when customers complain. Each customer is also capped at their plan's speed, and a busy small router can be the bottleneck. The live rate Bitwave shows is what the customer is using right now, not the speed they can get.",
       "checks": [
         "Ask when it is slow: if it is the evening, test Starlink itself at that hour, not in the morning.",
         "Ask for a speed test on the customer's device, whether on cable or Wi-Fi, and the time.",
@@ -958,7 +958,7 @@
       ],
       "cause": "An 'Active' payment method only means it's switched on in the app; it doesn't prove the provider accepts it. A wrong till or bank reference format, or the wrong method selected for the router, makes payments fail with errors such as 'incorrect account'. Outside Kenya, a mobile-money brand existing doesn't mean Bitwave already supports that country.",
       "checks": [
-        "Check which payment method is selected for this router in the dashboard, and that its details match exactly what the bank or provider issued (for a bank till, the bank-issued till reference).",
+        "Check which payment method this router uses (payment_method_id on the router in GET /api/routers, against GET /api/payment-methods), and that its details match exactly what the bank or provider issued (for a bank till, the bank-issued till reference).",
         "GET /api/mpesa/transactions/failed for the exact error.",
         "For a new country or provider, ask Bitwave before taking customers on it."
       ],
@@ -1026,10 +1026,10 @@
       "cause": "When Bitwave collects payments for you, they're paid out to your payout destination once a day. A missing payout is usually a delay in the daily run, a wrong or changed payout destination, or money still waiting in your balance for a manual withdrawal.",
       "checks": [
         "GET /api/reseller/payout-settings: is the payout destination right?",
-        "Check your account statement in the dashboard for that day's collections and any withdrawal.",
+        "GET /api/reseller/account-statement with start_date and end_date on that day: its collections and any withdrawal.",
         "GET /api/mpesa/transactions?router_id={router_id} for that day's completed payments."
       ],
-      "fix": "Correct the payout destination if it's wrong. If you withdraw manually, request the withdrawal from the dashboard.",
+      "fix": "Correct the payout destination if it's wrong. If you withdraw manually, request the withdrawal here in the chat (the withdraw form).",
       "bitwave": "Tell Bitwave support which day's payout is missing and roughly how much you expected. Bitwave support can check the payout status from our side.",
       "not_this_if": "You collect on your own till or paybill directly; then the money goes straight to you and there is no Bitwave payout for it."
     },
@@ -1054,13 +1054,13 @@
         "pricing",
         "trial"
       ],
-      "cause": "Platform billing is usually already set up on the account; a 'missing charge' is often a question of which page shows it. New accounts start on a free trial, then pay the current Bitwave tariff, which the invoice shows.",
+      "cause": "Platform billing is usually already set up on the account; a 'missing charge' is often a question of where it shows: the current invoice lists it. New accounts start on a free trial, then pay the current Bitwave tariff, which the invoice shows.",
       "checks": [
         "GET /api/subscription/current-invoice for the current invoice.",
         "GET /api/subscription/invoices and GET /api/subscription/payments for past ones.",
-        "Ask which page or which charge they expected to see."
+        "Ask which charge they expected to see."
       ],
-      "fix": "Read the current invoice on the subscription page in the dashboard. Go by the invoice, not by old prices quoted in chat.",
+      "fix": "Show the current invoice here (GET /api/subscription/current-invoice); it can be paid from the chat too. Go by the invoice, not by old prices quoted in chat.",
       "bitwave": "If the amount looks wrong, tell Bitwave support which invoice and what you expected. Bitwave support can check your tariff from our side.",
       "not_this_if": null
     },
@@ -1088,7 +1088,7 @@
         "bulk sms",
         "haziendi"
       ],
-      "cause": "Usually one of: the campaign needs more credits than you have (each recipient costs credits per message part, so long messages cost more); an old failure still shown as a warning on the Messaging page though newer messages went out; or a custom sender name that isn't registered with the provider yet.",
+      "cause": "Usually one of: the campaign needs more credits than you have (each recipient costs credits per message part, so long messages cost more); an old failure still shown as a warning though newer messages went out; or a custom sender name that isn't registered with the provider yet.",
       "checks": [
         "GET /api/messaging/credits for the real balance.",
         "Count recipients times message parts against that balance.",
@@ -1177,11 +1177,11 @@
         "portal customization",
         "branding"
       ],
-      "cause": "The order of plans on the customer purchase page is a portal setting, separate from the Plans list in the dashboard.",
+      "cause": "The order of plans on the customer purchase page is a portal setting, separate from the order of the plans list (plan_sort_order in the portal settings: default, price_asc or price_desc).",
       "checks": [
-        "Ask whether they mean the customer purchase page or the Plans list in the dashboard."
+        "Ask whether they mean the customer purchase page or their own list of plans."
       ],
-      "fix": "On a computer: Portal Configuration. On a phone: Settings, then Portal Customization. Then Branding, Package Order, Cheapest first, and Save. There's no need to delete or recreate plans. Special or emergency offers stay at the top.",
+      "fix": "Open the portal settings form here with plan_sort_order set to price_asc (cheapest first) or price_desc, and Confirm. There's no need to delete or recreate plans. Special or emergency offers stay at the top.",
       "bitwave": "If the setting is saved and the page still shows the old order, tell Bitwave support the router. Bitwave support can check from our side.",
       "not_this_if": null
     },
@@ -1256,11 +1256,11 @@
         "home router static",
         "badala ya pppoe"
       ],
-      "cause": "A customer's home router does not have to dial PPPoE. Bitwave also supports static-IP customers: their router is given a fixed IP, mask and gateway (and its MAC is pinned on the account), and the dashboard activates, suspends and cuts them off at expiry like any other customer.",
+      "cause": "A customer's home router does not have to dial PPPoE. Bitwave also supports static-IP customers: their router is given a fixed IP, mask and gateway (and its MAC is pinned on the account), and Bitwave activates, suspends and cuts them off at expiry like any other customer.",
       "checks": [
         "GET /api/plans: a static-IP customer needs a plan of the right connection type."
       ],
-      "fix": "Yes, it is possible. Register the customer as a static-IP customer and set their router's WAN to the fixed IP, mask, gateway and DNS the dashboard gives. Keep PPPoE for customers whose router can dial it.",
+      "fix": "Yes, it is possible. Register the customer as a static-IP customer and set their router's WAN to the fixed IP, mask, gateway and DNS Bitwave gives for them. Keep PPPoE for customers whose router can dial it.",
       "bitwave": null,
       "not_this_if": null
     },
@@ -1286,7 +1286,7 @@
         "GET /api/routers/{router_id}/access-points",
         "GET /api/routers/{router_id}/routeros?menu=/interface/bridge/host: is the AP's MAC learnt on a hotspot port?"
       ],
-      "fix": "Plug the AP into a hotspot port, set it to Access Point / bridge mode with DHCP off, and give it the same Wi-Fi name as the others. Then connect a phone to it: the login page should appear. A new MikroTik router (not an AP) is added and set up from the dashboard instead.",
+      "fix": "Plug the AP into a hotspot port, set it to Access Point / bridge mode with DHCP off, and give it the same Wi-Fi name as the others. Then connect a phone to it: the login page should appear. A new MikroTik router (not an AP) is added with a setup code here in the chat instead.",
       "bitwave": "For a new router, or if it still does not show, Bitwave can set it up remotely (AnyDesk, RustDesk or UltraViewer).",
       "not_this_if": "Phones on the new AP already get the login page: it is working, whatever the list shows."
     }
