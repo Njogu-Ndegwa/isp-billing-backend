@@ -178,6 +178,13 @@ it per router.
   feeds their graphs must be measured on canary routers first (`/tool profile`, CPU before and
   after), be cheap and infrequent, back off when CPU is high or a call is slow, and have a kill
   switch. The same goes for any board added to `SMALL_ARCHITECTURES` later.
+- **Routers without the push agent get graphs from the server health poll**
+  (`app/services/router_health_poll.py`, `source='poll'`). It selects from the routers
+  table on every run (online, owner not cut off, no push/SNMP reading in 10 min), so a new
+  router is covered with no script. The rollout's end state is
+  `app_settings.health_poll_router_ids = all`; never narrow it back to an ID list as a
+  permanent setting, since new routers would then be missed. Turn single routers or boards
+  off with the exclude keys instead.
 - **A new router with no readings is listed, never hidden.** It shows under "Online but no
   health readings" on the Router load page (`ranking()["not_reporting"]`) until data arrives.
   The panel says "never reported", not "fills in soon".
