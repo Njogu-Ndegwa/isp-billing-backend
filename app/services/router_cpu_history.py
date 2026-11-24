@@ -13,9 +13,13 @@ single short session: each router counts once, with its mean over the bucket,
 so a router pushing every minute weighs the same as one pushing every two.
 
 Costs nothing on the routers (it reuses samples they already send) and nothing
-on the hot ``routers`` row. A restart loses at most the open bucket. Writes are
-additive, so a bucket written twice (two app instances) still adds up; the
-``routers`` column then over-counts, which the chart tolerates.
+on the hot ``routers`` row. Writes are additive.
+
+Restarts: the outgoing process writes its open bucket at shutdown, so the
+bucket a new process starts in is usually already in the table. Adding the new
+process's half to it counted most routers twice (24 Nov 2026: 210 routers in
+a bucket that had 105). So the new process writes its start bucket only when
+no row exists yet; otherwise it keeps the outgoing process's half.
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ from typing import Dict, List, Optional, Tuple
 from sqlalchemy import delete, select
 
 from app.db import database
-from app.db.models import AppInstanceHeartbeat, RouterCpuBucket, RouterHealth
+from app.db.models import AppDeploy, AppInstanceHeartbeat, RouterCpuBucket, RouterHealth
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +74,10 @@ _tasks: set = set()
 def bucket_start(ts: datetime) -> datetime:
     epoch = int((ts - datetime(1970, 1, 1)).total_seconds())
     return datetime(1970, 1, 1) + timedelta(seconds=epoch - epoch % BUCKET_SECONDS)
+
+
+# The bucket this process started in; see "Restarts" above.
+_start_bucket: datetime = bucket_start(datetime.utcnow())
 
 
 def ros_major(version: Optional[str]) -> str:
@@ -152,6 +160,8 @@ async def flush(now: Optional[datetime] = None, *, include_open: bool = False) -
                         if not s["routers"]:
                             continue
                         row = await db.get(RouterCpuBucket, (start, board, major))
+                        if row is not None and start == _start_bucket:
+                            continue    # the outgoing process already wrote this bucket
                         if row is None:
                             db.add(RouterCpuBucket(bucket_start=start, board_name=board, ros_major=major, **s))
                         else:
@@ -199,16 +209,23 @@ def default_step(hours: int) -> int:
 
 
 def _percentile(hist: List[int], q: float) -> Optional[float]:
-    """Upper edge of the bin holding the q-quantile (so p90 = 70 means 'under 70%')."""
+    """The q-quantile of per-router means, placed linearly inside its 10%-wide bin.
+
+    Routers are spread evenly through the bin they fall in, so with 7 routers
+    in [40, 50) and the quantile landing on the 5th, the answer is 40 + 10*5/7.
+    (It used to be the bin's upper edge, which read up to 10 points high: on
+    24 Nov 2026 RB951 p90 showed 50 when the routers' own value was 47, and p50
+    showed 20 for 12.)
+    """
     total = sum(hist)
     if not total:
         return None
     rank = q * total
     seen = 0
     for i, n in enumerate(hist):
+        if n and seen + n >= rank:
+            return round(min(i * 10 + 10 * (rank - seen) / n, 100.0), 1)
         seen += n
-        if seen >= rank:
-            return float(min((i + 1) * 10, 100))
     return 100.0
 
 
@@ -279,10 +296,6 @@ async def history(db, *, hours: int = 24, step: Optional[int] = None, split_vers
             "points": points,
         })
 
-    deploys = (await db.execute(
-        select(AppInstanceHeartbeat.started_at, AppInstanceHeartbeat.app_version, AppInstanceHeartbeat.runtime_mode)
-        .where(AppInstanceHeartbeat.started_at >= since)
-        .order_by(AppInstanceHeartbeat.started_at))).all()
     return {
         "from": since.isoformat() + "Z",
         "to": now.isoformat() + "Z",
@@ -290,6 +303,26 @@ async def history(db, *, hours: int = 24, step: Optional[int] = None, split_vers
         "bucket_seconds": BUCKET_SECONDS,
         "split_version": split_version,
         "models": models,
-        "deploys": [{"at": s.isoformat() + "Z", "version": v, "runtime_mode": m}
-                    for s, v, m in deploys if s is not None],
+        "deploys": await _deploys(db, since),
     }
+
+
+async def _deploys(db, since: datetime) -> List[dict]:
+    """Every process start since ``since``: the deploy history table, plus any
+    live process missing from it (its first-heartbeat insert failed)."""
+    seen: Dict[str, tuple] = {}
+    try:
+        async with db.begin_nested():
+            for iid, s, v, m in (await db.execute(
+                    select(AppDeploy.instance_id, AppDeploy.started_at, AppDeploy.app_version,
+                           AppDeploy.runtime_mode).where(AppDeploy.started_at >= since))).all():
+                seen[iid] = (s, v, m)
+    except Exception:  # noqa: BLE001 - table not migrated yet: live heartbeats still mark the latest
+        logger.warning("router_cpu_history: app_deploys unreadable; using live heartbeats only")
+    for iid, s, v, m in (await db.execute(
+            select(AppInstanceHeartbeat.instance_id, AppInstanceHeartbeat.started_at,
+                   AppInstanceHeartbeat.app_version, AppInstanceHeartbeat.runtime_mode)
+            .where(AppInstanceHeartbeat.started_at >= since))).all():
+        seen.setdefault(iid, (s, v, m))
+    rows = sorted((v for v in seen.values() if v[0] is not None), key=lambda r: r[0])
+    return [{"at": s.isoformat() + "Z", "version": v, "runtime_mode": m} for s, v, m in rows]

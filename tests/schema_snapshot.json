@@ -187,6 +187,13 @@
   "surface",
   "updated_at"
  ],
+ "app_deploys": [
+  "app_version",
+  "hostname",
+  "instance_id",
+  "runtime_mode",
+  "started_at"
+ ],
  "app_instance_heartbeats": [
   "app_version",
   "db_identity",

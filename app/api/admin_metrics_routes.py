@@ -52,10 +52,13 @@ async def admin_router_cpu_by_model(
     """Fleet CPU per router model over time, with app deploys as markers.
 
     Each point is over routers, not samples: ``avg`` is the mean of each
-    router's mean in the interval, ``p50``/``p90`` are upper bin edges of that
-    distribution (10% bins), ``max`` is the highest single sample, and
-    ``pct_over_80`` is the share of routers averaging 80% or more. Use it to
-    check a release or a fleet-wide router change for CPU regressions.
+    router's mean in the interval, ``p50``/``p90`` are quantiles of that
+    distribution (stored in 10% bins, interpolated inside the bin), ``max`` is
+    the highest single sample, and ``pct_over_80`` is the share of routers
+    averaging 80% or more. ``deploys`` lists every app process start in the
+    window (``version`` is the commit, or "unknown" for images built without
+    one). Use it to check a release or a fleet-wide router change for CPU
+    regressions.
     """
     await _require_admin(token, db)
     from app.services import router_cpu_history

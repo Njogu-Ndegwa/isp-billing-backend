@@ -596,6 +596,21 @@ async def test_heartbeat_upserts_one_row_per_process(db):
 
 
 @pytest.mark.asyncio
+async def test_a_process_start_is_kept_as_a_deploy_after_its_heartbeat_goes(db, monkeypatch):
+    from app.db.models import AppDeploy
+
+    monkeypatch.setenv("GIT_SHA", "8b0993c2cc95866826150be88424e921946fa184")
+    await ops_health.write_heartbeat()
+    await ops_health.write_heartbeat()
+    assert await ops_health.retire_heartbeat() is True          # shutdown: live row gone
+    deploys = (await db.execute(select(AppDeploy))).scalars().all()
+    assert len(deploys) == 1
+    assert deploys[0].instance_id == ops_health.instance_id()
+    assert deploys[0].app_version.startswith("8b0993c")
+    assert deploys[0].runtime_mode == "active"
+
+
+@pytest.mark.asyncio
 async def test_second_active_writer_alerts_admins_once_per_dedupe_window(db, now):
     admin_a = await make_admin(db)
     admin_b = await make_admin(db)

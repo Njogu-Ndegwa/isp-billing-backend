@@ -51,7 +51,10 @@ services:
       retries: 20
 
   web:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     image: isp-billing-hetzner:${HETZNER_IMAGE_TAG:-candidate}
     container_name: isp_billing_hetzner_app
     # Ceiling for floods: past 100 open connections/tasks uvicorn answers a

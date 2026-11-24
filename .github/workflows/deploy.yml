@@ -140,6 +140,9 @@ jobs:
           if docker image inspect "$LAST_GOOD" >/dev/null 2>&1; then HAVE_LAST_GOOD=1; else HAVE_LAST_GOOD=0; fi
 
           echo "[6/9] Building the web image on the host ($WEB_IMAGE)..."
+          # Baked into the image (not set at `up`), so a rollback to last-good
+          # still reports the commit it was really built from.
+          export GIT_SHA="$(git rev-parse HEAD)"
           dc build web || { echo "ERROR: web image build failed"; exit 1; }
 
           echo "[7/9] Smoke-testing the new image BEFORE it replaces the live container..."

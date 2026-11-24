@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 import app.api.admin_metrics_routes as amr
 from app.db.database import get_db
-from app.db.models import AppInstanceHeartbeat, RouterCpuBucket, UserRole
+from app.db.models import AppDeploy, AppInstanceHeartbeat, RouterCpuBucket, UserRole
 from app.services import router_cpu_history as ch
 from app.services import router_health as rh
 from app.services.auth import verify_token
@@ -41,6 +41,16 @@ def test_keys_and_bucket_boundaries():
     assert ch.model_key(None, None) == ("unknown", "?")
     assert ch._percentile([0, 0, 1, 0, 0, 0, 0, 0, 0, 1], 0.5) == 30.0
     assert ch._percentile([0] * 10, 0.9) is None
+
+
+def test_percentiles_sit_inside_the_bin_not_on_its_upper_edge():
+    # 70 routers, 8 of them in [40, 50); p90 (the 63rd) is the 6th of those 8.
+    # The upper edge reported 50 for this (24 Nov 2026: 50 shown, 47 real).
+    hist = [8, 28, 14, 7, 8, 5, 0, 0, 0, 0]
+    assert ch._percentile(hist, 0.9) == 47.5               # 40 + 10 * 6/8
+    assert ch._percentile(hist, 0.5) == 19.6               # 10 + 10 * 27/28, not 20
+    assert ch._percentile([0] * 9 + [3], 1.0) == 100.0
+    assert ch._percentile([5] + [0] * 9, 0.5) == 5.0
 
 
 async def test_each_router_counts_once_per_bucket(db):
@@ -74,6 +84,57 @@ async def test_a_bucket_written_twice_adds_up(db):
     row = (await db.execute(select(RouterCpuBucket))).scalar_one()
     assert (row.routers, row.samples, row.cpu_mean_sum, row.cpu_peak) == (2, 2, 100.0, 60)
     assert sum(row.hist) == 2
+
+
+async def test_a_restart_does_not_count_routers_twice(db, monkeypatch):
+    # Old process: two routers, then the shutdown flush writes the open bucket.
+    ch.note(1, 40, RB951, "7.20.7", now=T0 + timedelta(minutes=1))
+    ch.note(2, 20, RB951, "7.20.7", now=T0 + timedelta(minutes=1))
+    await ch.flush(T0 + timedelta(minutes=2), include_open=True)
+    # New process starts inside the same bucket; the same routers push again.
+    monkeypatch.setattr(ch, "_start_bucket", T0)
+    ch.note(1, 60, RB951, "7.20.7", now=T0 + timedelta(minutes=3))
+    ch.note(2, 30, RB951, "7.20.7", now=T0 + timedelta(minutes=3))
+    ch.note(1, 50, RB951, "7.20.7", now=T0 + timedelta(minutes=6))       # next bucket: normal
+    await ch.flush(T0 + timedelta(minutes=11))
+    rows = {r.bucket_start: r for r in (await db.execute(select(RouterCpuBucket))).scalars()}
+    assert (rows[T0].routers, rows[T0].cpu_mean_sum) == (2, 60.0)          # was 4 routers
+    assert rows[T0 + timedelta(minutes=5)].routers == 1
+
+
+async def test_a_start_bucket_nobody_wrote_is_still_kept(db, monkeypatch):
+    # Crash or first boot: no shutdown flush, so the new process's half is all there is.
+    monkeypatch.setattr(ch, "_start_bucket", T0)
+    ch.note(1, 40, RB951, "7.20.7", now=T0 + timedelta(minutes=3))
+    await ch.flush(T0 + timedelta(minutes=6))
+    row = (await db.execute(select(RouterCpuBucket))).scalar_one()
+    assert (row.bucket_start, row.routers) == (T0, 1)
+
+
+async def test_chart_agrees_with_the_per_router_history(db):
+    """The chart and the per-router graphs (router_metric_buckets) are folded
+    from the same samples by separate code. On prod they are compared by
+    scripts/router_cpu_history_crosscheck.py; here, on mixed cadences."""
+    from app.db.models import RouterMetricBucket
+
+    owner = await make_reseller(db)
+    routers = [await make_router(db, owner) for _ in range(3)]
+    cadence = {routers[0].id: (0, 1, 2, 3, 4), routers[1].id: (0, 2, 4), routers[2].id: (1, 3)}
+    cpu = {routers[0].id: [11, 13, 15, 17, 19], routers[1].id: [70, 90, 80], routers[2].id: [5, 45]}
+    for r in routers:
+        for minute, value in zip(cadence[r.id], cpu[r.id]):
+            await rh.record(r.id, rh.HealthSample(cpu_load=value, board_name=RB951,
+                                                  routeros_version="7.20.7"),
+                            source="push", now=T0 + timedelta(minutes=minute))
+    await ch.flush(T0 + timedelta(minutes=6))
+
+    chart = (await db.execute(select(RouterCpuBucket))).scalar_one()
+    per_router = (await db.execute(select(RouterMetricBucket).where(
+        RouterMetricBucket.step_seconds == 300, RouterMetricBucket.bucket_start == T0))).scalars().all()
+    means = [b.cpu_sum / b.cpu_samples for b in per_router]
+    assert chart.routers == len(means) == 3
+    assert chart.cpu_mean_sum / chart.routers == pytest.approx(sum(means) / len(means), abs=0.01)
+    assert chart.samples == sum(b.cpu_samples for b in per_router)
 
 
 async def test_closing_a_bucket_schedules_a_flush(fresh_tally):
@@ -167,7 +228,8 @@ async def test_endpoint_returns_series_per_model_with_deploys(db, client, monkey
     assert total_routers > 0
     for p in model["points"]:
         assert p["avg"] == 42.0                 # (4*30 + 90) / 5 routers
-        assert p["p50"] == 40.0 and p["p90"] == 100.0
+        # 4 routers in [30, 40) for every 1 in [90, 100], interpolated in the bin.
+        assert p["p50"] == 36.2 and p["p90"] == 95.0
         assert p["max"] == 100 and p["pct_over_80"] == 20.0
     assert [d["version"] for d in body["deploys"]] == ["abc123"]
 
@@ -177,6 +239,30 @@ async def test_endpoint_returns_series_per_model_with_deploys(db, client, monkey
     assert set(by_major) == {"6", "7"}
     assert split["step_seconds"] == 300
     assert {p["avg"] for p in by_major["7"]["points"]} == {30.0}
+
+
+async def test_endpoint_marks_every_deploy_not_only_the_live_one(db, client, monkeypatch):
+    admin = await make_reseller(db, role=UserRole.ADMIN)
+    _auth_as(monkeypatch, admin)
+    now = datetime.utcnow()
+    # Five earlier processes are gone from the heartbeats; the live one is in both tables.
+    for i, minutes in enumerate((180, 170, 165, 160, 140)):
+        db.add(AppDeploy(instance_id=f"old-{i}", started_at=now - timedelta(minutes=minutes),
+                         app_version=f"sha{i}", runtime_mode="active"))
+    db.add(AppDeploy(instance_id="live", started_at=now - timedelta(minutes=10),
+                     app_version="sha-live", runtime_mode="active"))
+    db.add(AppInstanceHeartbeat(instance_id="live", runtime_mode="active", app_version="sha-live",
+                                started_at=now - timedelta(minutes=10), last_seen_at=now))
+    # A live process whose deploy insert failed still shows.
+    db.add(AppInstanceHeartbeat(instance_id="orphan", runtime_mode="shadow", app_version="sha-x",
+                                started_at=now - timedelta(minutes=5), last_seen_at=now))
+    db.add(AppDeploy(instance_id="ancient", started_at=now - timedelta(days=3),
+                     app_version="too-old", runtime_mode="active"))
+    await db.commit()
+
+    body = (await client.get("/api/admin/router-cpu/by-model", params={"hours": 6})).json()
+    assert [d["version"] for d in body["deploys"]] == ["sha0", "sha1", "sha2", "sha3", "sha4", "sha-live", "sha-x"]
+    assert body["deploys"][-1]["runtime_mode"] == "shadow"
 
 
 async def test_endpoint_is_admin_only(db, client, monkeypatch):
