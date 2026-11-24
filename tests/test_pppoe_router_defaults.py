@@ -193,6 +193,146 @@ def test_ensure_pppoe_fasttrack_bypass_reuses_rules_before_fasttrack():
     assert commands == []
 
 
+POOL_RANGE = "192.168.89.2-192.168.89.254"
+# What the same pool used to be written as: 13 CIDR blocks, src + dst each.
+LEGACY_POOL_CIDRS = [
+    "192.168.89.2/31", "192.168.89.4/30", "192.168.89.8/29", "192.168.89.16/28", "192.168.89.32/27",
+    "192.168.89.64/26", "192.168.89.128/26", "192.168.89.192/27", "192.168.89.224/28", "192.168.89.240/29",
+    "192.168.89.248/30", "192.168.89.252/31", "192.168.89.254/32",
+]
+
+
+def _legacy_bypass_rules(cidrs=LEGACY_POOL_CIDRS, first_id=10):
+    rules = []
+    for index, cidr in enumerate(cidrs):
+        # RouterOS prints a /32 as a bare address.
+        address = cidr[: -len("/32")] if cidr.endswith("/32") else cidr
+        for side, field in (("src", "src-address"), ("dst", "dst-address")):
+            rules.append({
+                ".id": f"*{first_id + len(rules):X}",
+                "chain": "forward",
+                "action": "accept",
+                field: address,
+                "comment": f"PPPoE bypass FastTrack ({side}) {cidr}",
+                "disabled": "false",
+            })
+    return rules
+
+
+def _bypass_api(filter_rules, pool_ranges=POOL_RANGE):
+    api = _connected_api()
+    commands = []
+    api.get_ip_pool_status = lambda pool_name: {
+        "success": True,
+        "pools": [{"name": pool_name, "ranges": pool_ranges}],
+    }
+    api.send_command_optimized = lambda command, proplist=None, query="": {"success": True, "data": filter_rules}
+    api.send_command = lambda command, args=None: commands.append((command, args or {})) or {"success": True}
+    return api, commands
+
+
+def test_pool_ranges_become_one_matcher_per_contiguous_block():
+    api = _connected_api()
+
+    assert api._pool_ranges_to_matchers(POOL_RANGE) == [POOL_RANGE]
+    # a block that is exactly one network keeps its CIDR form
+    assert api._pool_ranges_to_matchers("10.5.0.0-10.5.0.255") == ["10.5.0.0/24"]
+    assert api._pool_ranges_to_matchers("192.168.89.254") == ["192.168.89.254/32"]
+    # adjacent and overlapping parts merge; separate blocks stay separate
+    assert api._pool_ranges_to_matchers(
+        "10.0.0.10-10.0.0.20, 10.0.0.21-10.0.0.30,10.9.0.0/24,10.0.0.15-10.0.0.18"
+    ) == ["10.0.0.10-10.0.0.30", "10.9.0.0/24"]
+    assert api._pool_ranges_to_matchers("nonsense, 10.0.0.9-10.0.0.1") == []
+
+
+def test_ensure_pppoe_fasttrack_bypass_uses_one_rule_pair_for_a_pool_range():
+    fasttrack = {".id": "*1", "chain": "forward", "action": "fasttrack-connection", "disabled": "false"}
+    api, commands = _bypass_api([fasttrack])
+
+    result = api.ensure_pppoe_fasttrack_bypass(pool_name="pppoe-pool")
+
+    assert result["success"] is True
+    assert result["cidrs"] == [POOL_RANGE]
+    assert result["rules_added"] == 2
+    assert commands == [
+        ("/ip/firewall/filter/add", {
+            "chain": "forward", "src-address": POOL_RANGE, "action": "accept",
+            "comment": f"PPPoE bypass FastTrack (src) {POOL_RANGE}", "place-before": "*1",
+        }),
+        ("/ip/firewall/filter/add", {
+            "chain": "forward", "dst-address": POOL_RANGE, "action": "accept",
+            "comment": f"PPPoE bypass FastTrack (dst) {POOL_RANGE}", "place-before": "*1",
+        }),
+    ]
+
+
+def test_ensure_pppoe_fasttrack_bypass_replaces_cidr_block_rules_without_a_gap():
+    legacy = _legacy_bypass_rules()
+    fasttrack = {".id": "*1", "chain": "forward", "action": "fasttrack-connection", "disabled": "false"}
+    api, commands = _bypass_api(legacy + [fasttrack])
+
+    result = api.ensure_pppoe_fasttrack_bypass(pool_name="pppoe-pool")
+
+    assert result["success"] is True
+    assert result["rules_added"] == 2
+    assert result["rules_superseded"] == 26
+    assert result["rules_removed"] == 0
+    verbs = [command.rsplit("/", 1)[1] for command, _ in commands]
+    # both new rules exist before the first old one goes: no FastTrack gap
+    assert verbs == ["add", "add"] + ["remove"] * 26
+    assert {args["numbers"] for command, args in commands if command.endswith("/remove")} == {r[".id"] for r in legacy}
+
+
+def test_ensure_pppoe_fasttrack_bypass_is_a_noop_once_compacted():
+    rules = [
+        {".id": "*2", "chain": "forward", "action": "accept", "src-address": POOL_RANGE,
+         "comment": f"PPPoE bypass FastTrack (src) {POOL_RANGE}", "disabled": "false"},
+        {".id": "*3", "chain": "forward", "action": "accept", "dst-address": POOL_RANGE,
+         "comment": f"PPPoE bypass FastTrack (dst) {POOL_RANGE}", "disabled": "false"},
+        {".id": "*1", "chain": "forward", "action": "fasttrack-connection", "disabled": "false"},
+    ]
+    api, commands = _bypass_api(rules)
+
+    result = api.ensure_pppoe_fasttrack_bypass(pool_name="pppoe-pool")
+
+    assert result["rules_reused"] == 2
+    assert result["rules_superseded"] == 0
+    assert commands == []
+
+
+def test_ensure_pppoe_fasttrack_bypass_leaves_other_pools_rules_alone():
+    other_pool = _legacy_bypass_rules(["192.168.189.2/31", "192.168.189.254/32"], first_id=60)
+    # not ours to judge: no address, or not a forward accept
+    odd = [
+        {".id": "*90", "chain": "forward", "action": "accept", "comment": "PPPoE bypass FastTrack (src) 192.168.89.2/31"},
+        {".id": "*91", "chain": "input", "action": "accept", "src-address": "192.168.89.4/30",
+         "comment": "PPPoE bypass FastTrack (src) 192.168.89.4/30"},
+    ]
+    fasttrack = {".id": "*1", "chain": "forward", "action": "fasttrack-connection", "disabled": "false"}
+    api, commands = _bypass_api(other_pool + odd + [fasttrack])
+
+    result = api.ensure_pppoe_fasttrack_bypass(pool_name="pppoe-pool")
+
+    assert result["rules_added"] == 2
+    assert result["rules_superseded"] == 0
+    assert not [c for c in commands if c[0].endswith("/remove")]
+
+
+def test_ensure_pppoe_fasttrack_bypass_keeps_old_rules_when_the_new_rule_cannot_be_added():
+    legacy = _legacy_bypass_rules()
+    fasttrack = {".id": "*1", "chain": "forward", "action": "fasttrack-connection", "disabled": "false"}
+    api, commands = _bypass_api(legacy + [fasttrack])
+    api.send_command = lambda command, args=None: (
+        commands.append((command, args or {})) or
+        ({"error": "failure: bad address"} if command.endswith("/add") else {"success": True})
+    )
+
+    result = api.ensure_pppoe_fasttrack_bypass(pool_name="pppoe-pool")
+
+    assert "error" in result
+    assert not [c for c in commands if c[0].endswith("/remove")]
+
+
 def test_add_pppoe_secret_updates_when_router_reports_same_name_exists():
     api = _connected_api()
     commands = []

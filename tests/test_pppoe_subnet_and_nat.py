@@ -56,6 +56,8 @@ CASCADED_483 = {
     ],
     "/ip/firewall/filter": [
         {".id": "*A", "comment": "PPPoE bypass FastTrack (src) 192.168.89.2/31"},
+        # the one-rule-per-pool form (a range, not a CIDR block)
+        {".id": "*C", "comment": "PPPoE bypass FastTrack (dst) 192.168.89.2-192.168.89.254"},
         {".id": "*B", "comment": "defconf: fasttrack"},
     ],
     "/ppp/active": [{".id": "*S1", "address": "192.168.89.7"}],
