@@ -12,7 +12,10 @@ not "is the port open". The rules that matter, from the OVES runbook:
 * The OpenToken algorithm service is a pure function, so a fixed request has a
   fixed answer: the probe checks the TOKEN, not just the status code.
 * ``open-token-microservice`` answers ``GET /`` with a 500 by design
-  ("dbUri was not passed") -- that 500 means the process is up.
+  ("dbUri was not passed"), so the probe asks its GraphQL endpoint for
+  ``{__typename}`` instead. Probing ``GET /`` made this checker the main
+  source of that host's 5xx (~1/min, ~85 % of all its 500s on 2026-11-25),
+  which read as an outage on any ingress 5xx ratio.
 * ``exposure`` probes are inverted: an open port there is the alarm.
 
 Never called with a DB session open.
@@ -97,8 +100,9 @@ REGISTRY: list[Probe] = [
       "https://auth-microservice-prod.omnivoltaic.com/emqx-auth",
       "Every MQTT device connect", expect_text='"ok"', critical=True),
     P("open_token_store", "open-token-microservice", "oves_prod", "http",
-      "https://open-token-microservice-prod.omnivoltaic.com/",
-      "OpenToken secret sharing", expect_status=(500,), expect_text="dbUri"),
+      "https://open-token-microservice-prod.omnivoltaic.com/graphql",
+      "OpenToken secret sharing", method="POST",
+      body={"query": "{__typename}"}, expect_text="__typename"),
     P("shadow_api", "Shadow API (devices)", "oves_prod", "http",
       "https://api.omnivoltaic.com/", "Device OTP / code routes", expect_text="Welcome"),
     P("erm_admin", "ERM admin", "oves_prod", "http", "https://erm-admin.omnivoltaic.com/"),
