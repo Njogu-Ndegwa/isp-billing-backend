@@ -62,9 +62,10 @@ RANGES: dict[str, tuple[int, timedelta]] = {
     "7d": (COARSE_STEP_SECONDS, timedelta(days=7)),
 }
 
-# Only the push agent reports uptime. A row whose last writer was SNMP (CPU
+# The push agent and the server health poll (router_health_poll.py) read
+# uptime with the rest of the sample. A row whose last writer was SNMP (CPU
 # only) has a sampled_at that does not belong to its uptime.
-SOURCE_WITH_UPTIME = "push"
+SOURCES_WITH_UPTIME = frozenset({"push", "poll"})
 
 # A report reaches us a few seconds after the router read its uptime. Real
 # reboots move the boot time by at least the previous uptime, so a few minutes
@@ -121,7 +122,7 @@ def detect_reboot(prev: Optional[PrevReading], new_uptime: Optional[int],
     booted_at = now - timedelta(seconds=new_uptime)
     if new_uptime + UPTIME_BACKWARDS_SLACK_SECONDS < prev.uptime_seconds:
         return booted_at
-    if prev.source == SOURCE_WITH_UPTIME and prev.sampled_at is not None:
+    if prev.source in SOURCES_WITH_UPTIME and prev.sampled_at is not None:
         prev_booted_at = prev.sampled_at - timedelta(seconds=prev.uptime_seconds)
         if booted_at - prev_booted_at > BOOT_SHIFT_SLACK:
             return booted_at

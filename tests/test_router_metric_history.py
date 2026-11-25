@@ -69,6 +69,12 @@ def test_reboot_during_a_long_outage_is_still_seen():
     assert mh.detect_reboot(_prev(300, T0), 2400, now) == now - timedelta(seconds=2400)
 
 
+def test_reboot_during_a_long_outage_is_seen_on_polled_routers_too():
+    # hAP lites have no push agent; the server poll reads their uptime.
+    now = T0 + timedelta(hours=3)
+    assert mh.detect_reboot(_prev(300, T0, source="poll"), 2400, now) == now - timedelta(seconds=2400)
+
+
 def test_boot_time_check_needs_a_push_timestamp():
     # The last writer was SNMP: its sampled_at is not when that uptime was read.
     now = T0 + timedelta(hours=3)
