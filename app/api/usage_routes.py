@@ -282,6 +282,32 @@ async def get_customer_usage(
     return usage
 
 
+@router.post("/api/customers/{customer_id}/fup/lift", response_model=UsageOut)
+async def lift_customer_fup(
+    customer_id: int,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Restore full speed now for a customer the data cap slowed or blocked.
+
+    The cap stays off until the customer renews (or until tomorrow's reset on
+    a daily plan). 409 when the customer isn't capped or has expired, 502 when
+    the router couldn't be reached.
+    """
+    from app.services.fup import FupLiftError, lift_until_next_window
+
+    user = await get_current_user(token, db)
+    customer = await _load_customer_scoped(db, customer_id, user)
+    period = await get_open_period(db, customer.id)
+    try:
+        await lift_until_next_window(db, customer, period, plan=customer.plan)
+    except FupLiftError as exc:
+        status = 502 if exc.code == "router" else 409
+        raise HTTPException(status_code=status, detail=exc.reason)
+    await db.commit()
+    return _serialize_usage(customer, period)
+
+
 @router.post("/api/customers/usage/bulk", response_model=list[UsageOut])
 async def get_customer_usage_bulk(
     body: BulkUsageRequest,
