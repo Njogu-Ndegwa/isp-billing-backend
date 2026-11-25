@@ -787,6 +787,53 @@ async def evaluate_and_enforce(
     return None
 
 
+class FupLiftError(Exception):
+    """A reseller's lift could not be done; ``reason`` is user-facing."""
+
+    def __init__(self, code: str, reason: str):
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason
+
+
+async def lift_until_next_window(
+    db: AsyncSession,
+    customer: Customer,
+    period: Optional[CustomerUsagePeriod],
+    plan: Optional[Plan] = None,
+    now: Optional[datetime] = None,
+) -> None:
+    """Reseller lifts a customer's FUP now, mid-session (Tedd, 25 Nov 2026).
+
+    Restores the plan's normal speed and records the lift, but keeps the
+    trigger: every path that applies a cap needs an empty ``fup_triggered_at``,
+    so the cap stays off for the rest of this period. Renewal opens a fresh
+    period, and on a daily plan the next reset re-arms it, so the customer
+    gets the full cap back then.
+
+    Raises FupLiftError when there is nothing to lift or the router refused.
+    """
+    plan = plan if plan is not None else customer.plan
+    now = now or datetime.utcnow()
+    if (
+        period is None
+        or period.fup_triggered_at is None
+        or period.fup_reverted_at is not None
+    ):
+        raise FupLiftError("not_restricted", "This customer is not limited by the data cap right now.")
+    if not has_access_time(customer, now):
+        # Restoring would re-open a hotspot binding for an expired customer.
+        raise FupLiftError("expired", "This customer's plan has expired. Renew it instead.")
+    if period.fup_action_taken in (FupAction.THROTTLE, FupAction.BLOCK):
+        res = await restore_normal_profile(db, customer, plan)
+        if res.get("error"):
+            logger.warning(f"[FUP] Manual lift failed for customer={customer.id}: {res}")
+            raise FupLiftError("router", "Couldn't reach the router to restore full speed. Try again in a minute.")
+    identifier = customer.pppoe_username or customer.mac_address or f"customer:{customer.id}"
+    logger.info(f"[FUP] Lifted by reseller for customer={customer.id} ({identifier})")
+    period.fup_reverted_at = now
+
+
 async def lift_restrictions_after_cap_raise(customer_ids: list[int]) -> None:
     """Lift a throttle or block that a just-raised cap no longer justifies.
 
