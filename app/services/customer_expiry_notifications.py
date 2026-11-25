@@ -55,6 +55,20 @@ MAX_REMINDER_OFFSET_MINUTES = 30 * 24 * 60
 MAX_REMINDER_OFFSETS = 5
 TECHMID_SMS_OWNER_ID = 597
 TECHMID_DIRECT_PAYBILL_ROUTERS = frozenset({556, 564, 670})
+# app_settings key: comma-separated reseller ids whose PPPoE customers are
+# told to pay the platform paybill with their own account number, even though
+# the reseller settles directly. Such payments are matched by C2B, renew the
+# customer automatically, and reach the reseller through the B2B payout.
+PLATFORM_PAYBILL_RESELLERS_KEY = "pppoe_platform_paybill_resellers"
+
+
+async def uses_platform_paybill(db, reseller_id: int) -> bool:
+    """True when this reseller opted into the platform paybill for SMS."""
+    from app.services.app_settings import get_setting
+
+    raw = await get_setting(db, PLATFORM_PAYBILL_RESELLERS_KEY)
+    ids = {part.strip() for part in (raw or "").split(",")}
+    return str(reseller_id) in ids
 
 
 def expiry_message_category(expiry: datetime) -> str:
@@ -184,6 +198,9 @@ async def resolve_paybills(
         out[router_id] = await _paybill_for_method(
             db, pm, resolve_direct_destination, reseller.id, router_id
         )
+    if await uses_platform_paybill(db, reseller.id):
+        # A router with no matchable paybill falls back to the platform one.
+        out = {rid: paybill or settings.MPESA_SHORTCODE for rid, paybill in out.items()}
     return out
 
 

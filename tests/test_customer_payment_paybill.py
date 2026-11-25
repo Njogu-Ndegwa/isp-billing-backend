@@ -168,3 +168,44 @@ async def test_resolver_failure_does_not_break_the_customer_list(db, client, mon
 
     assert resp.status_code == 200
     assert resp.json()[0]["payment_paybill"] is None
+
+
+async def _direct_bank_reseller(db):
+    reseller = await make_reseller(db, settlement_mode="direct")
+    router = await make_router(db, reseller)
+    method = await _add_method(
+        db, reseller, ResellerPaymentMethodType.BANK_ACCOUNT,
+        bank_paybill_number="247247", bank_account_number="966538",
+    )
+    router.payment_method_id = method.id
+    await db.commit()
+    return reseller, router
+
+
+@pytest.mark.asyncio
+async def test_direct_reseller_opted_in_gets_the_platform_paybill(db, client, monkeypatch):
+    """Kelly (25 Nov): PPPoE customers pay the platform paybill with their own
+    account number so C2B renews them; the money reaches him by payout."""
+    from app.services.app_settings import set_setting
+    from app.services.customer_expiry_notifications import (
+        PLATFORM_PAYBILL_RESELLERS_KEY,
+        resolve_payment_targets,
+    )
+
+    reseller, router = await _direct_bank_reseller(db)
+    other, other_router = await _direct_bank_reseller(db)
+    await set_setting(db, PLATFORM_PAYBILL_RESELLERS_KEY, f" 9999, {reseller.id}")
+    customer = await _pppoe_customer(db, reseller, router)
+    _auth_as(monkeypatch, reseller)
+
+    detail = (await client.get(f"/api/customers/{customer.id}")).json()
+    target = (await resolve_payment_targets(db, reseller, {router.id}))[router.id]
+    other_target = (await resolve_payment_targets(db, other, {other_router.id}))[other_router.id]
+
+    assert detail["payment_paybill"] == settings.MPESA_SHORTCODE
+    assert target.paybill == settings.MPESA_SHORTCODE
+    assert target.auto_renews is True
+    assert target.fields(customer.account_number)["account_number"] == customer.account_number
+    # Not opted in: still told to pay the bank directly.
+    assert other_target.paybill == "247247"
+    assert other_target.auto_renews is False
