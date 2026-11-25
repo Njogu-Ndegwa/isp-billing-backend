@@ -165,7 +165,8 @@ async def test_the_summary_counts_the_same_local_day(db, client, monkeypatch):
 
     ranged = await _summary(client, start_date="2026-11-23", end_date="2026-11-23")
     assert ranged["status_breakdown"] == monday["status_breakdown"]
-    assert ranged["total_transactions"] == monday["total_transactions"] == 5
+    # the failed prompt is an attempt, not a transaction: 4 of the 5 rows count
+    assert ranged["total_transactions"] == monday["total_transactions"] == 4
 
 
 async def test_failed_payments_follow_the_same_local_day(db, client, monkeypatch):

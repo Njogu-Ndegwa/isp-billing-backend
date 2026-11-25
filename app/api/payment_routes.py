@@ -2230,7 +2230,12 @@ async def get_mpesa_transactions_summary(
     - router_id, payment_method, date, start_date, end_date (same as /transactions)
 
     Returns:
-    - total_transactions, total_amount
+    - total_transactions, total_amount: what the reseller made, COMPLETED
+      payments only (free compensation is counted in total_transactions, its
+      money in compensation_total). Failed, expired and pending M-Pesa prompts
+      are attempts, never part of these totals or of "money made".
+    - not_completed: count and amount of those attempts (failed / expired /
+      pending), only for when someone asks about failures
     - status_breakdown (completed / pending / failed / expired)
     - method_breakdown (mobile_money / voucher / cash / ...)
     - router_breakdown
@@ -2396,10 +2401,21 @@ async def get_mpesa_transactions_summary(
                     "connection_type": connection_type.value if connection_type else None,
                 })
 
-        total_transactions = len(rows)
+        # The headline totals are what the reseller actually made: completed
+        # payments only. A failed, expired or pending M-Pesa prompt is an
+        # attempt, not a sale; counting it inflated "Total transactions" and
+        # "Total amount" (Dennis, 2026-11-25). Attempts stay in
+        # status_breakdown and, summed, in not_completed.
+        completed = [r for r in rows if r["status"] == "completed"]
+        attempts = [r for r in rows if r["status"] != "completed"]
+        total_transactions = len(completed)
         # Only sum amounts for rows that count as revenue (exclude compensation)
-        total_amount = round(sum(r["amount"] for r in rows if r["counts_as_revenue"]), 2)
-        compensation_total = round(sum(r["amount"] for r in rows if not r["counts_as_revenue"]), 2)
+        total_amount = round(sum(r["amount"] for r in completed if r["counts_as_revenue"]), 2)
+        compensation_total = round(sum(r["amount"] for r in completed if not r["counts_as_revenue"]), 2)
+        not_completed = {
+            "count": len(attempts),
+            "amount": round(sum(r["amount"] for r in attempts if r["counts_as_revenue"]), 2),
+        }
 
         status_breakdown: dict = {}
         for r in rows:
@@ -2465,6 +2481,7 @@ async def get_mpesa_transactions_summary(
             "total_transactions": total_transactions,
             "total_amount": total_amount,
             "compensation_total": compensation_total,
+            "not_completed": not_completed,
             "settlement_breakdown": settlement_breakdown,
             "status_breakdown": status_breakdown,
             "method_breakdown": method_breakdown,
