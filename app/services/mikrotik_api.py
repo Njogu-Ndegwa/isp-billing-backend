@@ -21,6 +21,18 @@ logger.setLevel(logging.WARNING)  # Reduce noise, only warnings/errors
 QUEUE_FASTTRACK_BYPASS_LIST = "isp_queue_limited_clients"
 QUEUE_FASTTRACK_BYPASS_SRC_COMMENT = "ISP_BILLING_QUEUE_BYPASS_SRC"
 QUEUE_FASTTRACK_BYPASS_DST_COMMENT = "ISP_BILLING_QUEUE_BYPASS_DST"
+# The list above only ever grew: every customer IP ever seen stayed in it. On
+# RB951s it reached 1,500-2,300 entries with ~10% in use (2026-11-23), and every
+# `address-list find where list=...` in the Bitwave router scripts scans the
+# whole table, so the watchdog / reaper / usage-push ran 20-40 s at 100% CPU
+# each minute (router 75: pruning alone took average CPU from 90% to 63%).
+# Pruning keeps lists below the floor alone, removes nothing unless enough
+# entries are stale, and caps removals per call so a big leak is cleared over
+# a few sync passes instead of in one burst of config writes.
+QUEUE_BYPASS_PRUNE_MIN_ENTRIES = 64
+QUEUE_BYPASS_PRUNE_MIN_STALE = 16
+QUEUE_BYPASS_PRUNE_MAX_REMOVE = 400
+QUEUE_BYPASS_PRUNE_CHUNK = 40
 
 # Plain (no-auth) ports: bridge-plain must be trusted for DHCP/DNS on input,
 # or the defconf "drop all not coming from LAN" rule starves its clients.
@@ -391,6 +403,43 @@ def customer_queue_mac(queue: Dict[str, Any]) -> Optional[str]:
     """
     match = _CUSTOMER_QUEUE_NAME_RE.match(str(queue.get("name", "")).strip())
     return normalize_mac_address(match.group(1)) if match else None
+
+
+def _host_ip(value: Any) -> Optional[str]:
+    """``a.b.c.d`` or ``a.b.c.d/32`` -> ``a.b.c.d``; anything else (a subnet, junk) -> None."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    ip, _, mask = text.partition("/")
+    if mask and mask != "32":
+        return None
+    try:
+        return str(ipaddress.ip_address(ip.strip()))
+    except ValueError:
+        return None
+
+
+def live_router_ips(*row_lists: List[Dict[str, Any]], queues: List[Dict[str, Any]] = ()) -> set:
+    """Every host IP a device on the router holds right now.
+
+    ``row_lists`` are ARP / DHCP lease / hotspot host / hotspot active /
+    ip-binding rows (their ``address``, ``active-address`` and ``to-address``
+    fields count); ``queues`` adds each simple queue's target host IPs, so a
+    queued customer whose device is momentarily absent is still live.
+    """
+    live = set()
+    for rows in row_lists:
+        for row in rows or []:
+            for field in ("address", "active-address", "to-address"):
+                ip = _host_ip(row.get(field))
+                if ip:
+                    live.add(ip)
+    for queue in queues or []:
+        for part in str(queue.get("target", "")).split(","):
+            ip = _host_ip(part)
+            if ip:
+                live.add(ip)
+    return live
 
 
 def queue_single_target_ip(queue: Dict[str, Any]) -> Optional[str]:
@@ -1091,6 +1140,73 @@ class MikroTikAPI:
         except Exception as e:
             logger.error(f"Error removing hotspot parent queues: {e}")
             return {"error": str(e)}
+
+    def prune_queue_fasttrack_bypass_list(self, live_ips: Optional[set] = None) -> Dict[str, Any]:
+        """Remove ``isp_queue_limited_clients`` entries no device on the router holds.
+
+        Only static entries are considered, and only when the list has at least
+        ``QUEUE_BYPASS_PRUNE_MIN_ENTRIES`` of them and at least
+        ``QUEUE_BYPASS_PRUNE_MIN_STALE`` are stale; at most
+        ``QUEUE_BYPASS_PRUNE_MAX_REMOVE`` go per call. ``live_ips`` comes from
+        the caller's own fresh reads; when it is None the router is read here
+        (ARP, leases, hotspot hosts/active, ip-bindings, queue targets), and any
+        failed read means nothing is removed. An empty live set also removes
+        nothing (a read that silently came back empty must not wipe the list).
+
+        Safe by construction: a pruned IP has no device on it, and the queue
+        sync re-adds any connected customer's IP on its next pass (as for any
+        IP the list has never seen).
+        """
+        out: Dict[str, Any] = {"success": True, "entries": 0, "stale": 0, "removed": 0}
+        if not self.connected:
+            return {"error": "Not connected"}
+        listed = self.send_command_optimized(
+            "/ip/firewall/address-list/print",
+            proplist=[".id", "address", "dynamic"],
+            query=f"?list={QUEUE_FASTTRACK_BYPASS_LIST}",
+        )
+        if not listed.get("success"):
+            return {"error": f"address-list read failed: {listed.get('error')}"}
+        entries = [e for e in listed.get("data") or []
+                   if str(e.get("dynamic", "false")).lower() != "true" and e.get(".id")]
+        out["entries"] = len(entries)
+        if len(entries) < QUEUE_BYPASS_PRUNE_MIN_ENTRIES:
+            out["skipped"] = "small list"
+            return out
+        if live_ips is None:
+            reads = []
+            for path, props in (
+                ("/ip/arp/print", ["address"]),
+                ("/ip/dhcp-server/lease/print", ["address", "active-address"]),
+                ("/ip/hotspot/host/print", ["address", "to-address"]),
+                ("/ip/hotspot/active/print", ["address"]),
+                ("/ip/hotspot/ip-binding/print", ["address", "to-address"]),
+                ("/queue/simple/print", ["target"]),
+            ):
+                res = self.send_command_optimized(path, proplist=props)
+                if not res.get("success"):
+                    return {"error": f"{path} read failed: {res.get('error')}", **out}
+                reads.append(res.get("data") or [])
+            live_ips = live_router_ips(*reads[:5], queues=reads[5])
+        live = {ip for ip in (_host_ip(x) for x in live_ips) if ip}
+        if not live:
+            out["skipped"] = "no live IPs read"
+            return out
+        stale = [e for e in entries if _host_ip(e.get("address")) not in live]
+        out["stale"] = len(stale)
+        if len(stale) < QUEUE_BYPASS_PRUNE_MIN_STALE:
+            out["skipped"] = "few stale"
+            return out
+        ids = [e[".id"] for e in stale[:QUEUE_BYPASS_PRUNE_MAX_REMOVE]]
+        for i in range(0, len(ids), QUEUE_BYPASS_PRUNE_CHUNK):
+            chunk = ids[i:i + QUEUE_BYPASS_PRUNE_CHUNK]
+            res = self.send_command("/ip/firewall/address-list/remove", {"numbers": ",".join(chunk)})
+            if res.get("error"):
+                out["success"] = False
+                out["error"] = f"remove failed after {out['removed']}: {res.get('error')}"
+                break
+            out["removed"] += len(chunk)
+        return out
 
     def ensure_queue_fasttrack_bypass(self, client_ips: List[str]) -> Dict[str, Any]:
         """

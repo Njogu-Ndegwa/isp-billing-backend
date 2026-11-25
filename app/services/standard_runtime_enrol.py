@@ -100,6 +100,21 @@ def _parse_ids(raw) -> frozenset[int]:
     return frozenset(int(p.strip()) for p in str(raw or "").split(",") if p.strip().isdigit())
 
 
+def wants_checkin_tunnel(router_id: int, version: Optional[str]) -> bool:
+    """Should this router's check-in try the management tunnel first?
+
+    ``CHECKIN_TUNNEL_ROUTER_IDS`` is a comma list of router ids, or ``ros7``:
+    every RouterOS 7 router. The tunnel fetch (plain HTTP inside the encrypted
+    tunnel, public HTTPS fallback) saves an RB951 a TLS handshake per check-in
+    (fleet rollout 2026-11-23). RouterOS 6 stays on public HTTPS under ``ros7``:
+    the fetch's idle-timeout/duration options are only proven on 7.x.
+    """
+    raw = str(settings.CHECKIN_TUNNEL_ROUTER_IDS or "").strip().lower()
+    if raw == "ros7":
+        return str(version or "").strip().startswith("7.")
+    return router_id in _parse_ids(raw)
+
+
 def in_scope(router_id: int) -> bool:
     """STANDARD_RUNTIME_MIN_ROUTER_ID / _EXTRA_ / _EXCLUDE_ROUTER_IDS."""
     if router_id in _parse_ids(settings.STANDARD_RUNTIME_EXCLUDE_ROUTER_IDS):
@@ -262,7 +277,7 @@ def _checkin_sync(api, c: Candidate, identity: str, board: str, arch: str, versi
     if (api.send_command("/ip/hotspot/ip-binding/print") or {}).get("error"):
         return Component(False, "no hotspot ip-binding table")
     transport = {}
-    if c.id in _parse_ids(settings.CHECKIN_TUNNEL_ROUTER_IDS):
+    if wants_checkin_tunnel(c.id, version):
         transport["tunnel_endpoint_url"] = settings.CHECKIN_TUNNEL_ENDPOINT_URL
     actions = bool(settings.CHECKIN_APPLIER_ACTIONS)
     res = install_checkin_applier(api, identity=identity, endpoint_url=settings.CHECKIN_ENDPOINT_URL,

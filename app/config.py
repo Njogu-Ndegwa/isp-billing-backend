@@ -113,7 +113,8 @@ class Settings(BaseSettings):
     # Where the applier posts. Public HTTPS (through Cloudflare): it keeps
     # working when the management tunnel is down, which is the point.
     CHECKIN_ENDPOINT_URL: str = "https://isp.bitwavetechnologies.net/api/router/checkin"
-    # Explicit transport pilot; this does not enroll routers for check-in.
+    # Tunnel-first check-in transport: comma list of router ids, or "ros7" for
+    # every RouterOS 7 router. This does not enroll routers for check-in.
     CHECKIN_TUNNEL_ROUTER_IDS: str = ""
     CHECKIN_TUNNEL_ENDPOINT_URL: str = "http://10.251.0.1:8088/api/router/checkin"
     # New check-in installs get applier v3 (router actions: restart, tunnel
