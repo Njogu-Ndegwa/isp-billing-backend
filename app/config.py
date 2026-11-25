@@ -468,6 +468,35 @@ class Settings(BaseSettings):
     # Critical-only SMS destination for ops alerts. Empty = inbox alerts only.
     OPS_ALERT_SMS_PHONE: str = ""
 
+    # --- Load-balancing per-WAN health (app/services/lb_wan_health.py) -----
+    # Catches a WAN that still answers ping (check-gateway stays green) but
+    # drops replies for real flows (KWETU WIFI / router 671, 2026-11-19).
+    # A WAN is "degraded" in one check when, among its established TCP flows,
+    # the share with < STARVED_REPLY_BYTES of reply is >= MIN_STARVED_RATIO,
+    # it has >= MIN_FLOWS flows, and that share is >= RELATIVE_FACTOR x the
+    # healthiest other WAN's share (floored at BASELINE_FLOOR). With no other
+    # WAN to compare against, only ABSOLUTE_ONLY_RATIO counts.
+    LB_HEALTH_CHECK_ENABLED: bool = True
+    # False = detect + alert only, never touch a router.
+    LB_HEALTH_AUTO_MITIGATE: bool = True
+    LB_HEALTH_INTERVAL_SECONDS: int = 300
+    LB_HEALTH_STARVED_REPLY_BYTES: int = 1024
+    LB_HEALTH_MIN_FLOWS: int = 50
+    LB_HEALTH_MIN_BASELINE_FLOWS: int = 30
+    LB_HEALTH_MIN_STARVED_RATIO: float = 0.25
+    LB_HEALTH_RELATIVE_FACTOR: float = 4.0
+    LB_HEALTH_BASELINE_FLOOR: float = 0.02
+    # Healthy routers 537 and 354 run 44-48% "starved" on BOTH lines (idle
+    # keep-alives, 2026-11-19 fleet read), so the no-baseline bar sits well above.
+    LB_HEALTH_ABSOLUTE_ONLY_RATIO: float = 0.75
+    # Consecutive degraded checks before a WAN is pulled out of balancing, and
+    # consecutive healthy checks on trial before it counts as recovered.
+    LB_HEALTH_DEGRADED_CHECKS: int = 3
+    LB_HEALTH_HEALTHY_CHECKS: int = 3
+    # How long a pulled WAN rests before a trial; doubles after a failed trial.
+    LB_HEALTH_COOLDOWN_MINUTES: int = 30
+    LB_HEALTH_MAX_COOLDOWN_MINUTES: int = 240
+
     # --- OVES platform health (app/services/oves_health/) -------------------
     # A 60 s collector that watches the OVES EKS clusters, code generation,
     # MongoDB, and the external services OVES and this app depend on. Off

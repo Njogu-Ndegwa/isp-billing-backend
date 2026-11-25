@@ -4504,6 +4504,16 @@ async def startup_event():
         max_instances=1,
         misfire_grace_time=60,
     )
+    from app.services.lb_wan_health import check_lb_wan_health_background
+    scheduler.add_job(
+        check_lb_wan_health_background,
+        trigger=IntervalTrigger(seconds=app_settings.LB_HEALTH_INTERVAL_SECONDS),
+        id='lb_wan_health_check',
+        name='Load balancing: pull a line that answers ping but drops traffic',
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=60,
+    )
     scheduler.add_job(
         reconcile_lb_paid_background,
         trigger=IntervalTrigger(seconds=271),

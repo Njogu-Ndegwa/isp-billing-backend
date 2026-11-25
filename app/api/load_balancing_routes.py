@@ -153,6 +153,13 @@ async def _run_locked_router_thread(
         return {"error": "timeout"}
 
 
+def _pulled_wans(config: Optional[dict]) -> List[int]:
+    """WAN numbers the line health check has out of the balancing right now."""
+    wans = ((config or {}).get("health") or {}).get("wans") or {}
+    return sorted(int(n) for n, e in wans.items()
+                  if (e or {}).get("state") == "pulled" and str(n).isdigit())
+
+
 def _raise_for_router_error(result: dict, router_obj: Router) -> None:
     err = result.get("error")
     if not err:
@@ -318,12 +325,13 @@ def _lb_rollback_sync(router_info: dict) -> dict:
         api.disconnect()
 
 
-def _lb_verify_sync(router_info: dict, wan_ports: Optional[List[str]] = None) -> dict:
+def _lb_verify_sync(router_info: dict, wan_ports: Optional[List[str]] = None,
+                    pulled_wans: Optional[List[int]] = None) -> dict:
     api = _connect(router_info, timeout=30)
     if not api.connect():
         return {"error": "connect_failed", "detail": api.last_connect_error}
     try:
-        return mikrotik_lb.lb_verify(api, wan_ports)
+        return mikrotik_lb.lb_verify(api, wan_ports, pulled_wans)
     finally:
         api.disconnect()
 
@@ -621,8 +629,9 @@ async def verify_load_balancing(
     await db.commit()  # release the DB before router I/O
 
     wan_ports = list((config or {}).get("wan_ports") or []) if enabled else []
+    pulled_wans = _pulled_wans(config) if enabled else []
     result = await _run_locked_router_thread(
-        router_obj, _lb_verify_sync, router_info, wan_ports or None,
+        router_obj, _lb_verify_sync, router_info, wan_ports or None, pulled_wans or None,
         holder="a load-balancing check",
     )
     await _record_availability(router_id, result)

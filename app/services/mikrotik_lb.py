@@ -1575,12 +1575,15 @@ def lb_park_ports_v6(api, wan_ports: List[str], parked: List[str]) -> dict:
 
 # --- verify ------------------------------------------------------------------
 
-def lb_verify(api, wan_ports: Optional[List[str]] = None) -> dict:
+def lb_verify(api, wan_ports: Optional[List[str]] = None,
+              pulled_wans: Optional[List[int]] = None) -> dict:
     """Counters, live conntrack flow attribution, LB_PAID safety cross-check,
     and a rule-order check that every configured WAN can receive connections.
 
     *wan_ports* is the configured WAN set (WAN1 first); when omitted the WAN
-    count is inferred from the mark rules on the router.
+    count is inferred from the mark rules on the router. *pulled_wans* are WAN
+    numbers the line health check took out on purpose (lb_wan_health): their
+    disabled MARK rule is expected, not a rule-order failure.
     """
     report: dict = {"steps": [], "success": True, "warnings": []}
 
@@ -1632,6 +1635,15 @@ def lb_verify(api, wan_ports: Optional[List[str]] = None) -> dict:
         report["success"] = False
 
     order = lb_pcc_order_check(mangle, len(wan_ports) if wan_ports else None)
+    pulled = [f"WAN{n}" for n in (pulled_wans or [])]
+    if pulled:
+        order["pulled_by_health_check"] = [w for w in pulled if w in order["unreachable"]]
+        order["unreachable"] = [w for w in order["unreachable"] if w not in pulled]
+        order["ok"] = not order["unreachable"] and not order["unrouted"]
+        report["warnings"].append(
+            f"{', '.join(pulled)} taken out of the balancing by the line health check "
+            "(it answered ping but dropped replies); it is retried automatically."
+        )
     report["pcc_order"] = order
     _step(report, "check.pcc_order", order["ok"], order)
     if order["unreachable"]:
