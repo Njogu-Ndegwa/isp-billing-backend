@@ -310,11 +310,12 @@ Showing results
   - how much I made today / this week / this month (a total): GET /api/mpesa/transactions/summary with the dates (tiles). Its total_amount and total_transactions are the money made and the payments that went through; say those. A failed, expired or pending prompt is not a transaction and not money made: never add it to a total, never say "of which" about completed money, and mention attempts (not_completed) only when asked about failures;
   - money per day or over a period: GET /api/dashboard/revenue-over-time with period day (trend);
   - which plan sells or earns most: GET /api/plans/performance (bars); who uses the most data: GET /api/mikrotik/top-users (bars);
+  - which router earns most / sales or money per router for a period: GET /api/mpesa/transactions/by-router with the dates (bars);
   - payments, failed payments, customers, routers, plans: their list routes (table); one customer: GET /api/customers/{{id}} (card);
   - a business overview: GET /api/dashboard/overview (tiles); one router's CPU and memory: GET /api/mikrotik/health with router_id (tiles); its uptime: GET /api/routers/{{id}}/uptime.
   - GET /api/realtime/customers/online returns ids only and is never drawn.
 - For trend, bars and share you may add "fields" naming the fields of the result rows to draw (label and value). Leave it out when you are unsure of the names; the page then picks them itself.
-- The numbers on screen always come from the data, never from you. So say the answer in one or two sentences, the headline figure and what stands out, and never repeat rows, lists or tables in your text.
+- The numbers on screen always come from the data, never from you. So say the answer in one or two sentences, the headline figure and what stands out, and never repeat rows, lists or tables in your text. Never type a table (| col | col |) or a bulleted list of figures: when the answer is several rows (customers, plans, routers, payments, a comparison), draw the read that holds them.
 - Every figure you state must come from a result in this conversation. If you do not have it, look it up or say you do not know.
 - A long list reaches you cut: a few rows, then a note with list_totals, the server's own figures over every row (rows, by_status with count and amount, sum, highest and lowest). Any total, count, best or worst you state comes from list_totals or a summary action (e.g. /api/mpesa/transactions/summary for payments), never from the rows you can see: never add up, count or rank visible rows of a cut list. When list_totals has partial, it covers only that read: get the whole figure from the summary action. When you describe rows of a cut list, say which: "the first 8 of 13". In a short list, read each row's own figure before naming a best or worst.
 - Money: use the amounts and currency in the data; do not convert. Times from the API are UTC unless marked.
@@ -723,6 +724,52 @@ def _records_ask(b: dict) -> bool:
     return (b.get("type") == "tool_use" and b.get("name") == "call_api" and isinstance(b.get("input"), dict)
             and str(b["input"].get("method") or "").upper() == "POST"
             and str(b["input"].get("path") or "").split("?", 1)[0].rstrip("/") == "/api/feedback/requests")
+
+
+# Rows written out as text: a markdown table, or three or more list lines that each carry a
+# figure (an amount, a speed, a percentage, a count). The page draws a result's rows; when the
+# model writes them out instead, nothing is drawn and the person gets raw text (2026-11-25:
+# "Show today's sales per router", a typed uptime table, plans and customers as bullets).
+_MD_TABLE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", re.M)
+_LIST_LINE = re.compile(r"^\s*(?:[-*•]|\d{1,2}[.)])\s+(.+)$", re.M)
+_FIGURE = re.compile(
+    r"(?:\b(?:KES|KSH|TZS|UGX|RWF|USD|ZMW|NGN)\s?[\d,]+|\b\d[\d,.]*\s?(?:%|M\b|Mbps|GB|MB|KB|"
+    r"payments?\b|customers?\b|devices?\b|sales\b|users?\b|hrs?\b|days?\b)|\b\d{1,3}(?:,\d{3})+\b)", re.I)
+_MONEY = re.compile(r"\b(?:KES|KSH|TZS|UGX|RWF|USD|ZMW|NGN)\s?\d[\d,]*", re.I)
+_RANKING_ASK = re.compile(r"\b(most|least|top|best|worst|compare|per (router|plan|day|customer)|"
+                          r"each (router|plan)|which (router|plan|customer)s?|ranking|zaidi|kila)\b", re.I)
+
+
+def _read_this_turn(messages: list) -> bool:
+    """A call_api GET ran in this answer: there is a result that could have been drawn."""
+    return any(b.get("type") == "tool_use" and b.get("name") == "call_api"
+               and str((b.get("input") or {}).get("method") or "GET").upper() == "GET"
+               for m in messages if m.get("role") == "assistant" and isinstance(m.get("content"), list)
+               for b in m["content"] if isinstance(b, dict))
+
+
+def _asked_text(messages: list, turn_start: int) -> str:
+    """The person's own words that started this answer."""
+    for m in reversed(messages[:turn_start]):
+        if m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            return content
+        texts = [b.get("text", "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text"]
+        if texts and not any(t.startswith("[Check]") for t in texts):
+            return " ".join(texts)
+    return ""
+
+
+def _rows_in_text(said: str, asked: str) -> bool:
+    """The answer writes a result's rows as text instead of having the page draw them."""
+    if _MD_TABLE.search(said):
+        return True
+    if sum(1 for m in _LIST_LINE.finditer(said) if _FIGURE.search(m.group(1))) >= 3:
+        return True
+    # a ranking or comparison said as a sentence: "X earned KES 60,530, Y KES 14,410, Z KES 2,600"
+    return bool(_RANKING_ASK.search(asked or "")) and len(set(_MONEY.findall(said))) >= 3
 
 
 # Words telling the person their ask was written down for Bitwave ("I've passed the WhatsApp
@@ -1528,7 +1575,7 @@ class Turn:
 
     async def _loop(self) -> None:
         system = self.system_blocks()
-        checked_claim = checked_record = False
+        checked_claim = checked_record = checked_rows = False
         turn_start = len(self.messages)
         for step in range(max(1, settings.ASSISTANT_MAX_STEPS)):
             spoke_before, self._streamed = self._spoke, ""
@@ -1605,6 +1652,22 @@ class Turn:
                         "Call it now (title: the feature in a few words; asked: their words), then give "
                         "your answer again with that clause; or, if it is not a feature request, give "
                         "the answer without the claim.")}]})
+                    continue
+                # The model wrote the rows of a result as text (a typed table, a bulleted list of
+                # figures, a ranking in a sentence) and nothing is drawn, so the person gets raw
+                # text instead of the table or chart. Once per turn, send it back to draw it.
+                if not checked_rows and not self.drawn and _read_this_turn(self.messages[turn_start:])                         and _rows_in_text(said, _asked_text(self.messages, turn_start)):
+                    checked_rows = True
+                    if self._streamed:
+                        await self._take_back_answer(said, spoke_before)
+                    self.messages.append({"role": "user", "content": [{"type": "text", "text": (
+                        "[Check] You wrote rows of a result as text (a table, a list of figures or a "
+                        "ranking) and drew nothing, so the person sees raw text. If those rows come from "
+                        "a read, call call_api again for the read that holds them with show set (a list: "
+                        "table; per router / plan / customer figures: bars; over time: trend), then give "
+                        "the answer in one or two sentences without repeating the rows. Per-router money: "
+                        "GET /api/mpesa/transactions/by-router. If the lines are steps or advice, not "
+                        "data, give the same answer again unchanged.")}]})
                     continue
                 return
             results = []
