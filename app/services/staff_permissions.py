@@ -469,6 +469,7 @@ _RULES_SPEC: list[tuple[tuple, str, Requirement, Optional[str]]] = [
     ((R,), "/api/mpesa/transactions", "transactions.view", None),
     ((R,), "/api/mpesa/transactions/failed", "transactions.view", None),
     ((R,), "/api/mpesa/transactions/summary", "transactions.view", None),
+    ((R,), "/api/mpesa/transactions/by-router", "transactions.view", None),
     ((R,), "/api/c2b/unmatched", "transactions.view", None),
     (("POST",), "/api/c2b/unmatched/{unmatched_id}/attribute", "transactions.manage",
      "Attributed unmatched payment {unmatched_id}"),

@@ -2426,24 +2426,33 @@ async def get_mpesa_transactions_summary(
             if r["counts_as_revenue"]:
                 status_breakdown[s]["amount"] += r["amount"]
 
+        # By method and by router: completed payments only, like the totals (a failed
+        # prompt is not a sale). Comp is counted, its money left out.
         method_breakdown: dict = {}
-        for r in rows:
+        for r in completed:
             m = r["method"]
             if m not in method_breakdown:
                 method_breakdown[m] = {"count": 0, "amount": 0}
-            method_breakdown[m]["count"] += 1  # always count
+            method_breakdown[m]["count"] += 1
             if r["counts_as_revenue"]:
                 method_breakdown[m]["amount"] += r["amount"]
 
         router_breakdown: dict = {}
         for r in rows:
-            if r["router_name"]:
-                rname = r["router_name"]
-                if rname not in router_breakdown:
-                    router_breakdown[rname] = {"count": 0, "amount": 0, "router_id": r["router_id"]}
-                router_breakdown[rname]["count"] += 1  # always count
-                if r["counts_as_revenue"]:
-                    router_breakdown[rname]["amount"] += r["amount"]
+            if not r["router_name"]:
+                continue
+            rname = r["router_name"]
+            if rname not in router_breakdown:
+                router_breakdown[rname] = {"count": 0, "amount": 0, "router_id": r["router_id"],
+                                           "failed_attempts": 0}
+            if r["status"] != "completed":
+                router_breakdown[rname]["failed_attempts"] += 1
+                continue
+            router_breakdown[rname]["count"] += 1
+            if r["counts_as_revenue"]:
+                router_breakdown[rname]["amount"] += r["amount"]
+        for entry in router_breakdown.values():
+            entry["amount"] = round(entry["amount"], 2)
 
         # Hotspot vs PPPoE split — completed, revenue-counting rows only.
         # static_ip / null plans stay out of the split but remain in the totals.
@@ -2499,6 +2508,40 @@ async def get_mpesa_transactions_summary(
     except Exception as e:
         logger.error(f"Error fetching transaction summary: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch summary: {str(e)}")
+
+
+@router.get("/api/mpesa/transactions/by-router")
+async def get_mpesa_transactions_by_router(
+    payment_method: Optional[str] = None,
+    date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(verify_token)
+):
+    """
+    Money made per router for a period, best first: which router earns most, sales per router.
+
+    Same sources and rules as /api/mpesa/transactions/summary (completed payments only; a
+    failed, expired or pending prompt is not a sale and is counted apart in failed_attempts).
+    Dates are the person's own calendar days.
+
+    Query Parameters:
+    - date (one day) or start_date / end_date, payment_method (same as /transactions)
+
+    Returns:
+    - routers: [{router_id, router, amount, payments, failed_attempts}], highest amount first
+    - total_amount, period
+    """
+    summary = await get_mpesa_transactions_summary(
+        router_id=None, payment_method=payment_method, date=date, start_date=start_date,
+        end_date=end_date, db=db, token=token)
+    routers = sorted(
+        ({"router_id": v["router_id"], "router": name, "amount": v["amount"], "payments": v["count"],
+          "failed_attempts": v.get("failed_attempts", 0)}
+         for name, v in summary["router_breakdown"].items()),
+        key=lambda r: (-r["amount"], -r["payments"], r["router"]))
+    return {"routers": routers, "total_amount": summary["total_amount"], "period": summary["period"]}
 
 
 def _failure_fields(tx) -> dict:
