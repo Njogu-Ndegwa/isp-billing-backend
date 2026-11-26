@@ -15,6 +15,7 @@ from app.db.models import (
     MtnMomoTransaction, MtnMomoTransactionStatus, FapshiTransaction, FapshiTransactionStatus,
 )
 from app.services.auth import verify_token, get_current_user
+from app.core.local_time import parse_local_moment
 from app.services import local_day
 from app.services.plan_cache import (
     get_plans_cached,
@@ -338,7 +339,7 @@ async def create_plan_api(
         valid_until_dt = None
         if request.valid_until:
             try:
-                valid_until_dt = datetime.fromisoformat(request.valid_until.replace('Z', '+00:00'))
+                valid_until_dt = parse_local_moment(request.valid_until)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid valid_until format. Use ISO 8601.")
 
@@ -627,7 +628,7 @@ async def update_plan_api(
             plan.original_price = request.original_price
         if request.valid_until is not None:
             try:
-                plan.valid_until = datetime.fromisoformat(request.valid_until.replace('Z', '+00:00')) if request.valid_until != "" else None
+                plan.valid_until = parse_local_moment(request.valid_until) if request.valid_until != "" else None
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid valid_until format. Use ISO 8601.")
         fields_set = _request_fields_set(request)

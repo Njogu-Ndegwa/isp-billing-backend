@@ -12,7 +12,7 @@ the app has no per-reseller timezone yet. If that ever changes, widen
 ``LOCAL_UTC_OFFSET_HOURS`` handling here rather than at each call site.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 from app.config import settings
@@ -38,6 +38,19 @@ def to_local(dt: datetime) -> datetime:
 def to_utc(local_dt: datetime) -> datetime:
     """Local naive datetime -> UTC naive datetime."""
     return local_dt - local_offset()
+
+
+def parse_local_moment(value: str) -> datetime:
+    """An ISO 8601 moment from a person, as naive UTC (how the DB stores it).
+
+    A moment with a zone ("Z", "+03:00") is converted to UTC. One without a zone
+    is the person's own clock (local time), so "2026-12-24T23:10" in Nairobi is
+    20:10 UTC. Raises ``ValueError`` if ``value`` is not a date or date-time.
+    """
+    when = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    if when.tzinfo is not None:
+        return when.astimezone(timezone.utc).replace(tzinfo=None)
+    return to_utc(when)
 
 
 def local_now(now_utc: Optional[datetime] = None) -> datetime:
