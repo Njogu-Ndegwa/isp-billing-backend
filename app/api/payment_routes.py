@@ -2209,6 +2209,180 @@ async def get_customer_payment_summary(
         raise HTTPException(status_code=500, detail="Failed to fetch payment summary")
 
 
+async def summary_rows(
+    db: AsyncSession,
+    user_id: int,
+    *,
+    router_id: Optional[int] = None,
+    payment_method: Optional[str] = None,
+    date_start: Optional[datetime] = None,
+    date_end: Optional[datetime] = None,
+) -> list[dict]:
+    """Every payment and attempt the transactions summary counts, one dict each.
+
+    The single source of "money made" for the reseller's figures: the
+    transactions summary (what the assistant's chat says) and the assistant's
+    home screen both add these rows up, so the two can never disagree.
+    Bounds are naive UTC, ``date_end`` inclusive. Each row has ``at`` (the
+    moment the money came: the STK prompt, the paybill receipt, the ledger
+    entry), ``amount``, ``status``, ``method``, ``settlement``,
+    ``router_name``, ``router_id``, ``counts_as_revenue`` and
+    ``connection_type``.
+    """
+    rows = []
+    want_mpesa = payment_method in (None, "mobile_money")
+    want_other = True  # mobile_money still has gateway rows here
+
+    if want_mpesa:
+        mpesa_stmt = (
+            select(
+                MpesaTransaction.amount,
+                MpesaTransaction.status,
+                Router.name,
+                Router.id,
+                Plan.connection_type,
+                MpesaTransaction.collection_mode,
+                MpesaTransaction.created_at,
+            )
+            .outerjoin(Customer, MpesaTransaction.customer_id == Customer.id)
+            .outerjoin(Router, Router.id == func.coalesce(MpesaTransaction.router_id, Customer.router_id))
+            .join(Plan, Plan.id == func.coalesce(MpesaTransaction.plan_id, Customer.plan_id), isouter=True)
+            .where(_mpesa_owned_by(user_id))
+        )
+        if router_id:
+            mpesa_stmt = mpesa_stmt.where(Router.id == router_id)
+        if date_start:
+            mpesa_stmt = mpesa_stmt.where(MpesaTransaction.created_at >= date_start)
+        if date_end:
+            mpesa_stmt = mpesa_stmt.where(MpesaTransaction.created_at <= date_end)
+
+        for amount, tx_status, router_name, router_pk, connection_type, collection_mode, at in (
+            await db.execute(mpesa_stmt)
+        ).all():
+            rows.append({
+                "at": at,
+                "amount": float(amount),
+                "status": tx_status.value,
+                "method": "mobile_money",
+                "settlement": _settlement_of_mpesa(collection_mode),
+                "router_name": router_name,
+                "router_id": router_pk,
+                "counts_as_revenue": True,
+                "connection_type": connection_type.value if connection_type else None,
+            })
+
+        # Paybill (C2B) payments. Their customer_payments twin is skipped
+        # by _cp_ledger_condition, so without this they vanish from every
+        # tile. Only processed rows count: STK echoes duplicate a row
+        # above, and unmatched/rejected paybill money is not a sale.
+        c2b_stmt = (
+            select(
+                C2BTransaction.trans_amount,
+                C2BTransaction.business_shortcode,
+                Router.name,
+                Router.id,
+                Plan.connection_type,
+                C2BTransaction.received_at,
+            )
+            .outerjoin(Customer, C2BTransaction.matched_customer_id == Customer.id)
+            .outerjoin(CustomerPayment, and_(
+                CustomerPayment.payment_reference == C2BTransaction.trans_id,
+                CustomerPayment.reseller_id == C2BTransaction.matched_reseller_id,
+            ))
+            .outerjoin(Router, Router.id == func.coalesce(CustomerPayment.router_id, Customer.router_id))
+            .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
+            .where(
+                C2BTransaction.matched_reseller_id == user_id,
+                C2BTransaction.status == C2BTransactionStatus.PROCESSED,
+            )
+        )
+        if router_id:
+            c2b_stmt = c2b_stmt.where(Router.id == router_id)
+        if date_start:
+            c2b_stmt = c2b_stmt.where(C2BTransaction.received_at >= date_start)
+        if date_end:
+            c2b_stmt = c2b_stmt.where(C2BTransaction.received_at <= date_end)
+
+        for amount, shortcode, router_name, router_pk, connection_type, at in (
+            await db.execute(c2b_stmt)
+        ).all():
+            rows.append({
+                "at": at,
+                "amount": float(amount),
+                "status": "completed",
+                "method": "mobile_money",
+                "settlement": _settlement_of_c2b(shortcode),
+                "router_name": router_name,
+                "router_id": router_pk,
+                "counts_as_revenue": True,
+                "connection_type": connection_type.value if connection_type else None,
+            })
+
+    if want_other:
+        cp_stmt = (
+            select(
+                CustomerPayment.amount,
+                CustomerPayment.status,
+                CustomerPayment.payment_method,
+                CustomerPayment.counts_as_revenue,
+                CustomerPayment.collection_mode,
+                CustomerPayment.payment_reference,
+                Router.name,
+                Router.id,
+                Plan.connection_type,
+                CustomerPayment.created_at,
+            )
+            .outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
+            .outerjoin(Router, Router.id == func.coalesce(CustomerPayment.router_id, Customer.router_id))
+            .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
+            .where(
+                CustomerPayment.reseller_id == user_id,
+                _cp_ledger_condition(payment_method),
+            )
+        )
+        if payment_method and payment_method != "mobile_money":
+            try:
+                pm_enum = PaymentMethod(payment_method.lower())
+                cp_stmt = cp_stmt.where(CustomerPayment.payment_method == pm_enum)
+            except ValueError:
+                pass
+        if router_id:
+            cp_stmt = cp_stmt.where(Router.id == router_id)
+        if date_start:
+            cp_stmt = cp_stmt.where(CustomerPayment.created_at >= date_start)
+        if date_end:
+            cp_stmt = cp_stmt.where(CustomerPayment.created_at <= date_end)
+
+        for (
+            amount,
+            payment_status,
+            method,
+            counts_as_revenue,
+            collection_mode,
+            payment_reference,
+            router_name,
+            router_pk,
+            connection_type,
+            at,
+        ) in (await db.execute(cp_stmt)).all():
+            # The ledger filter already verified the fallback. Any mobile
+            # money row without a gateway prefix is an archived STK.
+            archived_stk = (method == PaymentMethod.MOBILE_MONEY
+                            and not (payment_reference or "").startswith(GATEWAY_REFERENCE_PREFIXES))
+            rows.append({
+                "at": at,
+                "amount": float(amount),
+                "status": payment_status.value if payment_status else "completed",
+                "method": method.value,
+                "settlement": _settlement_of_mpesa(collection_mode) if archived_stk else None,
+                "router_name": router_name,
+                "router_id": router_pk,
+                "counts_as_revenue": bool(counts_as_revenue),
+                "connection_type": connection_type.value if connection_type else None,
+            })
+    return rows
+
+
 @router.get("/api/mpesa/transactions/summary")
 async def get_mpesa_transactions_summary(
     router_id: Optional[int] = None,
@@ -2256,150 +2430,10 @@ async def get_mpesa_transactions_summary(
             if end_date:
                 date_end = local_day.range_end(end_date, user)
 
-        rows = []
-        want_mpesa = payment_method in (None, "mobile_money")
-        want_other = True  # mobile_money still has gateway rows here
-
-        if want_mpesa:
-            mpesa_stmt = (
-                select(
-                    MpesaTransaction.amount,
-                    MpesaTransaction.status,
-                    Router.name,
-                    Router.id,
-                    Plan.connection_type,
-                    MpesaTransaction.collection_mode,
-                )
-                .outerjoin(Customer, MpesaTransaction.customer_id == Customer.id)
-                .outerjoin(Router, Router.id == func.coalesce(MpesaTransaction.router_id, Customer.router_id))
-                .join(Plan, Plan.id == func.coalesce(MpesaTransaction.plan_id, Customer.plan_id), isouter=True)
-                .where(_mpesa_owned_by(user.id))
-            )
-            if router_id:
-                mpesa_stmt = mpesa_stmt.where(Router.id == router_id)
-            if date_start:
-                mpesa_stmt = mpesa_stmt.where(MpesaTransaction.created_at >= date_start)
-            if date_end:
-                mpesa_stmt = mpesa_stmt.where(MpesaTransaction.created_at <= date_end)
-
-            for amount, tx_status, router_name, router_pk, connection_type, collection_mode in (
-                await db.execute(mpesa_stmt)
-            ).all():
-                rows.append({
-                    "amount": float(amount),
-                    "status": tx_status.value,
-                    "method": "mobile_money",
-                    "settlement": _settlement_of_mpesa(collection_mode),
-                    "router_name": router_name,
-                    "router_id": router_pk,
-                    "counts_as_revenue": True,
-                    "connection_type": connection_type.value if connection_type else None,
-                })
-
-            # Paybill (C2B) payments. Their customer_payments twin is skipped
-            # by _cp_ledger_condition, so without this they vanish from every
-            # tile. Only processed rows count: STK echoes duplicate a row
-            # above, and unmatched/rejected paybill money is not a sale.
-            c2b_stmt = (
-                select(
-                    C2BTransaction.trans_amount,
-                    C2BTransaction.business_shortcode,
-                    Router.name,
-                    Router.id,
-                    Plan.connection_type,
-                )
-                .outerjoin(Customer, C2BTransaction.matched_customer_id == Customer.id)
-                .outerjoin(CustomerPayment, and_(
-                    CustomerPayment.payment_reference == C2BTransaction.trans_id,
-                    CustomerPayment.reseller_id == C2BTransaction.matched_reseller_id,
-                ))
-                .outerjoin(Router, Router.id == func.coalesce(CustomerPayment.router_id, Customer.router_id))
-                .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
-                .where(
-                    C2BTransaction.matched_reseller_id == user.id,
-                    C2BTransaction.status == C2BTransactionStatus.PROCESSED,
-                )
-            )
-            if router_id:
-                c2b_stmt = c2b_stmt.where(Router.id == router_id)
-            if date_start:
-                c2b_stmt = c2b_stmt.where(C2BTransaction.received_at >= date_start)
-            if date_end:
-                c2b_stmt = c2b_stmt.where(C2BTransaction.received_at <= date_end)
-
-            for amount, shortcode, router_name, router_pk, connection_type in (
-                await db.execute(c2b_stmt)
-            ).all():
-                rows.append({
-                    "amount": float(amount),
-                    "status": "completed",
-                    "method": "mobile_money",
-                    "settlement": _settlement_of_c2b(shortcode),
-                    "router_name": router_name,
-                    "router_id": router_pk,
-                    "counts_as_revenue": True,
-                    "connection_type": connection_type.value if connection_type else None,
-                })
-
-        if want_other:
-            cp_stmt = (
-                select(
-                    CustomerPayment.amount,
-                    CustomerPayment.status,
-                    CustomerPayment.payment_method,
-                    CustomerPayment.counts_as_revenue,
-                    CustomerPayment.collection_mode,
-                    CustomerPayment.payment_reference,
-                    Router.name,
-                    Router.id,
-                    Plan.connection_type,
-                )
-                .outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
-                .outerjoin(Router, Router.id == func.coalesce(CustomerPayment.router_id, Customer.router_id))
-                .outerjoin(Plan, Plan.id == func.coalesce(CustomerPayment.plan_id, Customer.plan_id))
-                .where(
-                    CustomerPayment.reseller_id == user.id,
-                    _cp_ledger_condition(payment_method),
-                )
-            )
-            if payment_method and payment_method != "mobile_money":
-                try:
-                    pm_enum = PaymentMethod(payment_method.lower())
-                    cp_stmt = cp_stmt.where(CustomerPayment.payment_method == pm_enum)
-                except ValueError:
-                    pass
-            if router_id:
-                cp_stmt = cp_stmt.where(Router.id == router_id)
-            if date_start:
-                cp_stmt = cp_stmt.where(CustomerPayment.created_at >= date_start)
-            if date_end:
-                cp_stmt = cp_stmt.where(CustomerPayment.created_at <= date_end)
-
-            for (
-                amount,
-                payment_status,
-                method,
-                counts_as_revenue,
-                collection_mode,
-                payment_reference,
-                router_name,
-                router_pk,
-                connection_type,
-            ) in (await db.execute(cp_stmt)).all():
-                # The ledger filter already verified the fallback. Any mobile
-                # money row without a gateway prefix is an archived STK.
-                archived_stk = (method == PaymentMethod.MOBILE_MONEY
-                                and not (payment_reference or "").startswith(GATEWAY_REFERENCE_PREFIXES))
-                rows.append({
-                    "amount": float(amount),
-                    "status": payment_status.value if payment_status else "completed",
-                    "method": method.value,
-                    "settlement": _settlement_of_mpesa(collection_mode) if archived_stk else None,
-                    "router_name": router_name,
-                    "router_id": router_pk,
-                    "counts_as_revenue": bool(counts_as_revenue),
-                    "connection_type": connection_type.value if connection_type else None,
-                })
+        rows = await summary_rows(
+            db, user.id, router_id=router_id, payment_method=payment_method,
+            date_start=date_start, date_end=date_end,
+        )
 
         # The headline totals are what the reseller actually made: completed
         # payments only. A failed, expired or pending M-Pesa prompt is an

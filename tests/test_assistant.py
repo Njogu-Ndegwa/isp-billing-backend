@@ -837,7 +837,9 @@ async def test_briefing_gives_the_home_screen_its_figures(client, owner, db):
 
     reseller, token = owner
     now = datetime.utcnow()
-    today = datetime(now.year, now.month, now.day)
+    # days are the account's own (Kenyan) calendar days, as naive UTC bounds
+    clock = briefing_mod.make_clock(reseller, now)
+    today = clock.today_start
     daily = await make_plan(db, reseller, name="Daily 50", price=50, duration_value=1)
     monthly = await make_plan(db, reseller, name="Monthly 1500", price=1500)
     soon = now + timedelta(minutes=2)
@@ -875,13 +877,13 @@ async def test_briefing_gives_the_home_screen_its_figures(client, owner, db):
     assert money["today"] == 1550 and money["payments_today"] == 3      # the comp counts as a payment only
     assert money["yesterday"] == 200 and money["last7"] == 1750 and money["prev7"] == 300
     assert len(money["daily"]) == 14 and money["daily"][-1]["partial"] is True
-    assert money["daily"][-1]["day"] == today.strftime("%Y-%m-%d") and money["daily"][0]["partial"] is False
+    assert money["daily"][-1]["day"] == clock.today.isoformat() and money["daily"][0]["partial"] is False
     assert [d["day"] for d in money["daily"]] == sorted(d["day"] for d in money["daily"])
     assert money["month"] >= 1550
 
     customers = b["customers"]
     assert customers["total"] == 5 and customers["active"] == 3
-    assert customers["expiring_today"] == (1 if soon < today + timedelta(days=1) else 0)
+    assert customers["expiring_today"] == (1 if soon < clock.tomorrow_start else 0)
     assert customers["expiring_3d"] == 2 and customers["expired_7d"] == 1 and customers["new_7d"] == 5
     assert [c["name"] for c in customers["expiring"]] == ["Jane", "Otieno"]     # soonest first, within a week
     assert customers["expiring"][0]["plan"] == "Daily 50" and customers["expiring"][0]["expiry"].endswith("Z")

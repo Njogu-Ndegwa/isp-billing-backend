@@ -16,6 +16,7 @@ from app.db.models import (
 )
 from app.services.auth import verify_token, get_current_user
 from app.services import local_day
+from app.services.money_time import moment_between, moment_since, payment_moment
 from app.services.markets import REPORTING_CURRENCY, reseller_market, sql_kes_by_market
 from app.services.subscription import get_invoice_alert_for_user
 from app.services.subscription_reminders import _zone as market_zone
@@ -131,6 +132,7 @@ async def get_dashboard_overview(
         revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
             CustomerPayment.reseller_id == user_id,
             CustomerPayment.counts_as_revenue.is_(True),
+            CustomerPayment.status == PaymentStatus.COMPLETED,   # an attempt is not money made
         )
         if router_id:
             revenue_stmt = revenue_stmt.outerjoin(Customer, CustomerPayment.customer_id == Customer.id)
@@ -138,13 +140,13 @@ async def get_dashboard_overview(
 
         total_revenue = float((await db.execute(revenue_stmt)).scalar() or 0)
         today_revenue = float((await db.execute(
-            revenue_stmt.where(CustomerPayment.created_at >= today_start)
+            revenue_stmt.where(moment_since(today_start))
         )).scalar() or 0)
         week_revenue = float((await db.execute(
-            revenue_stmt.where(CustomerPayment.created_at >= week_start)
+            revenue_stmt.where(moment_since(week_start))
         )).scalar() or 0)
         month_revenue = float((await db.execute(
-            revenue_stmt.where(CustomerPayment.created_at >= month_start)
+            revenue_stmt.where(moment_since(month_start))
         )).scalar() or 0)
 
         # Revenue by router
@@ -414,15 +416,16 @@ async def get_dashboard_analytics(
         
         # Build both DB queries
         payments_stmt = select(
-            CustomerPayment, Customer, Plan
+            CustomerPayment, Customer, Plan, payment_moment().label("moment")
         ).outerjoin(
             Customer, CustomerPayment.customer_id == Customer.id
         ).outerjoin(
             Plan, Plan.id == payment_plan_id()
         ).where(
             CustomerPayment.reseller_id == user_id,
-            CustomerPayment.created_at >= _local_to_utc(filter_start, zone),
-            CustomerPayment.created_at < _local_to_utc(filter_end, zone)
+            # by when the money came, as the transactions summary (money_time)
+            moment_between(_local_to_utc(filter_start, zone), _local_to_utc(filter_end, zone)),
+            CustomerPayment.status == PaymentStatus.COMPLETED,   # an attempt is not money made
         )
         if router_id:
             payments_stmt = payments_stmt.where(func.coalesce(CustomerPayment.router_id, Customer.router_id) == router_id)
@@ -463,9 +466,10 @@ async def get_dashboard_analytics(
         
         unique_customers_set = set()
         
-        for payment, customer, plan in all_payments:
-            # Bucket by the reseller's local day/hour, not the UTC one.
-            created_local = _utc_to_local(payment.created_at, zone)
+        for payment, customer, plan, moment in all_payments:
+            # Bucket by the reseller's local day/hour, not the UTC one, at the
+            # moment the money came (money_time), as every other figure does.
+            created_local = _utc_to_local(moment, zone)
             date_key = created_local.strftime("%Y-%m-%d")
             hour = created_local.hour
             amount = float(payment.amount)
@@ -480,7 +484,7 @@ async def get_dashboard_analytics(
             day["transactions"].append({
                 # Kept in UTC: the admin UI shifts this to local itself
                 # (formatTimeGMT3), so a local value would be shifted twice.
-                "time": payment.created_at.strftime("%H:%M:%S"),
+                "time": moment.strftime("%H:%M:%S"),
                 "amount": amount,
                 "phone": phone[-4:] if phone else "unknown",
                 "plan": plan_name
@@ -754,8 +758,9 @@ async def get_revenue_over_time(
 
         # Fetch all completed payments in the range
         base_where = [
-            CustomerPayment.created_at >= local_day.from_wall_clock(range_start, user),
-            CustomerPayment.created_at < local_day.from_wall_clock(range_end, user),
+            # by when the money came, as the transactions summary (money_time)
+            moment_between(local_day.from_wall_clock(range_start, user),
+                           local_day.from_wall_clock(range_end, user)),
             CustomerPayment.status == PaymentStatus.COMPLETED,
         ]
         if user.role != UserRole.ADMIN:
@@ -769,7 +774,7 @@ async def get_revenue_over_time(
         )
         payments_q = select(
             amount_col,
-            CustomerPayment.created_at,
+            payment_moment().label("moment"),
             CustomerPayment.counts_as_revenue,
         )
         if is_admin:
@@ -808,7 +813,7 @@ async def get_revenue_over_time(
                 return d.strftime("%b %Y")
 
         for row in rows:
-            key = bucket_key(local_day.wall_clock(row.created_at, user))
+            key = bucket_key(local_day.wall_clock(row.moment, user))
             if key not in buckets:
                 buckets[key] = {"revenue": 0.0, "transactions": 0}
             # Count every payment, but only add to revenue when it counts as
@@ -892,7 +897,11 @@ async def get_daily_transaction_counts(
     """
     try:
         user = await get_current_user(token, db)
-        now = datetime.utcnow()
+        # Days are the account's own calendar days (local_day), and each payment
+        # sits on the day its money came (money_time), as the transactions
+        # summary and the assistant count them. Until 2026-11-27 this chart cut
+        # days at UTC midnight (03:00 in Kenya) and by ledger time.
+        now = local_day.wall_clock(_utcnow(), user)
 
         if start_date and end_date:
             try:
@@ -920,8 +929,8 @@ async def get_daily_transaction_counts(
             raise HTTPException(status_code=400, detail="Daily transaction range cannot exceed 366 days")
 
         filters = [
-            CustomerPayment.created_at >= range_start,
-            CustomerPayment.created_at < range_end,
+            moment_between(local_day.from_wall_clock(range_start, user),
+                           local_day.from_wall_clock(range_end, user)),
         ]
         if user.role != UserRole.ADMIN:
             filters.append(CustomerPayment.reseller_id == user.id)
@@ -949,31 +958,16 @@ async def get_daily_transaction_counts(
             sql_kes_by_market(CustomerPayment.amount, User.market_code)
             if is_admin else CustomerPayment.amount
         )
-        day_bucket = func.date(CustomerPayment.created_at).label("day")
+        moment = payment_moment().label("moment")
         select_columns = [
-            day_bucket,
-            func.count(CustomerPayment.id).label("transactions"),
-            func.coalesce(
-                func.sum(
-                    case(
-                        (CustomerPayment.counts_as_revenue == True, amount_expr),
-                        else_=0,
-                    )
-                ),
-                0,
-            ).label("revenue"),
+            moment,
+            amount_expr.label("amount"),
+            CustomerPayment.counts_as_revenue.label("counts_as_revenue"),
         ]
-        group_columns = [day_bucket]
         if by_port:
             select_columns.append(CustomerPayment.port_name.label("port_name"))
-            group_columns.append(CustomerPayment.port_name)
 
-        stmt = (
-            select(*select_columns)
-            .where(*filters)
-            .group_by(*group_columns)
-            .order_by(day_bucket)
-        )
+        stmt = select(*select_columns).where(*filters)
 
         if is_admin:
             stmt = stmt.join(User, CustomerPayment.reseller_id == User.id)
@@ -988,16 +982,10 @@ async def get_daily_transaction_counts(
         buckets = {}
         port_keys_seen = set()
         for row in rows:
-            raw_day = row.day
-            if isinstance(raw_day, datetime):
-                day_key = raw_day.date().isoformat()
-            elif isinstance(raw_day, date):
-                day_key = raw_day.isoformat()
-            else:
-                day_key = str(raw_day)
+            day_key = local_day.wall_clock(row.moment, user).date().isoformat()
             bucket = buckets.setdefault(day_key, {"transactions": 0, "revenue": 0.0, "by_port": {}})
-            bucket["transactions"] += int(row.transactions or 0)
-            revenue = round(float(row.revenue or 0), 2)
+            bucket["transactions"] += 1
+            revenue = float(row.amount or 0) if row.counts_as_revenue else 0.0
             bucket["revenue"] = round(bucket["revenue"] + revenue, 2)
             if by_port:
                 port_key = getattr(row, "port_name", None) or "unattributed"
@@ -1101,26 +1089,26 @@ async def get_daily_revenue_metrics(
         if router_id:
             payments_stmt = select(
                 CustomerPayment.amount,
-                CustomerPayment.created_at,
+                payment_moment().label("moment"),
                 CustomerPayment.counts_as_revenue
             ).outerjoin(
                 Customer, CustomerPayment.customer_id == Customer.id
             ).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= utc_start,
-                CustomerPayment.created_at < utc_end,
+                moment_between(utc_start, utc_end),
+                CustomerPayment.status == PaymentStatus.COMPLETED,
                 func.coalesce(CustomerPayment.router_id, Customer.router_id) == router_id
-            ).order_by(CustomerPayment.created_at)
+            ).order_by("moment")
         else:
             payments_stmt = select(
                 CustomerPayment.amount,
-                CustomerPayment.created_at,
+                payment_moment().label("moment"),
                 CustomerPayment.counts_as_revenue
             ).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= utc_start,
-                CustomerPayment.created_at < utc_end
-            ).order_by(CustomerPayment.created_at)
+                moment_between(utc_start, utc_end),
+                CustomerPayment.status == PaymentStatus.COMPLETED
+            ).order_by("moment")
         
         result = await db.execute(payments_stmt)
         payments = result.all()
@@ -1141,7 +1129,7 @@ async def get_daily_revenue_metrics(
             }
         
         for payment in payments:
-            hour = local_day.wall_clock(payment.created_at, user).hour
+            hour = local_day.wall_clock(payment.moment, user).hour
             amount = float(payment.amount)
             # Count every payment, but only add to revenue when it counts as
             # revenue (compensation vouchers have counts_as_revenue=False).
@@ -1205,9 +1193,12 @@ async def get_dashboard_stats(
         user = await get_current_user(token, db)
         user_id = user.id
         
-        now = datetime.utcnow()
+        now = _utcnow()
         period_start = now - timedelta(days=period)
-        today_start = datetime(now.year, now.month, now.day)
+        # "Today" is the account's own day (local_day), and each payment counts
+        # when its money came (money_time), as every other figure does.
+        today_start = local_day.from_wall_clock(
+            datetime.combine(local_day.today(user, now), datetime.min.time()), user)
         
         # Build queries with optional router filtering
         if router_id:
@@ -1216,7 +1207,7 @@ async def get_dashboard_stats(
                 Customer, CustomerPayment.customer_id == Customer.id
             ).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= period_start,
+                moment_since(period_start), CustomerPayment.status == PaymentStatus.COMPLETED,
                 CustomerPayment.counts_as_revenue == True,
                 func.coalesce(CustomerPayment.router_id, Customer.router_id) == router_id
             )
@@ -1227,7 +1218,7 @@ async def get_dashboard_stats(
                 Customer, CustomerPayment.customer_id == Customer.id
             ).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= period_start,
+                moment_since(period_start), CustomerPayment.status == PaymentStatus.COMPLETED,
                 func.coalesce(CustomerPayment.router_id, Customer.router_id) == router_id
             )
             period_transactions = (await db.execute(period_txn_stmt)).scalar() or 0
@@ -1237,7 +1228,7 @@ async def get_dashboard_stats(
                 Customer, CustomerPayment.customer_id == Customer.id
             ).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= period_start,
+                moment_since(period_start), CustomerPayment.status == PaymentStatus.COMPLETED,
                 func.coalesce(CustomerPayment.router_id, Customer.router_id) == router_id
             )
             period_unique_customers = (await db.execute(period_customers_stmt)).scalar() or 0
@@ -1247,7 +1238,7 @@ async def get_dashboard_stats(
                 Customer, CustomerPayment.customer_id == Customer.id
             ).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= today_start,
+                moment_since(today_start), CustomerPayment.status == PaymentStatus.COMPLETED,
                 CustomerPayment.counts_as_revenue == True,
                 func.coalesce(CustomerPayment.router_id, Customer.router_id) == router_id
             )
@@ -1257,7 +1248,7 @@ async def get_dashboard_stats(
                 Customer, CustomerPayment.customer_id == Customer.id
             ).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= today_start,
+                moment_since(today_start), CustomerPayment.status == PaymentStatus.COMPLETED,
                 func.coalesce(CustomerPayment.router_id, Customer.router_id) == router_id
             )
             today_transactions = (await db.execute(today_txn_stmt)).scalar() or 0
@@ -1266,7 +1257,7 @@ async def get_dashboard_stats(
             # Total revenue in period — exclude comp vouchers
             period_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= period_start,
+                moment_since(period_start), CustomerPayment.status == PaymentStatus.COMPLETED,
                 CustomerPayment.counts_as_revenue == True
             )
             period_revenue = float((await db.execute(period_revenue_stmt)).scalar() or 0)
@@ -1274,28 +1265,28 @@ async def get_dashboard_stats(
             # Total transactions in period
             period_txn_stmt = select(func.count(CustomerPayment.id)).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= period_start
+                moment_since(period_start), CustomerPayment.status == PaymentStatus.COMPLETED
             )
             period_transactions = (await db.execute(period_txn_stmt)).scalar() or 0
             
             # Unique customers in period
             period_customers_stmt = select(func.count(func.distinct(CustomerPayment.customer_id))).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= period_start
+                moment_since(period_start), CustomerPayment.status == PaymentStatus.COMPLETED
             )
             period_unique_customers = (await db.execute(period_customers_stmt)).scalar() or 0
             
             # Today's stats — exclude comp vouchers from revenue
             today_revenue_stmt = select(func.sum(CustomerPayment.amount)).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= today_start,
+                moment_since(today_start), CustomerPayment.status == PaymentStatus.COMPLETED,
                 CustomerPayment.counts_as_revenue == True
             )
             today_revenue = float((await db.execute(today_revenue_stmt)).scalar() or 0)
             
             today_txn_stmt = select(func.count(CustomerPayment.id)).where(
                 CustomerPayment.reseller_id == user_id,
-                CustomerPayment.created_at >= today_start
+                moment_since(today_start), CustomerPayment.status == PaymentStatus.COMPLETED
             )
             today_transactions = (await db.execute(today_txn_stmt)).scalar() or 0
         
