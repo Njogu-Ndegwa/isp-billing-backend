@@ -124,22 +124,29 @@ def normalize_static_ip(value: Optional[str]) -> Optional[str]:
     return str(addr)
 
 
-_MAC_SHAPE = re.compile(r"^[0-9A-Fa-f]{2}([:-]?[0-9A-Fa-f]{2}){5}$")
+# Separators people actually type between the pairs: colons, dashes, dots
+# (Cisco "b841.d9de.5939", or "B8..41..D9" from a phone keyboard), spaces.
+_MAC_SEPARATORS = re.compile(r"[\s:.\-]+")
+_MAC_HEX = re.compile(r"^[0-9A-Fa-f]{12}$")
 
 
 def normalize_pin_mac(value: Optional[str]) -> Optional[str]:
-    """Canonical ``AA:BB:CC:DD:EE:FF`` pin MAC, None when blank.
+    """Canonical ``AA:BB:CC:DD:EE:FF`` MAC, None when blank.
 
     Raises ``ValueError`` for anything that is not a MAC. Shared by customer
-    registration/edit and the bulk static-IP import so both accept the same
-    spellings.
+    registration/edit (hotspot MAC and static-IP pin) and the bulk static-IP
+    import so all accept the same spellings. The router rejects anything but
+    the canonical form, so a MAC must never be stored as typed.
     """
     text = (value or "").strip()
     if not text:
         return None
-    if not _MAC_SHAPE.match(text):
-        raise ValueError(f"'{text}' is not a valid MAC address")
-    return normalize_mac_address(text).upper()
+    digits = _MAC_SEPARATORS.sub("", text)
+    if not _MAC_HEX.match(digits):
+        raise ValueError(
+            f"'{text}' is not a valid MAC address. Use 6 pairs like AA:BB:CC:DD:EE:FF"
+        )
+    return normalize_mac_address(digits).upper()
 
 
 INVALID_STATIC_IP_MESSAGE = (

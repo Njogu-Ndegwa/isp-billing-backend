@@ -365,7 +365,7 @@ async def register_customer_api(
         
         static_ip = request.static_ip
         static_mac = None
-        mac_address = request.mac_address
+        mac_address = _normalize_pin_mac(request.mac_address)
         if plan.connection_type == ConnectionType.STATIC_IP:
             static_ip = await _validate_static_ip(db, request.static_ip, request.router_id)
             # A static customer must never carry the hotspot identity column:
@@ -570,6 +570,11 @@ async def edit_customer(
             router_result = await db.execute(router_stmt)
             if not router_result.scalar_one_or_none():
                 raise HTTPException(status_code=404, detail="Router not found")
+
+        if request.mac_address is not None and request.mac_address.strip():
+            # Stored as typed, a MAC like "B8..41..D9.." is refused by the router
+            # on every provisioning attempt; canonicalise it or say it's wrong.
+            request.mac_address = _normalize_pin_mac(request.mac_address)
 
         if request.mac_address is not None and request.mac_address != customer.mac_address:
             mac_stmt = select(Customer).where(
